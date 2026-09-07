@@ -14,7 +14,9 @@ ALTER TABLE oauth_token_issuances
     DROP CONSTRAINT IF EXISTS oauth_token_issuances_signed_fields_check,
     DROP CONSTRAINT IF EXISTS oauth_token_issuances_phase_check,
     DROP CONSTRAINT IF EXISTS oauth_token_issuances_claim_owner_pair_check,
-    DROP CONSTRAINT IF EXISTS oauth_token_issuances_response_pair_check;
+    DROP CONSTRAINT IF EXISTS oauth_token_issuances_response_pair_check,
+    DROP CONSTRAINT IF EXISTS oauth_token_issuances_grant_key_check,
+    DROP CONSTRAINT IF EXISTS oauth_token_issuances_request_digest_check;
 
 ALTER TABLE oauth_token_issuances
     DROP COLUMN IF EXISTS phase,
