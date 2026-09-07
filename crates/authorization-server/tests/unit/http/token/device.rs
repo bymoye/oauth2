@@ -542,16 +542,23 @@ async fn device_authorization_endpoint_disabled_fails_before_client_lookup() {
     let state = Data::new(disabled_state());
     let req = form_request();
 
-    let response = device_authorization_with_admission(
+    let runtime =
+        crate::runtime_modules::test_support::runtime_module_registry_with_modules_for_test(
+            state.diesel_db.clone(),
+            state.settings.as_ref(),
+            Default::default(),
+        )
+        .expect("disabled runtime should build");
+    let response = device_authorization(
         device_authorization_service(&state),
         device_grant_service(&state),
         token_management_limiter(&state),
         Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
+        Data::from(runtime),
         Data::new(
             crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
                 .expect("empty resolver should build"),
         ),
-        false,
         req,
         Bytes::from_static(b"client_id=device-client&scope=openid"),
     )
