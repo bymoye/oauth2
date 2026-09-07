@@ -552,8 +552,8 @@ fn commit_input_validation_enforces_mode_ownership_and_expiry_contracts() {
 
 #[test]
 fn response_material_and_audit_events_cover_current_and_refresh_shapes() {
-    let ring =
-        TokenIssuanceResponseKeyRing::new("current", [0x11; 32], None).expect("key ring is valid");
+    let ring = TokenIssuanceResponseKeyRing::new("current", rand::random::<[u8; 32]>(), None)
+        .expect("key ring is valid");
     let no_body = valid_commit_input(TokenIssuanceMode::Fresh, None);
     assert_eq!(
         response_material(Some(&ring), &no_body, "grant-hash").expect("no body is valid"),

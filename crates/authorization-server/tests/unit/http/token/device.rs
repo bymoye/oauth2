@@ -1,4 +1,47 @@
 use super::*;
+
+#[actix_web::test]
+async fn device_client_authentication_accepts_registered_public_none_and_rejects_secret() {
+    let state = Data::new(disabled_state());
+    let service = device_authorization_service(&state);
+    let config = DeviceHttpConfig::from(state.settings.as_ref());
+    let resolver =
+        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[]).unwrap();
+    let mut client = device_client();
+    let credentials = ClientCredentials {
+        client_id: Some(client.client_id.clone()),
+        method: "none".into(),
+        ..Default::default()
+    };
+    assert!(
+        authenticate_device_authorization_client(
+            &service,
+            &config,
+            &form_request(),
+            &mut client,
+            &credentials,
+            &resolver
+        )
+        .await
+        .is_ok()
+    );
+    let credentials = ClientCredentials {
+        client_secret: Some(Uuid::now_v7().to_string()),
+        method: "client_secret_post".into(),
+        ..credentials
+    };
+    let response = authenticate_device_authorization_client(
+        &service,
+        &config,
+        &form_request(),
+        &mut client,
+        &credentials,
+        &resolver,
+    )
+    .await
+    .expect_err("public clients cannot present a secret");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
 use crate::config::ConfigSource;
 use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
 use crate::domain::tenancy::DEFAULT_REALM_ID;
