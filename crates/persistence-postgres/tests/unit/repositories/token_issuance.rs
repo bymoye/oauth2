@@ -19,7 +19,7 @@ fn context<'a>(
     }
 }
 
-fn row(phase: &str) -> TokenIssuanceRow {
+fn row() -> TokenIssuanceRow {
     let now = Utc::now();
     TokenIssuanceRow {
         issuance_id: Uuid::now_v7(),
@@ -28,9 +28,6 @@ fn row(phase: &str) -> TokenIssuanceRow {
         user_id: None,
         grant_key_blake3: "grant-hash".to_owned(),
         request_digest: "request-digest".to_owned(),
-        phase: phase.to_owned(),
-        claim_owner_id: None,
-        claim_started_at: None,
         access_token_jti: None,
         access_token_expires_at: None,
         response_ciphertext: None,
@@ -44,12 +41,13 @@ fn row(phase: &str) -> TokenIssuanceRow {
 }
 
 fn row_with_response(
-    phase: &str,
     ring: &TokenIssuanceResponseKeyRing,
     body: &[u8],
     digest: &str,
 ) -> TokenIssuanceRow {
-    let mut row = row(phase);
+    let mut row = row();
+    row.access_token_jti = Some("jti".to_owned());
+    row.access_token_expires_at = Some(Utc::now() + chrono::Duration::minutes(1));
     let envelope_context = context(
         row.issuance_id,
         row.tenant_id,
@@ -219,7 +217,7 @@ fn key_ring_rejects_empty_long_and_duplicate_ids() {
 }
 
 #[test]
-fn response_key_ring_preflight_rejects_uncovered_ids() {
+fn response_key_ring_preflight_rejects_unsupported_metadata() {
     let ring = TokenIssuanceResponseKeyRing::new(
         "current",
         [0x11; 32],
@@ -227,19 +225,67 @@ fn response_key_ring_preflight_rejects_uncovered_ids() {
     )
     .expect("key ring is valid");
     assert!(
-        validate_response_key_ids(
+        validate_response_key_metadata(
             &ring,
-            [Some("current".to_owned()), Some("previous".to_owned())],
+            [
+                (Some("current".to_owned()), Some("v1".to_owned())),
+                (Some("previous".to_owned()), Some("v1".to_owned())),
+            ],
         )
         .is_ok()
     );
     assert!(matches!(
-        validate_response_key_ids(&ring, [Some("retired".to_owned())]),
+        validate_response_key_metadata(
+            &ring,
+            [(Some("retired".to_owned()), Some("v1".to_owned()))],
+        ),
         Err(RepositoryError::Consistency(message)) if message.contains("retired")
     ));
     assert!(matches!(
-        validate_response_key_ids(&ring, [None]),
+        validate_response_key_metadata(&ring, [(None, Some("v1".to_owned()))]),
         Err(RepositoryError::Consistency(message)) if message.contains("missing")
+    ));
+    assert!(matches!(
+        validate_response_key_metadata(
+            &ring,
+            [(Some("current".to_owned()), Some("v2".to_owned()))],
+        ),
+        Err(RepositoryError::Consistency(message)) if message.contains("unsupported")
+    ));
+    assert!(matches!(
+        validate_response_key_metadata(&ring, [(Some("current".to_owned()), None)]),
+        Err(RepositoryError::Consistency(message)) if message.contains("missing")
+    ));
+}
+
+#[test]
+fn response_key_ring_preflight_ignores_corrupt_response_body() {
+    let ring =
+        TokenIssuanceResponseKeyRing::new("current", [0x11; 32], None).expect("key ring is valid");
+    let body = b"response";
+    let digest = blake3::hash(body).to_hex().to_string();
+    let mut corrupted = row_with_response(&ring, body, &digest);
+    let ciphertext = corrupted
+        .response_ciphertext
+        .as_mut()
+        .expect("response ciphertext is present");
+    *ciphertext
+        .last_mut()
+        .expect("response ciphertext is non-empty") ^= 1;
+
+    assert!(
+        validate_response_key_metadata(
+            &ring,
+            [(
+                corrupted.response_key_id.clone(),
+                corrupted.response_envelope_version.clone(),
+            )],
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        corrupted.into_record(Some(&ring)),
+        Err(RepositoryError::Consistency(message)) if message.contains("authentication")
     ));
 }
 
@@ -276,36 +322,23 @@ fn key_ring_display_debug_and_lookup_do_not_expose_key_material() {
 }
 
 #[test]
-fn issuance_rows_map_phases_and_preserve_sealed_response_state() {
+fn issuance_rows_preserve_sealed_response_state() {
     let ring =
         TokenIssuanceResponseKeyRing::new("current", [0x11; 32], None).expect("key ring is valid");
     let body = b"signed response";
     let digest = blake3::hash(body).to_hex().to_string();
 
-    let prepared = row("prepared")
+    let prepared = row()
         .into_record(None)
-        .expect("prepared row has no response envelope");
-    assert_eq!(prepared.phase, TokenIssuancePhase::Prepared);
+        .expect("row has no response envelope");
     assert!(prepared.response_body.is_none());
 
-    for phase in [
-        TokenIssuancePhase::Signed,
-        TokenIssuancePhase::Persisted,
-        TokenIssuancePhase::Delivered,
-    ] {
-        let record = row_with_response(phase.as_str(), &ring, body, &digest)
-            .into_record(Some(&ring))
-            .expect("sealed response row is valid");
-        assert_eq!(record.phase, phase);
-        assert_eq!(record.response_body.as_deref(), Some(body.as_slice()));
-        assert_eq!(record.response_digest.as_deref(), Some(digest.as_str()));
-        assert_eq!(record.response_key_version.as_deref(), Some("v1"));
-    }
-
-    assert!(matches!(
-        row("unknown").into_record(None),
-        Err(RepositoryError::Consistency(message)) if message.contains("unknown phase")
-    ));
+    let record = row_with_response(&ring, body, &digest)
+        .into_record(Some(&ring))
+        .expect("sealed response row is valid");
+    assert_eq!(record.response_body.as_deref(), Some(body.as_slice()));
+    assert_eq!(record.response_digest.as_deref(), Some(digest.as_str()));
+    assert_eq!(record.response_key_version.as_deref(), Some("v1"));
 }
 
 #[test]
@@ -315,36 +348,27 @@ fn issuance_rows_reject_incomplete_or_inconsistent_response_envelopes() {
     let body = b"response";
     let digest = blake3::hash(body).to_hex().to_string();
 
-    let missing_envelope = row("signed");
-    assert!(matches!(
-        missing_envelope.into_record(None),
-        Err(RepositoryError::Consistency(message)) if message.contains("phase and response")
-    ));
+    let missing_envelope = row();
+    assert!(missing_envelope.into_record(None).is_ok());
 
-    let mut incomplete = row("signed");
+    let mut incomplete = row();
     incomplete.response_ciphertext = Some(vec![1, 2, 3]);
     assert!(matches!(
         incomplete.into_record(None),
         Err(RepositoryError::Consistency(message)) if message.contains("incomplete")
     ));
 
-    let mut unsupported = row_with_response("signed", &ring, body, &digest);
+    let mut unsupported = row_with_response(&ring, body, &digest);
     unsupported.response_envelope_version = Some("v2".to_owned());
     assert!(matches!(
         unsupported.into_record(Some(&ring)),
         Err(RepositoryError::Consistency(message)) if message.contains("unsupported")
     ));
 
-    let no_keys = row_with_response("signed", &ring, body, &digest);
+    let no_keys = row_with_response(&ring, body, &digest);
     assert!(matches!(
         no_keys.into_record(None),
         Err(RepositoryError::Consistency(message)) if message.contains("not configured")
-    ));
-
-    let prepared_with_response = row_with_response("prepared", &ring, body, &digest);
-    assert!(matches!(
-        prepared_with_response.into_record(Some(&ring)),
-        Err(RepositoryError::Consistency(message)) if message.contains("phase and response")
     ));
 }
 

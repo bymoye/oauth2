@@ -1424,90 +1424,6 @@ async fn token_endpoint_returns_unsupported_grant_only_after_client_authenticati
 }
 
 #[actix_web::test]
-async fn token_endpoint_identifies_registered_self_signed_client_without_client_id() {
-    let Some(state) = live_rfc9440_token_state(AuthorizationServerProfile::Oauth2Baseline).await
-    else {
-        return;
-    };
-    let client_id = format!("mtls-cert-only-{}", Uuid::now_v7());
-    let certificate = crate::test_support::rfc9440_certificate_fixture(&client_id);
-    insert_token_client(
-        &state,
-        &client_id,
-        "confidential",
-        "self_signed_tls_client_auth",
-        None,
-        vec!["urn:example:unsupported"],
-        false,
-        false,
-        true,
-    )
-    .await;
-    set_client_mtls_thumbprint(&state, &client_id, &certificate.thumbprint).await;
-    let mut connection = get_conn(&state.diesel_db).await.unwrap();
-    sql_query("UPDATE oauth_clients SET jwks = $1 WHERE tenant_id = $2 AND client_id = $3")
-        .bind::<Jsonb, _>(json!({"keys": [{
-            "kid": "registered-client-cert",
-            "x5c": [certificate.header.trim_matches(':')]
-        }]}))
-        .bind::<diesel::sql_types::Uuid, _>(DEFAULT_TENANT_ID)
-        .bind::<Text, _>(&client_id)
-        .execute(&mut connection)
-        .await
-        .unwrap();
-    drop(connection);
-
-    let req = actix_web::test::TestRequest::post()
-        .uri("/token")
-        .app_data(Data::new(crate::http::mtls::MtlsCertificateSource::new(
-            crate::http::mtls::MtlsCertificateSourceMode::Rfc9440,
-        )))
-        .peer_addr("127.0.0.1:12345".parse().expect("peer addr should parse"))
-        .insert_header(("client-cert", certificate.header.as_str()))
-        .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
-        .to_http_request();
-    let body = Bytes::from_static(b"grant_type=urn%3Aexample%3Aunsupported");
-
-    assert_token_error(
-        token(state, req, body).await,
-        StatusCode::BAD_REQUEST,
-        "unsupported_grant_type",
-        false,
-    )
-    .await;
-}
-
-#[actix_web::test]
-async fn mtls_client_credentials_without_client_id_returns_none_when_client_not_active() {
-    let Some(state) = live_rfc9440_token_state(AuthorizationServerProfile::Oauth2Baseline).await
-    else {
-        return;
-    };
-    let presented_certificate =
-        crate::test_support::rfc9440_certificate_fixture("dispatch-mtls-unknown");
-    let req = actix_web::test::TestRequest::post()
-        .uri("/token")
-        .app_data(Data::new(crate::http::mtls::MtlsCertificateSource::new(
-            crate::http::mtls::MtlsCertificateSourceMode::Rfc9440,
-        )))
-        .peer_addr("127.0.0.1:12345".parse().expect("peer addr should parse"))
-        .insert_header(("client-cert", presented_certificate.header.as_str()))
-        .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
-        .to_http_request();
-
-    assert!(
-        mtls_client_credentials_without_client_id(
-            authorization_service(&state).get_ref(),
-            &state.settings.endpoint.trusted_proxy_cidrs,
-            &req,
-        )
-        .await
-        .expect("query should succeed when client certificate is unknown")
-        .is_none()
-    );
-}
-
-#[actix_web::test]
 async fn missing_client_authorization_code_holder_error_returns_none_when_code_missing() {
     let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
         return;
@@ -1742,7 +1658,7 @@ async fn token_endpoint_rejects_client_lookup_db_failure_with_server_error() {
 }
 
 #[actix_web::test]
-async fn token_endpoint_fails_closed_when_certificate_only_mtls_client_lookup_errors() {
+async fn token_endpoint_rejects_mtls_without_client_id_without_client_lookup() {
     let Some(state) =
         live_rfc9440_invalid_db_token_state(AuthorizationServerProfile::Oauth2Baseline).await
     else {
@@ -1762,8 +1678,8 @@ async fn token_endpoint_fails_closed_when_certificate_only_mtls_client_lookup_er
 
     assert_token_error(
         token(state, req, body).await,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "server_error",
+        StatusCode::UNAUTHORIZED,
+        "invalid_client",
         false,
     )
     .await;
@@ -2058,16 +1974,6 @@ fn missing_client_mtls_client_credentials_uses_invalid_request() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(oauth_error_code(&response), "invalid_request");
-}
-
-#[test]
-fn mtls_client_credentials_uses_tls_auth_method() {
-    let credentials = mtls_client_credentials("client-1".to_owned());
-
-    assert_eq!(credentials.client_id.as_deref(), Some("client-1"));
-    assert_eq!(credentials.method, "tls_client_auth");
-    assert!(credentials.client_secret.is_none());
-    assert!(credentials.client_assertion.is_none());
 }
 
 #[test]

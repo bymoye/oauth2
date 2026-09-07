@@ -270,6 +270,7 @@ async fn call_device_token_for_test(
         config: &issuance_config,
         modules: &modules,
         authorization: &authorization,
+        remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let device_service = ServerDeviceGrantService::new(std::sync::Arc::new(
         nazo_valkey::DeviceStore::new(&connection),
@@ -503,6 +504,10 @@ async fn device_authorization_endpoint_disabled_fails_before_client_lookup() {
         device_grant_service(&state),
         token_management_limiter(&state),
         Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
+        Data::new(
+            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                .expect("empty resolver should build"),
+        ),
         false,
         req,
         Bytes::from_static(b"client_id=device-client&scope=openid"),
@@ -621,6 +626,7 @@ async fn device_token_rejects_client_policy_before_polling_state() {
         config: &issuance_config,
         modules: &modules,
         authorization: &authorization,
+        remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let form = device_token_form(Some("not-stored"));
     let request = TestRequest::post().uri("/token").to_http_request();

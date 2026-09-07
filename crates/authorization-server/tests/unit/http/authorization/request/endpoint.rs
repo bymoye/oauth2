@@ -2567,3 +2567,94 @@ async fn authorization_response_crypto_failure_never_falls_back_to_plain_query()
         );
     }
 }
+
+#[actix_web::test]
+async fn baseline_dpop_authorization_does_not_require_par() {
+    let Some(fixture) = LiveAuthorizationFixture::new().await else {
+        return;
+    };
+    let client_id = format!("authorize-baseline-dpop-{}", Uuid::now_v7());
+    fixture
+        .insert_client(
+            &client_id,
+            vec!["https://client.example/callback"],
+            vec!["authorization_code"],
+            true,
+        )
+        .await;
+    fixture
+        .mark_client_sender_constrained(&client_id, true, false)
+        .await;
+    let dpop_jkt = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let uri = format!(
+        "/authorize?client_id={}&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&response_type=code&scope=openid&code_challenge={}&code_challenge_method=S256&dpop_jkt={}",
+        urlencoding::encode(&client_id),
+        VALID_CODE_CHALLENGE,
+        dpop_jkt
+    );
+    let req = actix_web::test::TestRequest::get()
+        .uri(&uri)
+        .to_http_request();
+    let mut q = query(&[
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", "https://client.example/callback"),
+        ("response_type", "code"),
+        ("scope", "openid"),
+        ("code_challenge", VALID_CODE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("dpop_jkt", dpop_jkt),
+    ]);
+
+    let response = authorize_request(fixture.state.clone(), req, &mut q).await;
+    let location = authorization_location(&response);
+    assert_eq!(
+        location.origin().ascii_serialization(),
+        "https://app.example",
+        "baseline sender-bound clients must reach the user confirmation flow without PAR/JAR"
+    );
+    assert_eq!(location.path(), "/auth");
+}
+
+#[actix_web::test]
+async fn baseline_mtls_authorization_does_not_require_par() {
+    let Some(fixture) = LiveAuthorizationFixture::new().await else {
+        return;
+    };
+    let client_id = format!("authorize-baseline-mtls-{}", Uuid::now_v7());
+    fixture
+        .insert_client(
+            &client_id,
+            vec!["https://client.example/callback"],
+            vec!["authorization_code"],
+            true,
+        )
+        .await;
+    fixture
+        .mark_client_sender_constrained(&client_id, false, true)
+        .await;
+    let uri = format!(
+        "/authorize?client_id={}&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&response_type=code&scope=openid&code_challenge={}&code_challenge_method=S256",
+        urlencoding::encode(&client_id),
+        VALID_CODE_CHALLENGE
+    );
+    let req = actix_web::test::TestRequest::get()
+        .uri(&uri)
+        .to_http_request();
+    let mut q = query(&[
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", "https://client.example/callback"),
+        ("response_type", "code"),
+        ("scope", "openid"),
+        ("code_challenge", VALID_CODE_CHALLENGE),
+        ("code_challenge_method", "S256"),
+    ]);
+
+    let response = authorize_request(fixture.state.clone(), req, &mut q).await;
+    let location = authorization_location(&response);
+    assert_eq!(
+        location.origin().ascii_serialization(),
+        "https://app.example",
+        "baseline mTLS-bound clients must reach the user confirmation flow without PAR/JAR"
+    );
+    assert_eq!(location.path(), "/auth");
+}

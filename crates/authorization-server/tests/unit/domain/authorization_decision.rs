@@ -71,6 +71,10 @@ fn authorization_decision_endpoint(
             nazo_identity::TenantId::new(DEFAULT_TENANT_ID).expect("default tenant ID is valid"),
             Arc::new(AuthorizationHttpConfig::from(state.settings.as_ref())),
             runtime_modules,
+            Arc::new(
+                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                    .expect("empty resolver should build"),
+            ),
         )),
         SessionCookieConfig::new(
             &session.session_cookie_name,

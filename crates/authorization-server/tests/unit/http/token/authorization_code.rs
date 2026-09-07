@@ -88,6 +88,7 @@ pub(crate) async fn token_authorization_code(
             config: &config,
             modules: &modules,
             authorization: &authorization,
+            remote_client_documents: crate::test_support::test_remote_client_documents(),
         },
         req,
         client,

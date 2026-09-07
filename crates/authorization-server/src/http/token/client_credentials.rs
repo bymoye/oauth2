@@ -7,6 +7,7 @@ use crate::domain::client_policy::parse_scope;
 use crate::domain::{ClientRow, RefreshTokenPolicy, TokenIssue};
 use crate::http::dpop::DpopErrorContext;
 use crate::http::dpop::dpop_error_response;
+use nazo_auth::TokenIssuanceMode;
 
 use actix_web::http::StatusCode;
 
@@ -16,9 +17,7 @@ use nazo_http_actix::oauth_token_error;
 use serde_json::json;
 
 // 只为机密客户端签发无用户主体的访问令牌。
-use super::issue::{
-    TokenIssuanceContext, issue_token_response_with_service_and_grant, request_idempotency_key,
-};
+use super::issue::{TokenIssuanceContext, issue_token_response, request_idempotency_key};
 use super::{
     SenderConstraintValidationError, ServerTokenService, TokenForm,
     consume_token_client_assertion_with_authorization_service, sender_constraint_multiple_error,
@@ -134,11 +133,14 @@ pub(crate) async fn token_client_credentials_with_service(
         Err(response) => return response,
     };
     let idempotency_key = request_idempotency_key(req);
-    issue_token_response_with_service_and_grant(
+    let mode = idempotency_key.map_or(TokenIssuanceMode::Fresh, |grant_key| {
+        TokenIssuanceMode::Idempotent { grant_key }
+    });
+    issue_token_response(
         issuance,
         token_service,
         client,
-        idempotency_key.as_deref(),
+        mode,
         TokenIssue {
             user_id: None,
             subject: client.client_id.clone(),

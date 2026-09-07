@@ -20,6 +20,7 @@ pub(crate) async fn verify_confidential_client(
     client: &ClientRow,
     credentials: &ClientCredentials,
 ) -> Result<Option<ValidatedClientAssertion>, TokenManagementClientAuthError> {
+    let mut client = client.clone();
     let connection = state.valkey_connection();
     let service = crate::http::authorization::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(
@@ -34,9 +35,10 @@ pub(crate) async fn verify_confidential_client(
         ClientAuthConfig::new(
             &state.settings.endpoint.issuer,
             &state.settings.protocol.client_secret_pepper,
+            crate::test_support::test_remote_client_documents(),
         ),
         request,
-        client,
+        &mut client,
         credentials,
         ClientAuthenticationContext::ConfidentialOnly,
     )

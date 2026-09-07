@@ -53,6 +53,7 @@ pub(crate) async fn token_client_credentials(
             config: &config,
             modules: &modules,
             authorization: &authorization_service,
+            remote_client_documents: crate::test_support::test_remote_client_documents(),
         },
         req,
         client,

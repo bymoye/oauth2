@@ -13,11 +13,15 @@ use crate::settings::{AuthorizationServerProfile, Settings};
 use actix_web::http::header;
 
 use chrono::Duration;
+use chrono::{DateTime, Utc};
 
 use serde_json::Value;
+use serde_json::json;
 
 use nazo_auth::RefreshTokenAuthenticationContext;
+use uuid::Uuid;
 
+use crate::adapters::security::blake3_hex;
 use crate::http::token::issue::TokenIssuanceConfig;
 
 pub(crate) async fn token_refresh(
@@ -43,6 +47,7 @@ pub(crate) async fn token_refresh(
             config: &config,
             modules: &modules,
             authorization: &authorization,
+            remote_client_documents: crate::test_support::test_remote_client_documents(),
         },
         req,
         client,
