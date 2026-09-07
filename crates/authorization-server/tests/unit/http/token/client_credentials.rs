@@ -381,7 +381,7 @@ async fn token_client_credentials_binds_mtls_thumbprint_from_verified_certificat
             .await;
     assert_eq!(
         idempotent_response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(oauth_error_code(&idempotent_response), "server_error");
 }

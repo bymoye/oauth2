@@ -1709,9 +1709,9 @@ async fn token_endpoint_rejects_encrypted_id_token_when_client_jwks_cannot_refre
         .await
         .expect("database connection should be available");
     sql_query(
-        "UPDATE oauth_clients SET jwks_uri = $1, id_token_encrypted_response_alg = $2, id_token_encrypted_response_enc = $3 WHERE tenant_id = $4 AND client_id = $5",
+        "UPDATE oauth_clients SET jwks_uri = $1, jwks = '{\"keys\":[]}'::jsonb, id_token_encrypted_response_alg = $2, id_token_encrypted_response_enc = $3 WHERE tenant_id = $4 AND client_id = $5",
     )
-    .bind::<Text, _>("http://invalid.example/jwks.json")
+    .bind::<Text, _>("https://invalid.example/jwks.json")
     .bind::<Text, _>("RSA-OAEP-256")
     .bind::<Text, _>("A256GCM")
     .bind::<diesel::sql_types::Uuid, _>(DEFAULT_TENANT_ID)
