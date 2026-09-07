@@ -260,8 +260,8 @@ fn response_key_ring_preflight_rejects_unsupported_metadata() {
 
 #[test]
 fn response_key_ring_preflight_ignores_corrupt_response_body() {
-    let ring =
-        TokenIssuanceResponseKeyRing::new("current", [0x11; 32], None).expect("key ring is valid");
+    let ring = TokenIssuanceResponseKeyRing::new("current", rand::random::<[u8; 32]>(), None)
+        .expect("key ring is valid");
     let body = b"response";
     let digest = blake3::hash(body).to_hex().to_string();
     let mut corrupted = row_with_response(&ring, body, &digest);
