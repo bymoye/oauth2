@@ -67,6 +67,40 @@ async fn issue_token_response_with_grant_for_test(
     grant_key: &str,
     issue: TokenIssue,
 ) -> HttpResponse {
+    issue_token_response_with_mode_for_test(
+        state,
+        client,
+        TokenIssuanceMode::SingleUse {
+            grant_key: grant_key.to_owned(),
+        },
+        issue,
+    )
+    .await
+}
+
+async fn issue_token_response_with_idempotent_grant_for_test(
+    state: &TestInfrastructure,
+    client: &ClientRow,
+    grant_key: &str,
+    issue: TokenIssue,
+) -> HttpResponse {
+    issue_token_response_with_mode_for_test(
+        state,
+        client,
+        TokenIssuanceMode::Idempotent {
+            grant_key: grant_key.to_owned(),
+        },
+        issue,
+    )
+    .await
+}
+
+async fn issue_token_response_with_mode_for_test(
+    state: &TestInfrastructure,
+    client: &ClientRow,
+    mode: TokenIssuanceMode,
+    issue: TokenIssue,
+) -> HttpResponse {
     let service = ServerTokenService::new(
         crate::test_support::token_issuance_repository(state.diesel_db.clone()),
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(
@@ -86,9 +120,7 @@ async fn issue_token_response_with_grant_for_test(
         },
         &service,
         client,
-        TokenIssuanceMode::SingleUse {
-            grant_key: grant_key.to_owned(),
-        },
+        mode,
         issue,
     )
     .await
@@ -1383,15 +1415,25 @@ async fn same_idempotent_grant_retry_reuses_the_persisted_response() {
     let grant_key = format!("idempotent-test-{}", Uuid::now_v7());
     let mut first_issue = token_issue_without_openid();
     first_issue.include_refresh = false;
-    let first =
-        issue_token_response_with_grant_for_test(&state, &client, &grant_key, first_issue).await;
+    let first = issue_token_response_with_idempotent_grant_for_test(
+        &state,
+        &client,
+        &grant_key,
+        first_issue,
+    )
+    .await;
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = response_body(first).await;
 
     let mut retry_issue = token_issue_without_openid();
     retry_issue.include_refresh = false;
-    let retry =
-        issue_token_response_with_grant_for_test(&state, &client, &grant_key, retry_issue).await;
+    let retry = issue_token_response_with_idempotent_grant_for_test(
+        &state,
+        &client,
+        &grant_key,
+        retry_issue,
+    )
+    .await;
     assert_eq!(retry.status(), StatusCode::OK);
     assert_eq!(response_body(retry).await, first_body);
 }

@@ -338,10 +338,10 @@ pub(crate) async fn token_authorization_code_with_service(
     // Pure parameter validation runs before any sender proof, client
     // assertion, or state transition so that an erroneous redemption never
     // consumes a Pending authorization code.
-    let pending_facts = match expected_payload.as_deref() {
+    let pending_audiences = match expected_payload.as_deref() {
         Some(payload) => {
             match validate_pending_authorization_code_request(issuance, client, form, payload) {
-                Ok(facts) => Some(facts),
+                Ok(audiences) => Some(audiences),
                 Err(response) => return response,
             }
         }
@@ -497,10 +497,30 @@ pub(crate) async fn token_authorization_code_with_service(
     }
     let refresh_token_dpop_jkt = refresh_token_dpop_binding(client, &payload, dpop_jkt.clone());
     let refresh_token_mtls_x5t_s256 = mtls_x5t_s256.clone();
-    // begin only yields Consuming from a Pending state, so the pure facts
-    // computed before the sender proof must exist here.
-    let (audiences, subject) =
-        pending_facts.expect("Consuming requires pre-computed pending facts");
+    // begin only yields Consuming from a Pending state, so the pure audience
+    // facts computed before the sender proof must exist here.  Subject
+    // derivation is intentionally performed after begin: a missing pairwise
+    // secret is a server-side policy failure, not a client parameter error,
+    // and must terminally fail the one-time grant.
+    let audiences = pending_audiences.expect("Consuming requires pre-computed pending facts");
+    let subject = match authorization_code_subject(issuance.config, &payload, client) {
+        Ok(subject) => subject,
+        Err(_) => {
+            mark_failed_authorization_code(
+                token_service,
+                issuance.config.auth_code_ttl_seconds(),
+                &code_hash,
+                "subject_policy_invalid",
+            )
+            .await;
+            return oauth_token_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "subject invalid",
+                false,
+            );
+        }
+    };
     issue_token_response(
         issuance,
         token_service,
@@ -531,7 +551,7 @@ fn validate_pending_authorization_code_request(
     client: &ClientRow,
     form: &TokenForm,
     payload: &CodePayload,
-) -> Result<(Vec<String>, String), HttpResponse> {
+) -> Result<Vec<String>, HttpResponse> {
     if payload.expires_at <= Utc::now() {
         return Err(oauth_token_error(
             StatusCode::BAD_REQUEST,
@@ -616,15 +636,7 @@ fn validate_pending_authorization_code_request(
             ));
         }
     }
-    let subject = authorization_code_subject(issuance.config, payload, client).map_err(|_| {
-        oauth_token_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server_error",
-            "subject invalid",
-            false,
-        )
-    })?;
-    Ok((audiences, subject))
+    Ok(audiences)
 }
 
 async fn mark_failed_authorization_code(

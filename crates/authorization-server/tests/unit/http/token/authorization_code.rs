@@ -1397,7 +1397,7 @@ async fn token_authorization_code_accepts_matching_mtls_bound_code_before_issuin
 }
 
 #[actix_web::test]
-async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audience_errors() {
+async fn token_authorization_code_preserves_pending_state_for_redirect_pkce_and_audience_errors() {
     let Some(fixture) = LiveAuthorizationCodeFixture::new().await else {
         return;
     };
@@ -1420,12 +1420,10 @@ async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audi
     let redirect_response =
         token_authorization_code(&fixture.state, &req, &client, &redirect_form, None).await;
     assert_eq!(oauth_error_code(&redirect_response), "invalid_grant");
-    match fixture.code_state(&redirect_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "client_or_redirect_uri_mismatch");
-        }
-        _ => panic!("redirect mismatch should mark the authorization code as failed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&redirect_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 
     let missing_verifier_code = format!("code-{}", Uuid::now_v7());
     fixture
@@ -1444,12 +1442,10 @@ async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audi
         oauth_error_code(&missing_verifier_response),
         "invalid_grant"
     );
-    match fixture.code_state(&missing_verifier_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "missing_code_verifier");
-        }
-        _ => panic!("missing code_verifier should mark the authorization code as failed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&missing_verifier_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 
     let pkce_failed_code = format!("code-{}", Uuid::now_v7());
     fixture
@@ -1465,12 +1461,10 @@ async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audi
     let pkce_failed_response =
         token_authorization_code(&fixture.state, &req, &client, &pkce_failed_form, None).await;
     assert_eq!(oauth_error_code(&pkce_failed_response), "invalid_grant");
-    match fixture.code_state(&pkce_failed_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "pkce_failed");
-        }
-        _ => panic!("PKCE mismatch should mark the authorization code as failed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&pkce_failed_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 
     let pkce_state_code = format!("code-{}", Uuid::now_v7());
     let mut pkce_state_payload = payload_for_client(&client);
@@ -1496,12 +1490,10 @@ async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audi
         StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(oauth_error_code(&pkce_state_response), "server_error");
-    match fixture.code_state(&pkce_state_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "pkce_state_invalid");
-        }
-        _ => panic!("invalid PKCE state should mark the authorization code as failed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&pkce_state_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 
     let audience_code = format!("code-{}", Uuid::now_v7());
     fixture
@@ -1518,12 +1510,10 @@ async fn token_authorization_code_marks_failed_states_for_redirect_pkce_and_audi
         token_authorization_code(&fixture.state, &req, &client, &audience_form, None).await;
     assert_eq!(audience_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(oauth_error_code(&audience_response), "invalid_target");
-    match fixture.code_state(&audience_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "audience_not_allowed");
-        }
-        _ => panic!("invalid audience should mark the authorization code as failed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&audience_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 }
 
 #[actix_web::test]
@@ -1719,12 +1709,10 @@ async fn token_authorization_code_reports_busy_failed_and_missing_states() {
     .await;
     assert_eq!(expired_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(oauth_error_code(&expired_response), "invalid_grant");
-    match fixture.code_state(&expired_code).await {
-        AuthorizationCodeState::Failed { error, .. } => {
-            assert_eq!(error, "authorization_code_expired");
-        }
-        _ => panic!("expired authorization code should be failed closed"),
-    }
+    assert!(matches!(
+        fixture.code_state(&expired_code).await,
+        AuthorizationCodeState::Pending { .. }
+    ));
 
     let failed_code = format!("code-{}", Uuid::now_v7());
     fixture
