@@ -36,7 +36,7 @@ fn tls_server(
     content_type: &str,
     body: Vec<u8>,
     content_length: bool,
-) -> (SocketAddr, thread::JoinHandle<()>) {
+) -> (SocketAddr, thread::JoinHandle<()>, Vec<u8>) {
     tls_server_sequence(vec![(
         status,
         content_type.to_owned(),
@@ -47,12 +47,13 @@ fn tls_server(
 
 fn tls_server_sequence(
     responses: Vec<(u16, String, Vec<u8>, bool)>,
-) -> (SocketAddr, thread::JoinHandle<()>) {
+) -> (SocketAddr, thread::JoinHandle<()>, Vec<u8>) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate TLS test key");
     let certificate = CertificateParams::new(vec!["localhost".to_owned()])
         .expect("TLS certificate params")
         .self_signed(&key)
         .expect("self-sign TLS test certificate");
+    let certificate_der = certificate.der().to_vec();
     let private_key = rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der());
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -92,19 +93,24 @@ fn tls_server_sequence(
             stream.write_all(&body).expect("write TLS test body");
         }
     });
-    (address, handle)
+    (address, handle, certificate_der)
 }
 
-fn resolver_for(address: SocketAddr) -> RemoteClientDocumentResolver {
-    RemoteClientDocumentResolver::new_for_tests(&[format!("https://localhost:{}", address.port())])
-        .expect("test resolver should build")
+fn resolver_for(address: SocketAddr, certificate_der: &[u8]) -> RemoteClientDocumentResolver {
+    let certificate =
+        reqwest::Certificate::from_der(certificate_der).expect("test TLS certificate should parse");
+    RemoteClientDocumentResolver::new_with_root_certificates(
+        &[format!("https://localhost:{}", address.port())],
+        vec![certificate],
+    )
+    .expect("test resolver should build")
 }
 
 #[tokio::test]
 async fn jwks_fetches_valid_documents_and_reuses_a_matching_cache_entry() {
     let body = br#"{"keys":[{"kid":"key-1","kty":"OKP"}]}"#.to_vec();
-    let (address, server) = tls_server(200, "application/json", body, true);
-    let resolver = resolver_for(address);
+    let (address, server, certificate_der) = tls_server(200, "application/json", body, true);
+    let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
 
     let first = resolver
@@ -122,7 +128,7 @@ async fn jwks_fetches_valid_documents_and_reuses_a_matching_cache_entry() {
 
 #[tokio::test]
 async fn jwks_refreshes_for_an_unknown_kid_and_rejects_bad_payloads() {
-    let (address, server) = tls_server_sequence(vec![
+    let (address, server, certificate_der) = tls_server_sequence(vec![
         (
             200,
             "application/json".to_owned(),
@@ -136,7 +142,7 @@ async fn jwks_refreshes_for_an_unknown_kid_and_rejects_bad_payloads() {
             true,
         ),
     ]);
-    let resolver = resolver_for(address);
+    let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
     resolver
         .jwks_for_kid(&uri, Some("old"))
@@ -155,8 +161,8 @@ async fn jwks_refreshes_for_an_unknown_kid_and_rejects_bad_payloads() {
         (200, "application/json", b"not-json".to_vec()),
         (200, "application/json", br#"{"keys":{}}"#.to_vec()),
     ] {
-        let (address, server) = tls_server(status, content_type, body, true);
-        let resolver = resolver_for(address);
+        let (address, server, certificate_der) = tls_server(status, content_type, body, true);
+        let resolver = resolver_for(address, &certificate_der);
         let uri = format!("https://localhost:{}/jwks", address.port());
         assert!(resolver.jwks_for_kid(&uri, None).await.is_err());
         server.join().expect("bad-payload TLS server should exit");
@@ -165,8 +171,9 @@ async fn jwks_refreshes_for_an_unknown_kid_and_rejects_bad_payloads() {
 
 #[tokio::test]
 async fn request_objects_validate_utf8_size_and_content_type() {
-    let (address, server) = tls_server(200, "application/jwt", b"  signed.jwt \n".to_vec(), true);
-    let resolver = resolver_for(address);
+    let (address, server, certificate_der) =
+        tls_server(200, "application/jwt", b"  signed.jwt \n".to_vec(), true);
+    let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/request", address.port());
     assert_eq!(
         resolver
@@ -180,8 +187,8 @@ async fn request_objects_validate_utf8_size_and_content_type() {
         .expect("request object TLS server should exit");
 
     for body in [Vec::new(), vec![0xff, 0xfe]] {
-        let (address, server) = tls_server(200, "application/jwt", body, true);
-        let resolver = resolver_for(address);
+        let (address, server, certificate_der) = tls_server(200, "application/jwt", body, true);
+        let resolver = resolver_for(address, &certificate_der);
         let uri = format!("https://localhost:{}/request", address.port());
         assert!(resolver.request_object(&uri).await.is_err());
         server
@@ -192,31 +199,31 @@ async fn request_objects_validate_utf8_size_and_content_type() {
 
 #[tokio::test]
 async fn remote_fetch_rejects_oversize_bodies_dns_failures_and_exhausted_slots() {
-    let (address, server) = tls_server(
+    let (address, server, certificate_der) = tls_server(
         200,
         "application/json",
         vec![b'x'; MAX_DOCUMENT_BYTES + 1],
         true,
     );
-    let resolver = resolver_for(address);
+    let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
     assert!(resolver.jwks_for_kid(&uri, None).await.is_err());
     server.join().expect("oversized TLS server should exit");
 
-    let (address, server) = tls_server(
+    let (address, server, certificate_der) = tls_server(
         200,
         "application/json",
         vec![b'x'; MAX_DOCUMENT_BYTES + 1],
         false,
     );
-    let resolver = resolver_for(address);
+    let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
     assert!(resolver.jwks_for_kid(&uri, None).await.is_err());
     server
         .join()
         .expect("streamed oversized TLS server should exit");
 
-    let resolver = RemoteClientDocumentResolver::new_for_tests(&[]).expect("resolver should build");
+    let resolver = RemoteClientDocumentResolver::new(&[]).expect("resolver should build");
     let blocked_error = resolver
         .fetch(
             "https://localhost:1/jwks",

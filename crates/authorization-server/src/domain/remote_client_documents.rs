@@ -22,12 +22,18 @@ pub(crate) struct RemoteClientDocumentResolver {
     private_network_origins: Arc<HashSet<String>>,
     jwks_cache: Cache<String, Arc<Value>>,
     fetch_slots: Arc<Semaphore>,
-    #[cfg(test)]
-    accept_invalid_certs: bool,
+    root_certificates: Arc<Vec<reqwest::Certificate>>,
 }
 
 impl RemoteClientDocumentResolver {
     pub(crate) fn new(private_network_origins: &[String]) -> Result<Self, String> {
+        Self::new_with_root_certificates(private_network_origins, Vec::new())
+    }
+
+    pub(crate) fn new_with_root_certificates(
+        private_network_origins: &[String],
+        root_certificates: Vec<reqwest::Certificate>,
+    ) -> Result<Self, String> {
         let mut origins = HashSet::new();
         for value in private_network_origins {
             let parsed = validate_https_url(value, false)?;
@@ -45,16 +51,8 @@ impl RemoteClientDocumentResolver {
                 .time_to_live(JWKS_CACHE_TTL)
                 .build(),
             fetch_slots: Arc::new(Semaphore::new(REMOTE_FETCH_CONCURRENCY)),
-            #[cfg(test)]
-            accept_invalid_certs: false,
+            root_certificates: Arc::new(root_certificates),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_tests(private_network_origins: &[String]) -> Result<Self, String> {
-        let mut resolver = Self::new(private_network_origins)?;
-        resolver.accept_invalid_certs = true;
-        Ok(resolver)
     }
 
     /// Use a cached document only if it contains the requested signing key.
@@ -162,16 +160,13 @@ impl RemoteClientDocumentResolver {
             return Err("remote document resolved to a blocked network".to_owned());
         }
 
-        let client_builder = reqwest::Client::builder()
+        let mut client_builder = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none());
-        #[cfg(test)]
-        let client_builder = if self.accept_invalid_certs {
-            client_builder.danger_accept_invalid_certs(true)
-        } else {
-            client_builder
-        };
+        for certificate in self.root_certificates.iter() {
+            client_builder = client_builder.add_root_certificate(certificate.clone());
+        }
         let client = client_builder
             .resolve_to_addrs(host, &addresses)
             .build()
