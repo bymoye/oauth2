@@ -1,7 +1,7 @@
 use crate::adapters::security::{blake3_hex, random_urlsafe_token};
 use crate::domain::ClientRow;
 use crate::domain::client_jwe::{JwePayloadKind, client_jwe_key, encrypt_compact_jwe};
-use crate::domain::client_policy::refresh_client_jwks;
+use crate::domain::client_policy::refresh_client_jwks_for_encryption;
 use crate::http::views::append_query;
 use actix_web::HttpResponse;
 use actix_web::http::StatusCode;
@@ -151,10 +151,14 @@ pub(crate) async fn authorization_response_redirect_with_context(
                 "authorization response protection failed.",
             );
         };
-        if (client.authorization_encrypted_response_alg.is_some()
-            || client.authorization_encrypted_response_enc.is_some())
-            && let Err(error) =
-                refresh_client_jwks(&mut client, context.remote_client_documents, None).await
+        let response_encryption_configured = client.authorization_encrypted_response_alg.is_some()
+            || client.authorization_encrypted_response_enc.is_some();
+        if let Err(error) = refresh_client_jwks_for_encryption(
+            &mut client,
+            context.remote_client_documents,
+            response_encryption_configured,
+        )
+        .await
         {
             tracing::warn!(%error, "JARM encryption jwks_uri could not be refreshed");
             return oauth_error(

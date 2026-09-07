@@ -1,5 +1,7 @@
 use crate::test_support::TestInfrastructure;
 
+use crate::adapters::security::blake3_hex;
+
 use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
 
 use crate::domain::tenancy::DEFAULT_REALM_ID;
@@ -181,6 +183,27 @@ fn token_request() -> HttpRequest {
 }
 
 #[test]
+fn client_credentials_issuance_mode_is_fresh_or_idempotent_from_request_header() {
+    assert!(matches!(
+        client_credentials_issuance_mode(&token_request()),
+        nazo_auth::TokenIssuanceMode::Fresh
+    ));
+
+    let request = TestRequest::post()
+        .uri("/token")
+        .insert_header(("Idempotency-Key", "client-credentials-test-key"))
+        .to_http_request();
+    assert!(matches!(
+        client_credentials_issuance_mode(&request),
+        nazo_auth::TokenIssuanceMode::Idempotent { ref grant_key }
+            if grant_key == &format!(
+                "idempotency:{}",
+                blake3_hex("client-credentials-test-key")
+            )
+    ));
+}
+
+#[test]
 fn client_credentials_defaults_to_allowed_scopes_and_default_audience() {
     let settings = settings(AuthorizationServerProfile::Oauth2Baseline);
     let client = client();
@@ -343,6 +366,24 @@ async fn token_client_credentials_binds_mtls_thumbprint_from_verified_certificat
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(oauth_error_code(&response), "server_error");
+
+    let idempotent_request = TestRequest::post()
+        .uri("/token")
+        .insert_header(("Idempotency-Key", "client-credentials-retry"))
+        .app_data(Data::new(crate::http::mtls::MtlsCertificateSource::new(
+            crate::http::mtls::MtlsCertificateSourceMode::Rfc9440,
+        )))
+        .peer_addr("127.0.0.1:12345".parse().expect("peer addr should parse"))
+        .insert_header(("client-cert", certificate.header.as_str()))
+        .to_http_request();
+    let idempotent_response =
+        token_client_credentials(&state, &idempotent_request, &client, &form(None, &[]), None)
+            .await;
+    assert_eq!(
+        idempotent_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(oauth_error_code(&idempotent_response), "server_error");
 }
 
 #[actix_web::test]

@@ -702,3 +702,7 @@ fn row_from_domain(token: &RefreshToken) -> Result<RefreshTokenRow, RepositoryEr
 fn map_error(error: diesel::result::Error) -> RepositoryError {
     RepositoryError::Unexpected(error.to_string())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/repositories/tokens.rs"]
+mod tests;

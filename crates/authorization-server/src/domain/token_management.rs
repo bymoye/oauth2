@@ -18,7 +18,7 @@ use crate::{
         security::blake3_hex,
     },
     domain::client_jwe::{JwePayloadKind, client_jwe_key, encrypt_compact_jwe},
-    domain::client_policy::refresh_client_jwks,
+    domain::client_policy::refresh_client_jwks_for_encryption,
     http::{
         authorization::{AuthorizationHttpConfig, ServerAuthorizationService},
         token::{
@@ -248,20 +248,19 @@ impl TokenManagementOperations for ServerTokenManagementOperations {
             let response_requires_signature = signed_response_requested
                 || client.security_policy.require_signed_introspection_response;
             if response_requires_signature {
-                if client.introspection_encrypted_response_alg.is_some()
-                    || client.introspection_encrypted_response_enc.is_some()
-                {
-                    refresh_client_jwks(
-                        &mut client,
-                        self.remote_client_documents.as_ref(),
-                        None,
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::warn!(%error, "introspection encryption jwks_uri could not be refreshed");
-                        TokenManagementError::ResponseProtectionFailed
-                    })?;
-                }
+                let response_encryption_configured =
+                    client.introspection_encrypted_response_alg.is_some()
+                        || client.introspection_encrypted_response_enc.is_some();
+                refresh_client_jwks_for_encryption(
+                    &mut client,
+                    self.remote_client_documents.as_ref(),
+                    response_encryption_configured,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(%error, "introspection encryption jwks_uri could not be refreshed");
+                    TokenManagementError::ResponseProtectionFailed
+                })?;
                 return self
                     .protected_introspection(&client, &inspection)
                     .await

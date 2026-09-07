@@ -1686,6 +1686,58 @@ async fn token_endpoint_rejects_mtls_without_client_id_without_client_lookup() {
 }
 
 #[actix_web::test]
+async fn token_endpoint_rejects_encrypted_id_token_when_client_jwks_cannot_refresh() {
+    let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
+        return;
+    };
+    let client_id = format!("encrypted-id-token-refresh-{}", Uuid::now_v7());
+    let client_secret = fixture_secret("encrypted-id-token-refresh");
+    insert_token_client(
+        &state,
+        &client_id,
+        "confidential",
+        "client_secret_post",
+        Some(fixture_secret_hash(&state, &client_secret)),
+        vec!["authorization_code"],
+        false,
+        false,
+        true,
+    )
+    .await;
+
+    let mut connection = get_conn(&state.diesel_db)
+        .await
+        .expect("database connection should be available");
+    sql_query(
+        "UPDATE oauth_clients SET jwks_uri = $1, id_token_encrypted_response_alg = $2, id_token_encrypted_response_enc = $3 WHERE tenant_id = $4 AND client_id = $5",
+    )
+    .bind::<Text, _>("http://invalid.example/jwks.json")
+    .bind::<Text, _>("RSA-OAEP-256")
+    .bind::<Text, _>("A256GCM")
+    .bind::<diesel::sql_types::Uuid, _>(DEFAULT_TENANT_ID)
+    .bind::<Text, _>(&client_id)
+    .execute(&mut connection)
+    .await
+    .expect("encrypted response metadata should be updated");
+    drop(connection);
+
+    let req = token_request("application/x-www-form-urlencoded");
+    let body = Bytes::from(format!(
+        "grant_type=authorization_code&code=unused&client_id={}&client_secret={}",
+        urlencoding::encode(&client_id),
+        urlencoding::encode(&client_secret),
+    ));
+
+    assert_token_error(
+        token(state, req, body).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        false,
+    )
+    .await;
+}
+
+#[actix_web::test]
 async fn token_endpoint_rejects_confidential_client_without_required_client_secret() {
     let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
         return;

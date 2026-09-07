@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::adapters::security::{access_token_tenant_id, blake3_hex, constant_time_eq};
 use crate::domain::client_jwe::{JwePayloadKind, client_jwe_key, encrypt_compact_jwe};
-use crate::domain::client_policy::{parse_scope, refresh_client_jwks};
+use crate::domain::client_policy::{parse_scope, refresh_client_jwks_for_encryption};
 use crate::domain::oidc_claims::oidc_user_claims;
 use crate::http::dpop::{DpopError, validate_dpop_proof_with_store};
 use crate::http::mtls::request_mtls_thumbprint;
@@ -157,20 +157,18 @@ impl ServerUserinfoOperations {
             &claims.userinfo_claim_requests,
             None,
         );
-        if client.userinfo_encrypted_response_alg.is_some()
-            || client.userinfo_encrypted_response_enc.is_some()
-        {
-            refresh_client_jwks(
-                &mut client,
-                self.handles.remote_client_documents.as_ref(),
-                None,
-            )
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "userinfo encryption jwks_uri could not be refreshed");
-                UserinfoError::ResponseProtectionFailed
-            })?;
-        }
+        let response_encryption_configured = client.userinfo_encrypted_response_alg.is_some()
+            || client.userinfo_encrypted_response_enc.is_some();
+        refresh_client_jwks_for_encryption(
+            &mut client,
+            self.handles.remote_client_documents.as_ref(),
+            response_encryption_configured,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "userinfo encryption jwks_uri could not be refreshed");
+            UserinfoError::ResponseProtectionFailed
+        })?;
         let representation = self
             .protect_response(&client, response_claims)
             .await

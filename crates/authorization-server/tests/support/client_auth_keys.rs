@@ -68,3 +68,37 @@ impl RemoteJwksResolverPort for CountingJwksResolver {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn counting_resolver_covers_success_missing_and_failure_paths() {
+        let resolver = CountingJwksResolver::with_document(
+            "https://client.example/jwks",
+            json!({"keys": [{"kid": "rotated"}]}),
+        );
+        assert_eq!(resolver.calls(), 0);
+        let document = resolver
+            .resolve("https://client.example/jwks", Some("rotated"))
+            .await
+            .expect("configured document should resolve");
+        assert_eq!(document["keys"][0]["kid"], "rotated");
+        let missing = resolver
+            .resolve("https://other.example/jwks", None)
+            .await
+            .expect_err("unknown URI should fail closed");
+        assert_eq!(missing, "test JWKS URI is not configured");
+
+        let failing = CountingJwksResolver::with_failure("resolver unavailable");
+        let error = failing
+            .resolve("https://client.example/jwks", None)
+            .await
+            .expect_err("configured dependency failure should propagate");
+        assert_eq!(error, "resolver unavailable");
+        assert_eq!(resolver.calls(), 2);
+        assert_eq!(failing.calls(), 1);
+    }
+}

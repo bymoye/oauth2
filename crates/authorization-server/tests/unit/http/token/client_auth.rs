@@ -51,6 +51,38 @@ pub(crate) async fn verify_confidential_client(
     })
 }
 
+async fn verify_confidential_client_with_resolver(
+    state: &TestInfrastructure,
+    request: &ClientAuthRequestFacts,
+    client: &ClientRow,
+    credentials: &ClientCredentials,
+    resolver: &dyn nazo_http_actix::RemoteJwksResolverPort,
+) -> Result<Option<ValidatedClientAssertion>, TokenManagementClientAuthError> {
+    let mut client = client.clone();
+    let connection = state.valkey_connection();
+    let service = crate::http::authorization::ServerAuthorizationService::new(
+        nazo_postgres::AuthorizationFlowRepository::new(
+            state.diesel_db.clone(),
+            crate::domain::tenancy::DEFAULT_TENANT_ID,
+        ),
+        std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
+        state.keyset.clone(),
+    );
+    authenticate_client_with_dependencies(
+        &service,
+        ClientAuthConfig::new(
+            &state.settings.endpoint.issuer,
+            &state.settings.protocol.client_secret_pepper,
+            resolver,
+        ),
+        request,
+        &mut client,
+        credentials,
+        ClientAuthenticationContext::ConfidentialOnly,
+    )
+    .await
+}
+
 fn revocation_public_client_allows_credentials(credentials: &ClientCredentials) -> bool {
     credentials.method == "none"
         && credentials.client_secret.is_none()
@@ -468,6 +500,124 @@ async fn private_key_jwt_requires_present_and_well_formed_assertion() {
         .await,
         Err(TokenManagementClientAuthError::InvalidClient)
     ));
+}
+
+#[actix_web::test]
+async fn private_key_jwt_refreshes_registered_jwks_and_fails_closed_on_resolver_error() {
+    let state = token_management_state();
+    let key = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
+    let mut client = confidential_client_with_secret(&fixture_secret("dynamic-jwks"));
+    client.token_endpoint_auth_method = "private_key_jwt".to_owned();
+    client.jwks_uri = Some("https://client.example/jwks".to_owned());
+
+    let mut credentials = client_credentials("private_key_jwt");
+    credentials.client_assertion = Some(signed_client_assertion(
+        &client.client_id,
+        &state.settings.endpoint.issuer,
+        "rotated-kid",
+        &key,
+        "dynamic-jwks-refresh",
+    ));
+    let resolver = crate::test_support::CountingJwksResolver::with_failure(
+        "remote JWKS dependency unavailable",
+    );
+
+    let error = verify_confidential_client_with_resolver(
+        &state,
+        &ClientAuthRequestFacts::new("/token", None),
+        &client,
+        &credentials,
+        &resolver,
+    )
+    .await
+    .expect_err("a failed dynamic JWKS refresh must fail client authentication");
+    assert!(matches!(
+        error,
+        TokenManagementClientAuthError::StoreUnavailable
+    ));
+    assert_eq!(resolver.calls(), 1);
+}
+
+#[actix_web::test]
+async fn self_signed_mtls_refreshes_registered_jwks_and_fails_closed_on_resolver_error() {
+    let state = token_management_state();
+    let mut client = confidential_client_with_secret(&fixture_secret("dynamic-mtls-jwks"));
+    client.token_endpoint_auth_method = "self_signed_tls_client_auth".to_owned();
+    client.jwks_uri = Some("https://client.example/jwks".to_owned());
+    let resolver = crate::test_support::CountingJwksResolver::with_failure(
+        "remote mTLS JWKS dependency unavailable",
+    );
+
+    let error = verify_confidential_client_with_resolver(
+        &state,
+        &ClientAuthRequestFacts::new(
+            "/token",
+            Some(crate::http::mtls::MtlsClientCertificate::default()),
+        ),
+        &client,
+        &client_credentials("self_signed_tls_client_auth"),
+        &resolver,
+    )
+    .await
+    .expect_err("a failed dynamic mTLS JWKS refresh must fail client authentication");
+    assert!(matches!(
+        error,
+        TokenManagementClientAuthError::StoreUnavailable
+    ));
+    assert_eq!(resolver.calls(), 1);
+}
+
+#[actix_web::test]
+async fn introspection_and_revocation_wrappers_preserve_public_client_policy() {
+    let state = token_management_state();
+    let connection = state.valkey_connection();
+    let service = crate::http::authorization::ServerAuthorizationService::new(
+        nazo_postgres::AuthorizationFlowRepository::new(
+            state.diesel_db.clone(),
+            crate::domain::tenancy::DEFAULT_TENANT_ID,
+        ),
+        std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
+        state.keyset.clone(),
+    );
+    let resolver = crate::test_support::CountingJwksResolver::default();
+    let config = ClientAuthConfig::new(
+        &state.settings.endpoint.issuer,
+        &state.settings.protocol.client_secret_pepper,
+        &resolver,
+    );
+    let request = ClientAuthRequestFacts::new("/introspect", None);
+    let mut public_client = confidential_client_with_secret(&fixture_secret("public-wrapper"));
+    public_client.client_type = "public".to_owned();
+    public_client.token_endpoint_auth_method = "none".to_owned();
+    let credentials = client_credentials("none");
+
+    let introspection_error = authenticate_introspection_client_with_dependencies(
+        &service,
+        config,
+        &request,
+        &mut public_client,
+        &credentials,
+    )
+    .await
+    .expect_err("introspection must reject public-client credentials");
+    assert!(matches!(
+        introspection_error,
+        TokenManagementClientAuthError::PublicClientCredentialsForbidden
+    ));
+
+    let revocation = authenticate_revocation_client_with_dependencies(
+        &service,
+        config,
+        &request,
+        &mut public_client,
+        &credentials,
+    )
+    .await;
+    assert!(
+        revocation.is_ok(),
+        "revocation allows public clients with none"
+    );
+    assert_eq!(resolver.calls(), 0);
 }
 
 #[actix_web::test]

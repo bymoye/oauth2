@@ -763,22 +763,7 @@ impl TokenRepositoryPort for TokenIssuanceRepository {
                             let record = row
                                 .into_record(self.response_keys.as_ref())
                                 .map_err(CommitTransactionError::Repository)?;
-                            if record.request_digest != input.request_digest {
-                                return Ok(CommitTokenIssuanceResult::Conflict);
-                            }
-                            return Ok(match input.mode {
-                                TokenIssuanceMode::Idempotent { .. }
-                                    if record.response_body.is_some() =>
-                                {
-                                    CommitTokenIssuanceResult::Existing(Box::new(record))
-                                }
-                                TokenIssuanceMode::Fresh | TokenIssuanceMode::SingleUse { .. } => {
-                                    CommitTokenIssuanceResult::AlreadyUsed
-                                }
-                                TokenIssuanceMode::Idempotent { .. } => {
-                                    CommitTokenIssuanceResult::Conflict
-                                }
-                            });
+                            return Ok(classify_existing_issuance(&input, record));
                         }
                         if let Some(refresh) = input.refresh_token.as_ref() {
                             match TokenRepository::persist_refresh_token_on_connection(
@@ -980,6 +965,24 @@ impl TokenRepositoryPort for TokenIssuanceRepository {
                 .await
                 .map_err(map_repository_error)
         })
+    }
+}
+
+fn classify_existing_issuance(
+    input: &CommitTokenIssuance,
+    record: TokenIssuanceRecord,
+) -> CommitTokenIssuanceResult {
+    if record.request_digest != input.request_digest {
+        return CommitTokenIssuanceResult::Conflict;
+    }
+    match &input.mode {
+        TokenIssuanceMode::Idempotent { .. } if record.response_body.is_some() => {
+            CommitTokenIssuanceResult::Existing(Box::new(record))
+        }
+        TokenIssuanceMode::Fresh | TokenIssuanceMode::SingleUse { .. } => {
+            CommitTokenIssuanceResult::AlreadyUsed
+        }
+        TokenIssuanceMode::Idempotent { .. } => CommitTokenIssuanceResult::Conflict,
     }
 }
 

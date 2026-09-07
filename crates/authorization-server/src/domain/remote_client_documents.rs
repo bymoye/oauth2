@@ -22,6 +22,8 @@ pub(crate) struct RemoteClientDocumentResolver {
     private_network_origins: Arc<HashSet<String>>,
     jwks_cache: Cache<String, Arc<Value>>,
     fetch_slots: Arc<Semaphore>,
+    #[cfg(test)]
+    accept_invalid_certs: bool,
 }
 
 impl RemoteClientDocumentResolver {
@@ -43,7 +45,16 @@ impl RemoteClientDocumentResolver {
                 .time_to_live(JWKS_CACHE_TTL)
                 .build(),
             fetch_slots: Arc::new(Semaphore::new(REMOTE_FETCH_CONCURRENCY)),
+            #[cfg(test)]
+            accept_invalid_certs: false,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(private_network_origins: &[String]) -> Result<Self, String> {
+        let mut resolver = Self::new(private_network_origins)?;
+        resolver.accept_invalid_certs = true;
+        Ok(resolver)
     }
 
     /// Use a cached document only if it contains the requested signing key.
@@ -151,10 +162,17 @@ impl RemoteClientDocumentResolver {
             return Err("remote document resolved to a blocked network".to_owned());
         }
 
-        let client = reqwest::Client::builder()
+        let client_builder = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::none());
+        #[cfg(test)]
+        let client_builder = if self.accept_invalid_certs {
+            client_builder.danger_accept_invalid_certs(true)
+        } else {
+            client_builder
+        };
+        let client = client_builder
             .resolve_to_addrs(host, &addresses)
             .build()
             .map_err(|_| "remote document HTTP client could not be built".to_owned())?;
