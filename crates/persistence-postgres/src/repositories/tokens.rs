@@ -156,22 +156,6 @@ impl TokenRepository {
             .transpose()
     }
 
-    pub async fn persist_refresh_token(
-        &self,
-        token: NewRefreshToken,
-    ) -> Result<RefreshTokenPersistResult, RepositoryError> {
-        let authentication_context = validate_new_refresh_token(&token)?;
-        let mut connection = self.connection().await?;
-        connection
-            .transaction::<RefreshTokenPersistResult, diesel::result::Error, _>(
-                async |connection| {
-                    persist_refresh_token_inner(connection, &token, authentication_context).await
-                },
-            )
-            .await
-            .map_err(map_error)
-    }
-
     /// Apply a refresh-token mutation inside a caller-owned transaction.
     ///
     /// This helper deliberately performs no pool acquisition and never starts
@@ -185,41 +169,6 @@ impl TokenRepository {
         persist_refresh_token_inner(connection, &token, authentication_context)
             .await
             .map_err(map_error)
-    }
-
-    pub async fn lost_response_successor_or_compromise(
-        &self,
-        token: &RefreshToken,
-        client_id: Uuid,
-        retry_started_at: DateTime<Utc>,
-    ) -> Result<Option<RefreshToken>, RepositoryError> {
-        let mut connection = self.connection().await?;
-        let row = connection
-            .transaction::<Option<RefreshTokenRow>, diesel::result::Error, _>(async |connection| {
-                lock_refresh_family(connection, token.token_family_id).await?;
-                let original = load_family_token(
-                    connection,
-                    token.tenant_id,
-                    token.token_family_id,
-                    client_id,
-                    token.id,
-                )
-                .await?;
-                let successor = match original {
-                    Some(original) => {
-                        lost_response_successor(connection, &original, client_id, retry_started_at)
-                            .await?
-                    }
-                    None => None,
-                };
-                if successor.is_none() {
-                    compromise_family(connection, token.tenant_id, token.token_family_id).await?;
-                }
-                Ok(successor)
-            })
-            .await
-            .map_err(map_error)?;
-        row.map(RefreshToken::try_from).transpose()
     }
 
     pub async fn inspect_lost_response_successor(

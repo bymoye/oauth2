@@ -383,6 +383,24 @@ fn issuance_rows_preserve_sealed_response_state() {
 }
 
 #[test]
+fn expired_response_preserves_terminal_metadata_without_recovering_credentials() {
+    let ring = TokenIssuanceResponseKeyRing::new("current", rand::random(), None).unwrap();
+    let body = b"signed response";
+    let digest = blake3::hash(body).to_hex().to_string();
+    for expires_at in [Utc::now(), Utc::now() - chrono::Duration::seconds(1)] {
+        let mut expired = row_with_response(&ring, body, &digest);
+        expired.access_token_expires_at = Some(expires_at);
+        expired.response_key_id = Some("retired".to_owned());
+        expired.response_ciphertext = Some(vec![0]);
+        let record = expired.into_record(None).unwrap();
+        assert!(record.response_body.is_none());
+        assert_eq!(record.access_token_jti.as_deref(), Some("jti"));
+        assert_eq!(record.access_token_expires_at, Some(expires_at.timestamp()));
+        assert_eq!(record.response_digest.as_deref(), Some(digest.as_str()));
+    }
+}
+
+#[test]
 fn issuance_rows_reject_incomplete_or_inconsistent_response_envelopes() {
     let ring =
         TokenIssuanceResponseKeyRing::new("current", [0x11; 32], None).expect("key ring is valid");

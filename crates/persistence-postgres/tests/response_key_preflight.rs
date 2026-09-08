@@ -24,6 +24,7 @@ fn preflight_reads_only_distinct_response_key_metadata() {
     assert!(source.contains("response_key_id"));
     assert!(source.contains("response_envelope_version"));
     assert!(source.contains("response_ciphertext.is_not_null()"));
+    assert!(source.contains("access_token_expires_at.gt(Utc::now())"));
     assert!(!source.contains("response_ciphertext,"));
     assert!(!source.contains("into_record"));
     assert!(!source.contains("RESPONSE_MIN_PROTECTED_LEN"));

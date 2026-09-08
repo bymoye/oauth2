@@ -244,6 +244,7 @@ impl TokenIssuanceRepository {
         let mut connection = self.connection().await?;
         let response_metadata = oauth_token_issuances::table
             .filter(oauth_token_issuances::expires_at.gt(Utc::now()))
+            .filter(oauth_token_issuances::access_token_expires_at.gt(Utc::now()))
             .filter(oauth_token_issuances::response_ciphertext.is_not_null())
             .select((
                 oauth_token_issuances::response_key_id,
@@ -313,24 +314,33 @@ impl TokenIssuanceRow {
                 if envelope_version == TOKEN_ISSUANCE_RESPONSE_ENVELOPE_VERSION
                     && self.access_token_jti.is_some() =>
             {
-                let Some(response_keys) = response_keys else {
-                    return Err(RepositoryError::Consistency(
-                        "token issuance response encryption keys are not configured".to_owned(),
-                    ));
-                };
-                Some(unseal_response(
-                    response_keys,
-                    &ResponseEnvelopeContext {
-                        issuance_id: self.issuance_id,
-                        tenant_id: self.tenant_id,
-                        client_id: self.client_id,
-                        grant_key_hash: &self.grant_key_blake3,
-                        response_digest: digest,
-                        envelope_version,
-                        key_id,
-                    },
-                    ciphertext,
-                )?)
+                // Retention can extend through the refresh token lifetime.
+                // Expired responses no longer need their decryption key.
+                if self
+                    .access_token_expires_at
+                    .is_some_and(|expiry| expiry > Utc::now())
+                {
+                    let Some(response_keys) = response_keys else {
+                        return Err(RepositoryError::Consistency(
+                            "token issuance response encryption keys are not configured".to_owned(),
+                        ));
+                    };
+                    Some(unseal_response(
+                        response_keys,
+                        &ResponseEnvelopeContext {
+                            issuance_id: self.issuance_id,
+                            tenant_id: self.tenant_id,
+                            client_id: self.client_id,
+                            grant_key_hash: &self.grant_key_blake3,
+                            response_digest: digest,
+                            envelope_version,
+                            key_id,
+                        },
+                        ciphertext,
+                    )?)
+                } else {
+                    None
+                }
             }
             (Some(_), Some(_), Some(_), Some(_)) => {
                 return Err(RepositoryError::Consistency(
@@ -624,6 +634,7 @@ fn token_issued_audit_event(
         event_category: "token_lifecycle".to_owned(),
         payload: serde_json::json!({
             "schema_version": nazo_persistence::SECURITY_AUDIT_SCHEMA_VERSION, "tenant_id": input.tenant_id, "issuance_id": input.issuance_id,
+            "event_category": "token_lifecycle", "user_id": input.user_id,
             "client_id": input.audit_fields.client_id, "subject_hash": input.audit_fields.subject_hash, "scope": input.audit_fields.scope,
             "audience": input.audit_fields.audience, "access_token_jti": input.access_token_jti, "refresh_token_family_id": refresh_family_id,
         }),
@@ -640,6 +651,7 @@ fn refresh_rotated_audit_event(
         event_category: "token_lifecycle".to_owned(),
         payload: serde_json::json!({
             "schema_version": nazo_persistence::SECURITY_AUDIT_SCHEMA_VERSION, "tenant_id": input.tenant_id, "issuance_id": input.issuance_id,
+            "event_category": "token_lifecycle",
             "client_id": input.audit_fields.client_id, "token_family_id": refresh.family_id, "rotated_from_id": refresh.rotated_from_id,
         }),
         occurred_at: Utc::now(),
@@ -655,6 +667,7 @@ fn refresh_reuse_audit_event(
         event_category: "token_replay".to_owned(),
         payload: serde_json::json!({
             "schema_version": nazo_persistence::SECURITY_AUDIT_SCHEMA_VERSION, "tenant_id": input.tenant_id, "issuance_id": input.issuance_id,
+            "event_category": "token_replay",
             "client_id": input.audit_fields.client_id, "token_family_id": refresh.family_id, "rotated_from_id": refresh.rotated_from_id,
             "source_token_id": refresh.lost_response_retry.map(|retry| retry.original_id),
         }),

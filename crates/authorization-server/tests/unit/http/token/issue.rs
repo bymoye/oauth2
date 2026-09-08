@@ -1761,6 +1761,79 @@ async fn native_sso_issue_requires_a_refresh_session_before_persisting_device_st
 }
 
 #[actix_web::test]
+async fn native_sso_idempotent_retry_rejects_expired_access_with_live_refresh() {
+    let state = issue_state_with_live_database()
+        .expect("Native SSO regression requires PostgreSQL and Valkey");
+    state
+        .valkey
+        .init()
+        .await
+        .expect("Native SSO test requires Valkey");
+    let mut client = client_with_grants(&["authorization_code", "refresh_token"]);
+    client.client_id = format!("native-expiry-{}", Uuid::now_v7());
+    let user_id = Uuid::now_v7();
+    insert_issue_client(&state, &client).await;
+    insert_issue_user(&state, user_id).await;
+    let service = ServerTokenService::new(
+        crate::test_support::token_issuance_repository(state.diesel_db.clone()),
+        std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(
+            &state.valkey_connection(),
+        )),
+        state.keyset.clone(),
+    );
+    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let mut modules = state.active_module_snapshot();
+    modules
+        .accepting
+        .insert(nazo_runtime_modules::ModuleId::NativeSso);
+    let authorization = test_support::test_authorization_service(&state);
+    let context = TokenIssuanceContext {
+        config: &config,
+        modules: &modules,
+        authorization: &authorization,
+        remote_client_documents: crate::test_support::test_remote_client_documents(),
+    };
+    let grant_key = format!("native-expiry-{}", Uuid::now_v7());
+    let issue = || {
+        let mut issue = token_issue_with_sid(vec!["sid".to_owned()]);
+        issue.user_id = Some(user_id);
+        issue.subject = user_id.to_string();
+        issue.scopes = vec!["openid".to_owned(), "offline_access".to_owned()];
+        issue.include_refresh = true;
+        issue.native_sso = Some(NativeSsoTokenBinding {
+            device_secret: format!("new-secret-{}", Uuid::now_v7()),
+            ds_hash: "device-hash".to_owned(),
+            sid: "native-expiry-sid".to_owned(),
+        });
+        issue
+    };
+    let mode = TokenIssuanceMode::Idempotent {
+        grant_key: grant_key.clone(),
+    };
+    let first =
+        super::issue_token_response(&context, &service, &client, mode.clone(), issue()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = response_body(first).await;
+    let retry =
+        super::issue_token_response(&context, &service, &client, mode.clone(), issue()).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    assert_eq!(response_body(retry).await, first_body);
+    let mut connection = get_conn(&state.diesel_db).await.unwrap();
+    let changed = sql_query("UPDATE oauth_token_issuances SET access_token_expires_at = CURRENT_TIMESTAMP WHERE tenant_id = $1 AND client_id = $2 AND grant_key_blake3 = $3 AND expires_at > CURRENT_TIMESTAMP")
+        .bind::<SqlUuid, _>(client.tenant_id).bind::<SqlUuid, _>(client.id)
+        .bind::<Text, _>(blake3_hex(&grant_key)).execute(&mut connection).await.unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+    let expired = super::issue_token_response(&context, &service, &client, mode, issue()).await;
+    assert_eq!(expired.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(oauth_error_code(&expired), "invalid_request");
+    let body: Value = serde_json::from_slice(&response_body(expired).await).unwrap();
+    assert!(body.get("access_token").is_none());
+    assert!(body.get("refresh_token").is_none());
+    assert_eq!(refresh_token_row_count(&state, &client).await, 1);
+}
+
+#[actix_web::test]
 async fn native_sso_issue_persists_device_state_with_the_refresh_family() {
     let Some(state) = issue_state_with_live_database() else {
         return;
