@@ -179,13 +179,12 @@ pub(crate) async fn authenticate_client_with_dependencies(
     match requirement {
         ClientAuthenticationRequirement::PublicClient => Ok(None),
         ClientAuthenticationRequirement::PrivateKeyJwt { assertion } => {
-            // Decode only the untrusted header to select a refresh key;
-            // signature and claim validation still happen below. Malformed
+            // The registered URI determines the key source; kid is only a
+            // hint to the resolver, including when it is absent. Signature
+            // and claim validation still happen below. Malformed
             // assertions are rejected by the existing verifier without a
             // network request.
-            if let Ok(header) = decode_header(assertion)
-                && header.kid.is_some()
-            {
+            if let Ok(header) = decode_header(assertion) {
                 refresh_client_jwks(client, config.remote_jwks, header.kid.as_deref())
                     .await
                     .map_err(|error| {

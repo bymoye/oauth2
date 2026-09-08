@@ -144,6 +144,24 @@ pub(crate) async fn token(
     req: HttpRequest,
     body: Bytes,
 ) -> HttpResponse {
+    token_with_remote_documents(
+        state,
+        req,
+        body,
+        Arc::new(
+            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                .expect("empty remote document policy is valid"),
+        ),
+    )
+    .await
+}
+
+async fn token_with_remote_documents(
+    state: Data<TestInfrastructure>,
+    req: HttpRequest,
+    body: Bytes,
+    resolver: Arc<crate::domain::remote_client_documents::RemoteClientDocumentResolver>,
+) -> HttpResponse {
     let service = Data::new(ServerTokenService::new(
         crate::test_support::token_issuance_repository(state.diesel_db.clone()),
         Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(
@@ -188,10 +206,7 @@ pub(crate) async fn token(
             CibaTokenHandles::new(ciba_service, ciba_users, ciba_config),
             issuance_config,
             runtime_modules,
-            Arc::new(
-                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
-                    .expect("empty remote document policy is valid"),
-            ),
+            resolver,
             Openid4vcTokenHandles::default(),
         )),
         req,
@@ -1635,6 +1650,157 @@ async fn missing_client_authorization_code_holder_error_returns_none_when_client
         )
         .await
         .is_none()
+    );
+}
+
+#[actix_web::test]
+async fn token_endpoint_private_key_jwt_without_kid_obeys_jwks_uri() {
+    use crate::domain::remote_client_documents::tests::{resolver_for, tls_server_sequence};
+    use crate::test_support::{ClientSigningFixture, client_signing_fixture};
+
+    let state = live_token_state(AuthorizationServerProfile::Oauth2Baseline)
+        .await
+        .expect("key-source regression requires PostgreSQL and Valkey");
+    nazo_postgres::run_pending_migrations(
+        &std::env::var("DATABASE_URL").expect("PostgreSQL test URL"),
+    )
+    .await
+    .expect("token test migrations should apply");
+    let old = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
+    let current = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
+    let old_document = json!({"keys": [old.public_jwk("A")]});
+    let current_document = json!({"keys": [current.public_jwk("B")]});
+    let (address, server, certificate) = tls_server_sequence(vec![
+        (
+            200,
+            "application/json".to_owned(),
+            serde_json::to_vec(&old_document).unwrap(),
+            true,
+        ),
+        (
+            200,
+            "application/json".to_owned(),
+            serde_json::to_vec(&current_document).unwrap(),
+            true,
+        ),
+        (503, "application/json".to_owned(), b"{}".to_vec(), true),
+    ]);
+    let uri = format!("https://localhost:{}/jwks", address.port());
+    let resolver = Arc::new(resolver_for(address, &certificate));
+    assert_eq!(
+        resolver.jwks_for_kid(&uri, None).await.unwrap(),
+        old_document
+    );
+    let client_id = format!("kidless-{}", Uuid::now_v7());
+    insert_token_client(
+        &state,
+        &client_id,
+        "confidential",
+        "private_key_jwt",
+        None,
+        vec!["client_credentials"],
+        false,
+        false,
+        true,
+    )
+    .await;
+    let mut connection = get_conn(&state.diesel_db).await.unwrap();
+    sql_query(
+        "UPDATE oauth_clients SET jwks_uri = $1, jwks = $2 WHERE tenant_id = $3 AND client_id = $4",
+    )
+    .bind::<Text, _>(&uri)
+    .bind::<Jsonb, _>(&old_document)
+    .bind::<SqlUuid, _>(DEFAULT_TENANT_ID)
+    .bind::<Text, _>(&client_id)
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    drop(connection);
+    let body = |key: &ClientSigningFixture, kid: Option<&str>| {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = kid.map(str::to_owned);
+        let now = Utc::now().timestamp();
+        let assertion = key.encode_jwt(
+            &header,
+            &json!({
+                "iss": client_id, "sub": client_id, "aud": state.settings.endpoint.issuer,
+                "iat": now, "exp": now + 120, "jti": Uuid::now_v7().to_string(),
+            }),
+        );
+        Bytes::from(format!(
+            "grant_type=client_credentials&scope=accounts&resource=resource%3A%2F%2Fdefault&client_id={}&client_assertion_type={}&client_assertion={}",
+            urlencoding::encode(&client_id),
+            urlencoding::encode(CLIENT_ASSERTION_TYPE_JWT_BEARER),
+            urlencoding::encode(&assertion)
+        ))
+    };
+    // The actual token endpoint must acquire B on rotation, then continue to
+    // use B for kidless assertions despite every database read returning A.
+    for (key, kid, accepted) in [
+        (&current, Some("B"), true),
+        (&old, None, false),
+        (&current, None, true),
+    ] {
+        let response = token_with_remote_documents(
+            state.clone(),
+            token_request("application/x-www-form-urlencoded"),
+            body(key, kid),
+            resolver.clone(),
+        )
+        .await;
+        if accepted {
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: serde_json::Value = serde_json::from_slice(
+                &actix_web::body::to_bytes(response.into_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(value["access_token"].as_str().is_some());
+        } else {
+            assert_token_error(response, StatusCode::UNAUTHORIZED, "invalid_client", false).await;
+        }
+    }
+    // A cold cache forces a real failing fetch; stale registration A is not
+    // an alternate trust source when the registered URI is unavailable.
+    let cold = Arc::new(resolver_for(address, &certificate));
+    let unavailable = token_with_remote_documents(
+        state.clone(),
+        token_request("application/x-www-form-urlencoded"),
+        body(&old, None),
+        cold.clone(),
+    )
+    .await;
+    assert_token_error(
+        unavailable,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "server_error",
+        false,
+    )
+    .await;
+    server
+        .join()
+        .expect("all three HTTPS fetches should complete");
+
+    let mut connection = get_conn(&state.diesel_db).await.unwrap();
+    sql_query("UPDATE oauth_clients SET jwks_uri = NULL WHERE tenant_id = $1 AND client_id = $2")
+        .bind::<SqlUuid, _>(DEFAULT_TENANT_ID)
+        .bind::<Text, _>(&client_id)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let static_response = token_with_remote_documents(
+        state.clone(),
+        token_request("application/x-www-form-urlencoded"),
+        body(&old, None),
+        cold,
+    )
+    .await;
+    assert_eq!(
+        static_response.status(),
+        StatusCode::OK,
+        "static single-key clients must not fetch the now-closed remote service"
     );
 }
 

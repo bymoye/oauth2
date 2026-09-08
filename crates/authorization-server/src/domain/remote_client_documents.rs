@@ -283,4 +283,4 @@ impl nazo_http_actix::RemoteJwksResolverPort for RemoteClientDocumentResolver {
 
 #[cfg(test)]
 #[path = "../../tests/unit/domain/remote_client_documents.rs"]
-mod tests;
+pub(crate) mod tests;

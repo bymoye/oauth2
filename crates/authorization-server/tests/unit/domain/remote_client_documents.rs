@@ -45,7 +45,7 @@ fn tls_server(
     )])
 }
 
-fn tls_server_sequence(
+pub(crate) fn tls_server_sequence(
     responses: Vec<(u16, String, Vec<u8>, bool)>,
 ) -> (SocketAddr, thread::JoinHandle<()>, Vec<u8>) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate TLS test key");
@@ -96,7 +96,10 @@ fn tls_server_sequence(
     (address, handle, certificate_der)
 }
 
-fn resolver_for(address: SocketAddr, certificate_der: &[u8]) -> RemoteClientDocumentResolver {
+pub(crate) fn resolver_for(
+    address: SocketAddr,
+    certificate_der: &[u8],
+) -> RemoteClientDocumentResolver {
     let certificate =
         reqwest::Certificate::from_der(certificate_der).expect("test TLS certificate should parse");
     RemoteClientDocumentResolver::new_with_root_certificates(

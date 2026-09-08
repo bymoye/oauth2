@@ -539,6 +539,76 @@ async fn private_key_jwt_refreshes_registered_jwks_and_fails_closed_on_resolver_
 }
 
 #[actix_web::test]
+async fn private_key_jwt_without_kid_uses_the_registered_key_source() {
+    let state = token_management_state();
+    let old = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
+    let current = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
+    let uri = "https://client.example/jwks";
+    let mut client = confidential_client_with_secret(&fixture_secret("key-source"));
+    client.token_endpoint_auth_method = "private_key_jwt".to_owned();
+    client.jwks_uri = Some(uri.to_owned());
+    client.jwks = Some(json!({"keys": [old.public_jwk("A")]}));
+    for (key, kid, remote, unavailable, accepted, calls) in [
+        (&old, None, true, false, false, 1),
+        (&current, None, true, false, true, 1),
+        (&old, None, true, true, false, 1),
+        (&old, None, false, true, true, 0),
+        (&current, Some("B"), true, false, true, 1),
+    ] {
+        let mut candidate = client.clone();
+        if !remote {
+            candidate.jwks_uri = None;
+        }
+        let resolver = if unavailable {
+            crate::test_support::CountingJwksResolver::with_failure("JWKS unavailable")
+        } else {
+            crate::test_support::CountingJwksResolver::with_document(
+                uri,
+                json!({"keys": [current.public_jwk("B")]}),
+            )
+        };
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = kid.map(str::to_owned);
+        let now = Utc::now().timestamp();
+        let assertion = key.encode_jwt(
+            &header,
+            &json!({
+                "iss": client.client_id, "sub": client.client_id,
+                "aud": state.settings.endpoint.issuer,
+                "iat": now, "exp": now + 120, "jti": Uuid::now_v7().to_string(),
+            }),
+        );
+        let mut credentials = client_credentials("private_key_jwt");
+        credentials.client_assertion = Some(assertion);
+        let result = verify_confidential_client_with_resolver(
+            &state,
+            &ClientAuthRequestFacts::new("/token", None),
+            &candidate,
+            &credentials,
+            &resolver,
+        )
+        .await;
+        if accepted {
+            assert!(
+                matches!(result, Ok(Some(_))),
+                "current or static key should authenticate"
+            );
+        } else if unavailable {
+            assert!(matches!(
+                result,
+                Err(TokenManagementClientAuthError::StoreUnavailable)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(TokenManagementClientAuthError::InvalidClient)
+            ));
+        }
+        assert_eq!(resolver.calls(), calls);
+    }
+}
+
+#[actix_web::test]
 async fn self_signed_mtls_refreshes_registered_jwks_and_fails_closed_on_resolver_error() {
     let state = token_management_state();
     let mut client = confidential_client_with_secret(&fixture_secret("dynamic-mtls-jwks"));
