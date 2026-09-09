@@ -1490,6 +1490,30 @@ async fn token_authorization_code_preserves_pending_state_for_redirect_pkce_and_
         .to_http_request();
     let client = live_client("client-failure-cases");
 
+    let no_challenge_code = format!("code-{}", Uuid::now_v7());
+    let mut no_challenge_payload = payload_for_client(&client);
+    no_challenge_payload.code_challenge = None;
+    no_challenge_payload.code_challenge_method = None;
+    fixture
+        .store_code_state(
+            &no_challenge_code,
+            &AuthorizationCodeState::Pending {
+                payload: no_challenge_payload,
+            },
+        )
+        .await;
+    for verifier in ["", "wrong-verifier", VALID_CODE_VERIFIER] {
+        let mut form = form_for_code(&no_challenge_code);
+        form.code_verifier = Some(verifier.to_owned());
+        let response = token_authorization_code(&fixture.state, &req, &client, &form, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(oauth_error_code(&response), "invalid_grant");
+        assert!(matches!(
+            fixture.code_state(&no_challenge_code).await,
+            AuthorizationCodeState::Pending { .. }
+        ));
+    }
+
     let redirect_code = format!("code-{}", Uuid::now_v7());
     fixture
         .store_code_state(
