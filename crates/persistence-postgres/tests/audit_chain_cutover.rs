@@ -1,7 +1,7 @@
 use chrono::Utc;
 use diesel::{
     QueryableByName, sql_query,
-    sql_types::{BigInt, Binary, Bool, Uuid as SqlUuid},
+    sql_types::{BigInt, Binary, Bool, Text, Uuid as SqlUuid},
 };
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use nazo_postgres::{AuditLedgerRepository, SecurityAuditEvent, create_pool};
@@ -250,6 +250,14 @@ async fn audit_cutover_preserves_history_and_moves_chain_authority_to_exporter()
             .is_err()
     );
 
+    for delivery in retried {
+        exporter
+            .mark_exported(delivery.event_id, delivery.attempts, "cutover-test")
+            .await
+            .unwrap();
+    }
+    cancellation_and_lost_result(&mut owner, &writer, &exporter_url).await;
+
     drop((
         writer,
         exporter,
@@ -267,4 +275,97 @@ async fn audit_cutover_preserves_history_and_moves_chain_authority_to_exporter()
         ))
         .await
         .unwrap();
+}
+
+async fn cancellation_and_lost_result(
+    owner: &mut AsyncPgConnection,
+    writer: &AuditLedgerRepository,
+    exporter_url: &str,
+) {
+    let application = format!("cancel_claim_{}", Uuid::now_v7().simple());
+    let mut url = url::Url::parse(exporter_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("application_name", &application);
+    let pool = create_pool(url.as_str(), 1).unwrap();
+    let exporter = std::sync::Arc::new(AuditLedgerRepository::new(pool.clone()));
+    let before = exporter.anchor_health().await.unwrap().head_sequence;
+    let pending = event();
+    writer.append(pending.clone()).await.unwrap();
+    owner
+        .batch_execute(
+            "SELECT pg_advisory_lock(909090909); \
+         CREATE FUNCTION public.gate_test_chain() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN PERFORM pg_advisory_xact_lock(909090909); RETURN NEW; END $$; \
+         CREATE TRIGGER gate_test_chain BEFORE INSERT ON public.security_audit_chain_entries \
+         FOR EACH ROW EXECUTE FUNCTION public.gate_test_chain();",
+        )
+        .await
+        .unwrap();
+    let task_repository = exporter.clone();
+    let task = tokio::spawn(async move { task_repository.claim_due(256, 60).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting = sql_query("SELECT count(*)::bigint AS value FROM pg_stat_activity WHERE application_name = $1 AND wait_event = 'advisory'")
+                .bind::<Text, _>(&application).get_result::<Count>(owner).await.unwrap();
+            if waiting.value == 1 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("claim must reach the SQL gate after taking the head and claiming rows");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    owner
+        .batch_execute("SELECT pg_advisory_unlock(909090909)")
+        .await
+        .unwrap();
+    // Keep both the original repository and pool alive, and do not acquire
+    // from that pool: recycling a returned connection must not be the cleanup.
+    owner.batch_execute("SET statement_timeout = '2s'; BEGIN; SELECT * FROM public.nazo_security_audit_chain_head_for_update(); COMMIT").await
+        .expect("an independent connection must acquire the head after cancellation");
+    let unchanged = sql_query("SELECT count(*)::bigint AS value FROM public.security_audit_event_outbox o WHERE event_id = $1 AND attempts = 0 AND locked_at IS NULL AND NOT EXISTS (SELECT 1 FROM public.security_audit_chain_entries c WHERE c.event_id = o.event_id)")
+        .bind::<SqlUuid, _>(pending.event_id).get_result::<Count>(owner).await.unwrap();
+    assert_eq!(
+        unchanged.value, 1,
+        "cancelled claim must leave raw event without claim or chain mutations"
+    );
+    owner.batch_execute("DROP TRIGGER gate_test_chain ON public.security_audit_chain_entries; DROP FUNCTION public.gate_test_chain(); SET statement_timeout = 0").await.unwrap();
+    assert_eq!(
+        exporter.anchor_health().await.unwrap().head_sequence,
+        before
+    );
+
+    let committed = exporter.claim_due(256, 60).await.unwrap();
+    assert_eq!(committed.len(), 1);
+    let identity = (
+        committed[0].event_id,
+        committed[0].sequence,
+        committed[0].previous_hash.clone(),
+        committed[0].event_hash.clone(),
+        committed[0].attempts,
+    );
+    drop(committed); // A successful COMMIT whose result never reaches the caller.
+    sql_query("UPDATE public.security_audit_event_outbox SET locked_at = CURRENT_TIMESTAMP - INTERVAL '61 seconds' WHERE event_id = $1")
+        .bind::<SqlUuid, _>(pending.event_id).execute(owner).await.unwrap();
+    let reclaimed = exporter.claim_due(256, 60).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    let retry = &reclaimed[0];
+    assert_eq!(
+        (
+            retry.event_id,
+            retry.sequence,
+            retry.previous_hash.clone(),
+            retry.event_hash.clone(),
+            retry.attempts
+        ),
+        (
+            identity.0,
+            identity.1,
+            identity.2,
+            identity.3,
+            identity.4 + 1
+        )
+    );
+    assert_eq!(
+        exporter.anchor_health().await.unwrap().head_sequence,
+        before + 1
+    );
 }

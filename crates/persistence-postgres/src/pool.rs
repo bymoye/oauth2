@@ -29,6 +29,28 @@ const MIGRATION_STATEMENT_TIMEOUT: &str = "240s";
 pub type DbPool = Pool<AsyncPgConnection>;
 pub type DbConnection = Object<AsyncPgConnection>;
 
+/// Discard the physical connection unless its transaction outcome is confirmed.
+/// Dropping a transaction future alone does not end a diesel-async transaction.
+pub(crate) struct DiscardOnDrop(pub(crate) Option<DbConnection>);
+
+impl DiscardOnDrop {
+    pub(crate) fn connection(&mut self) -> &mut DbConnection {
+        self.0.as_mut().expect("connection guard is armed")
+    }
+
+    pub(crate) fn return_to_pool(mut self) {
+        let _ = self.0.take();
+    }
+}
+
+impl Drop for DiscardOnDrop {
+    fn drop(&mut self) {
+        if let Some(connection) = self.0.take() {
+            drop(DbConnection::take(connection));
+        }
+    }
+}
+
 static DB_POOL_ACQUIRE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DB_POOL_WAIT_NANOS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DB_POOL_WAIT_NANOS_MAX: AtomicU64 = AtomicU64::new(0);

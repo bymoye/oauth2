@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     DbPool,
+    pool::DiscardOnDrop,
     schema::{access_token_revocations, oauth_token_issuances},
 };
 
@@ -447,27 +448,6 @@ fn unseal_response(
         ));
     }
     Ok(plaintext)
-}
-
-struct DiscardOnDrop(Option<crate::DbConnection>);
-
-impl DiscardOnDrop {
-    fn connection(&mut self) -> &mut crate::DbConnection {
-        self.0
-            .as_mut()
-            .expect("token issuance connection guard is armed")
-    }
-    fn return_to_pool(mut self) {
-        let _ = self.0.take();
-    }
-}
-
-impl Drop for DiscardOnDrop {
-    fn drop(&mut self) {
-        if let Some(connection) = self.0.take() {
-            drop(crate::DbConnection::take(connection));
-        }
-    }
 }
 
 enum CommitTransactionError {

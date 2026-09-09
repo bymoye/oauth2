@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use nazo_identity::ports::RepositoryError;
 
-use crate::DbPool;
+use crate::{DbPool, pool::DiscardOnDrop};
 
 /// The maximum JSON payload accepted by the durable audit ledger.
 ///
@@ -156,8 +156,8 @@ impl AuditLedgerRepository {
                 "audit outbox claim limit or lock timeout is outside its safe bound".to_owned(),
             ));
         }
-        let mut connection = self.connection().await?;
-        connection.transaction::<_, diesel::result::Error, _>(async |connection| {
+        let mut guard = DiscardOnDrop(Some(self.connection().await?));
+        let result = guard.connection().transaction::<_, diesel::result::Error, _>(async |connection| {
             let mut head = sql_query(
                 "SELECT last_sequence, last_hash FROM public.nazo_security_audit_chain_head_for_update()",
             ).get_result::<ChainStateRow>(connection).await?;
@@ -207,7 +207,11 @@ impl AuditLedgerRepository {
                     .execute(connection).await?;
             }
             Ok(deliveries)
-        }).await.map_err(map_error)
+        }).await.map_err(map_error);
+        if result.is_ok() {
+            guard.return_to_pool();
+        }
+        result
     }
 
     pub async fn mark_exported(

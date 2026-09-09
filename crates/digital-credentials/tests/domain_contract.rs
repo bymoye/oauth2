@@ -29,7 +29,11 @@ fn dcql_multiple_defaults_to_false_and_accepts_only_booleans() {
         assert_eq!(query.validate(), Ok(()));
         assert_eq!(
             serde_json::to_value(&query).unwrap()["credentials"][0]["multiple"],
-            multiple
+            if multiple {
+                serde_json::json!(true)
+            } else {
+                serde_json::Value::Null
+            }
         );
     }
     for invalid in [
