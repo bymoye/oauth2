@@ -5,9 +5,10 @@ Audit date: 2026-06-08
 ## Scope
 
 OAuth 2.1 is tracked as the IETF OAuth working group draft, not as a final RFC.
-On the audit date, the Datatracker entry was
-`draft-ietf-oauth-v2-1-15`, an active Internet-Draft from March 2026 that
-expires on 2026-09-03. The audit treats OAuth 2.1 as the consolidated OAuth
+The June audit covered draft 15. The source review on 2026-09-09 found
+`draft-ietf-oauth-v2-1-16`; this does not extend the June implementation
+evidence to draft 16. Its value-size, PKCE, and consent-phishing guidance
+still requires an implementation delta audit. The audit treats OAuth 2.1 as the consolidated OAuth
 2.0 security baseline and cross-checks it with the profile matrix, OAuth
 Security BCP controls, OIDC conformance records, and FAPI2 profile boundaries.
 

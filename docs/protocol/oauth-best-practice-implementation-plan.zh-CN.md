@@ -45,7 +45,7 @@ OAuth 2.1 draft / OIDC / FAPI 2.0 / FAPI-CIBA / CIBA 相关能力，并同时支
 
 | 类别 | 当前基线 | 路线处理 |
 | --- | --- | --- |
-| OAuth 安全基线 | RFC 9700 OAuth 2.0 Security BCP；OAuth 2.1 仍是 `draft-ietf-oauth-v2-1-15`。 | 以 RFC 9700 和 OAuth 2.1 草案方向作为默认安全约束；不得声明 OAuth 2.1 final RFC 合规。 |
+| OAuth 安全基线 | RFC 9700 OAuth 2.0 Security BCP；OAuth 2.1 仍是 `draft-ietf-oauth-v2-1-16`。 | 以 RFC 9700 和 OAuth 2.1 草案方向作为默认安全约束；不得声明 OAuth 2.1 final RFC 合规。 |
 | FAPI 2.0 | FAPI 2.0 Security Profile Final；FAPI 2.0 Message Signing Final。 | 作为高价值 API 主线；Message Signing 选项单独 gating。 |
 | OIDC | Core、Discovery、DCR、RP-Initiated Logout、Back-Channel Logout、Front-Channel Logout、Session Management 等规范。 | 我们作为 OP 时只广告已实现能力；我们作为 RP 时通过 provider adapter 接入外部登录。 |
 | CIBA / FAPI-CIBA | OpenID Connect CIBA Core 1.0 为 Final；已实现的 FAPI-CIBA 仍是 ID1 / Draft-02 兼容 profile，当前 working draft 已为 `fapi-ciba-03`（2026-06-26）。 | CIBA 默认关闭；FAPI-CIBA 做 ID1 兼容 profile；`fapi2-ciba` 只表示内部强化 profile；采用 working draft 前必须单独做 delta 审计。 |
