@@ -34,23 +34,24 @@ fn cancelled_password_callers_keep_capacity_until_the_blocking_workers_finish() 
 
     let capacity = password_hash_concurrency_limit().available_permits();
     assert!(capacity >= 3);
-    let encoded = hash_password("correct password").unwrap();
+    let password = Uuid::now_v7().to_string();
+    let encoded = hash_password(&password).unwrap();
     runtime.block_on(async {
         for index in 0..capacity {
             let mut work: Pin<Box<dyn Future<Output = ()>>> = match index % 3 {
                 0 => Box::pin(async {
                     let _ = verify_password_blocking_limited(
-                        "correct password".to_owned(),
+                        password.clone(),
                         nazo_identity::PasswordHash::new(encoded.clone()).unwrap(),
                     )
                     .await;
                 }),
                 1 => Box::pin(async {
-                    let _ = hash_password_blocking_limited("new password".to_owned()).await;
+                    let _ = hash_password_blocking_limited(password.clone()).await;
                 }),
                 _ => Box::pin(async {
                     let _ = verify_encoded_hashes_blocking_limited(
-                        "correct password".to_owned(),
+                        password.clone(),
                         vec![
                             nazo_identity::ports::EncodedSecretHash::new(encoded.clone()).unwrap(),
                         ],
@@ -67,7 +68,7 @@ fn cancelled_password_callers_keep_capacity_until_the_blocking_workers_finish() 
             );
         }
         assert_eq!(
-            hash_password_blocking_limited("over capacity".to_owned()).await,
+            hash_password_blocking_limited(password.clone()).await,
             Err(PasswordHashingError::Saturated)
         );
     });
