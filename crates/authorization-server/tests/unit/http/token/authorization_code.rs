@@ -609,6 +609,15 @@ fn pending_authorization_code_validation_covers_non_consuming_policy_boundaries(
         payload.expires_at = Utc::now() + Duration::seconds(60);
         payload.code_challenge = None;
         payload.code_challenge_method = None;
+        for verifier in ["", "wrong-verifier", VALID_CODE_VERIFIER] {
+            form.code_verifier = Some(verifier.to_owned());
+            let downgrade =
+                validate_pending_authorization_code_request(&issuance, &client, &form, &payload)
+                    .expect_err("a verifier must never be accepted without an original challenge");
+            assert_eq!(downgrade.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(oauth_error_code(&downgrade), "invalid_grant");
+        }
+        form.code_verifier = None;
         let no_pkce = validate_pending_authorization_code_request(
             &issuance, &client, &form, &payload,
         )
@@ -627,6 +636,7 @@ fn pending_authorization_code_validation_covers_non_consuming_policy_boundaries(
         form.audiences.clear();
         payload.code_challenge = Some(pkce_s256(VALID_CODE_VERIFIER));
         payload.code_challenge_method = Some("S256".to_owned());
+        form.code_verifier = Some(VALID_CODE_VERIFIER.to_owned());
         payload.scopes = vec![crate::http::token::native_sso::DEVICE_SSO_SCOPE.to_owned()];
         let native_sso_disabled =
             validate_pending_authorization_code_request(&issuance, &client, &form, &payload)

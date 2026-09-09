@@ -207,6 +207,7 @@ fn valid_dcql() -> DcqlQuery {
         credentials: vec![nazo_digital_credentials::CredentialQuery {
             id: "pid".to_owned(),
             format: CredentialFormat::SdJwtVc,
+            multiple: false,
             meta: None,
             claims: None,
             claim_sets: None,

@@ -38,6 +38,8 @@ pub struct TrustedAuthority {
 pub struct CredentialQuery {
     pub id: String,
     pub format: CredentialFormat,
+    #[serde(default)]
+    pub multiple: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
