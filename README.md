@@ -10,83 +10,63 @@
 [![conformance-security](https://github.com/nazozero/NazoAuth/actions/workflows/conformance-security.yml/badge.svg?branch=main)](https://github.com/nazozero/NazoAuth/actions/workflows/conformance-security.yml)
 [![codecov](https://codecov.io/gh/nazozero/NazoAuth/branch/main/graph/badge.svg)](https://app.codecov.io/gh/nazozero/NazoAuth)
 
-[中文文档](README.zh-CN.md) · [Documentation](#documentation) · [Quick start](#quick-start) · [Security](SECURITY.md)
+[中文文档](README.zh-CN.md) · [Documentation](#documentation) · [Operations](#supported-deployment-and-operations) · [Security](SECURITY.md)
 
-Nazo Auth Server is a self-hosted OAuth 2.x / OAuth 2.1-aligned and OpenID
-Connect authorization server written in Rust. It is built for same-origin
-deployments where the issuer, browser UI, passkeys, CORS, cookies, and protocol
-endpoints share one public origin.
+NazoAuth is a self-hosted OAuth 2.x / OAuth 2.1-aligned and OpenID Connect
+authorization-server data plane written in Rust. Each directory-managed tenant
+issuer is same-origin: its browser UI, passkeys, CORS, cookies, and protocol
+endpoints share that tenant's public origin.
 
-The project includes the authorization server, a compact identity/admin surface,
-local signing key management, WebAuthn/passkeys, MFA, SCIM, and Rust
-resource-server verification libraries. Modular external-provider login is
-tracked in the future roadmap rather than advertised as a current default
-capability. It uses PostgreSQL for durable state and Valkey for short-lived
-protocol state.
+## Responsibilities and boundaries
 
-## Status
+NazoAuth owns the issuer-facing protocol, local identity and administration
+surface, per-client security policy, signing-key use, and protocol state. It
+uses PostgreSQL for durable users, clients, grants, tokens, revocation, and
+security records. It uses Valkey for transient protocol security state such as
+sessions, authorization-code replay markers, PAR, replay detection, and rate
+limits.
 
-| Item | Value |
+Released installation, update, backup, restore, and recovery are owned by the
+independently released [`nazoauthctl`](https://github.com/nazozero/NazoAuthCtl).
+The controller is not an online dependency of token or authorization requests.
+NazoAuth's long-running runtime receives only the less-privileged PostgreSQL
+role; lifecycle work uses a distinct role through the signed controller path.
+
+The server artifact contains no OIDF Suite, browser automation, validator
+credentials, plan registry, or validator-specific route. External validation is
+an ordinary public-protocol client interaction; dated records remain separate
+from the production runtime. See the [release boundary](docs/operations/release-boundary.md).
+
+## Current support boundary
+
+| Area | Verified boundary |
 | --- | --- |
-| Application package | `nazo-oauth-server` (database-neutral library) |
-| Default distribution package | `nazoauth` (PostgreSQL + Valkey) |
-| Storage adapters | `nazo-oauth-server-postgres`, `nazo-oauth-server-valkey` |
-| Workspace version | `0.2.3` |
-| License | AGPL-3.0-or-later |
-| Language | Rust 2024 |
-| Runtime services | PostgreSQL, plus Valkey |
-| Conformance test issuer | operator-provided public HTTPS origin |
-| Default deployment model | same-origin |
+| Package and release identity | The workspace manifest is [Cargo.toml](Cargo.toml); a release is identified by its published signed tag and attestation, not this README. |
+| Runtime dependencies | PostgreSQL is durable authority. Valkey stores transient security state and must not be treated as an independently rollbackable cache. |
+| Release lifecycle | Linux `x86_64` and `aarch64` are the supported controller installation, update, rollback, and recovery targets. See [platform support](docs/operations/platform-support.md). |
+| TLS ingress | NazoAuth supports either `direct-tls` or a trusted reverse proxy. The two trust models are exclusive; see [deployment](docs/operations/deployment.md). |
+| Tenant and issuer routing | Active directory bindings map a canonical request host to one immutable tenant graph. Unknown hosts have no default-tenant fallback; direct TLS also requires matching SNI and Host. See [tenancy](docs/features/tenancy.md). |
+| External login federation | Configured external OIDC, OAuth2 social, and trusted SAML-gateway providers are active product login paths. This is distinct from the unimplemented OpenID Federation trust-chain protocol; see [federation](docs/features/federation.md). |
+| External OIDF evidence | The [official-release record](docs/conformance/oidf-2026-09-06-official-release.md) is dated engineering acceptance for identified artifacts, not an OIDF certification claim. |
+| Capacity evidence | The performance documents are dated measurements and regression baselines, not a capacity promise for the current release. |
 
-## Quality Signals
+The project implements the features and profiles recorded in the
+[profile matrix](docs/protocol/profile-matrix.md) and
+[RFC compliance matrix](docs/protocol/rfc-compliance-matrix.md). Each OAuth
+client still needs its explicit grant allowlist, metadata, sender constraint,
+and current `security_policy`; server support does not grant a client access.
 
-Project quality is tracked through direct, auditable checks rather than a
-composite score:
+The [roadmap](docs/project/roadmap.md) records the remaining prerequisite-gated
+or separate protocol scope. Dynamic Client Registration still requires its
+initial-access token, and external/refresh/ID-token exchange plus OpenID
+Federation trust chains remain separate from the implemented tenant routing and
+external-login adapters.
 
-| Signal | Evidence |
-| --- | --- |
-| Rust quality gate | `cargo fmt --check`, `cargo check --workspace --all-targets --all-features --locked`, `cargo clippy -D warnings`, migrations, and the complete workspace test suite in `code-quality`. |
-| Static security analysis | CodeQL Rust analysis with the `security-extended` query suite. |
-| Dependency policy | GitHub dependency review, `cargo audit`, and `cargo deny` over advisories, bans, licenses, and sources. |
-| Runtime security behavior | Real HTTP E2E, load/race gate, and Valkey outage injection in `conformance-security`. |
-| External protocol validation | Third-party clients exercise only public protocol and tenant-resource interfaces. |
-| Coverage trend | Codecov LCOV upload from the dedicated coverage workflow. |
-| Release provenance | CycloneDX SBOM, Trivy image scan, Sigstore signing, and GitHub artifact attestations. |
+## Supported deployment and operations
 
-## Standards
-
-📚 [Standards and profile support](docs/integration/openid-connect.md)
-
-## Certification
-
-🏅 External validators interact with NazoAuth exactly like any other client.
-
-## Features
-
-- Authorization code + PKCE, refresh tokens, client credentials, bounded JWT
-  bearer grant, bounded Token Exchange, revocation, introspection,
-  signed/encrypted introspection, discovery, protected resource metadata, JWKS,
-  JSON/signed/encrypted UserInfo, signed/encrypted JARM, PAR, JAR, DPoP, and
-  mTLS.
-- Runtime profiles: `oauth2-baseline`, `fapi2-security`,
-  `fapi2-message-signing-authz-request`, `fapi2-message-signing-jarm`, and
-  `fapi2-message-signing-introspection`.
-- Local users, profiles, OAuth clients, grants, access requests, TOTP MFA,
-  backup codes, remembered MFA, WebAuthn/passkeys, and SCIM provisioning.
-- Local signing key lifecycle with prepublish, active, grace, and retired
-  states. External-command signing is available for KMS/HSM integrations.
-- Framework-independent Rust resource-server verifier plus the project's Actix
-  HTTP integration. Historical Axum/Tower and tonic adapters are not shipped.
-- Release security workflows for CodeQL, dependency review, cargo audit,
-  cargo deny, SBOM generation, Trivy image scanning, keyless signing, and
-  provenance attestations.
-
-## Quick start
-
-Install the independently signed `nazoauthctl` from
-[`nazozero/NazoAuthCtl`](https://github.com/nazozero/NazoAuthCtl). Controller
-source, CI, installation, and Releases live only in that repository. Register
-the target and provide two existing, distinct PostgreSQL roles plus the existing
+For a released production installation, use the signed controller lifecycle.
+Install `nazoauthctl` from its own Release, register the target, and provide
+existing, distinct PostgreSQL runtime and lifecycle roles plus an existing
 Valkey credential:
 
 ```sh
@@ -100,51 +80,41 @@ nazoauthctl install --host production-host --name production \
   --database-lifecycle-password-file ./database-lifecycle-password \
   --valkey-host valkey.internal --valkey-port 6379 \
   --valkey-password-file ./valkey-password
-nazoauthctl admin create --instance production
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
-nazoauthctl status --instance production
-nazoauthctl doctor --instance production
+nazoauthctl admin create --instance production
 ```
 
-The runtime is exactly `podman`, `docker`, or `host`; there is no automatic
-runtime selection. NazoAuthCtl never creates credentials for external
-PostgreSQL or Valkey. The lifecycle PostgreSQL role runs migrations, backup,
-and recovery; the less-privileged runtime role is the only database identity
-given to the server. Open `http://127.0.0.1:8000/health` or
-`http://127.0.0.1:8000/.well-known/openid-configuration` on the target's
-private boundary. Data, signing keys, generated application secrets, and
-avatars are persistent. See [managed installation, update, and recovery](docs/operations/one-click-update.md)
-for current-format import and backup policy.
+Select exactly one runtime: `podman`, `docker`, or `host`. NazoAuthCtl does not
+create or replace PostgreSQL or Valkey credentials. It creates the deployment
+identity, generated application secrets, signing identity, and the Valkey state
+epoch for managed operations. The complete supported lifecycle, including
+version selection, backup, restore-test, update, rollback, and recovery, is in
+[managed installation, update, and recovery](docs/operations/one-click-update.md).
 
-On a database without an administrator, `nazoauthctl admin create` invokes
-the target runtime's local `nazoauth admin-provision` one-shot command. The
-closed credential document is supplied through the controller's protected
-credential path; it is never sent through an HTTP bootstrap route, argv,
-ordinary environment variables, logs, or audit records.
-
-For a public issuer, pass `--public-url https://auth.example.com`; see the
-[deployment guide](docs/operations/deployment.md) for TLS ingress requirements.
-`compose.yml` remains a source-tree development sandbox and uses a development
-operator identity; it is not the production lifecycle boundary.
-
-For a direct binary run, `server` creates a local `.env.yaml` when absent,
-generates persistent application secrets, creates signing keys when needed,
-and continues starting. Schema changes are deliberately owned by the host-side
-controller and are never attempted by the managed server runtime:
+Operate the installed instance through its controller and public protocol
+boundary:
 
 ```sh
-nazoauth server
+nazoauthctl status --instance production
+nazoauthctl doctor --instance production
+nazoauthctl operation --instance production --limit 20
 ```
 
-Explicit YAML and environment values still take precedence. In managed
-deployments, schema changes run only inside the signed install, update, or
-recover lifecycle operation for the exact verified release target. The server
-runtime never holds the lifecycle database credential.
+Check `/health` and `/.well-known/openid-configuration` on the target's private
+boundary, then through the configured public HTTPS issuer. The deployment guide
+lists the activation checks and reverse-proxy/mTLS boundary.
+
+A standalone binary can own Direct TLS when the operator provides its
+configuration, certificates, PostgreSQL, and Valkey. `nazoauth server` creates
+a local minimal `.env.yaml` when absent, materializes service-owned secrets,
+and continues starting. It does not perform managed schema lifecycle work.
+`compose.yml` is a source-tree development sandbox, not the released production
+lifecycle path.
 
 ## Configuration
 
-Configuration is intentionally small for new deployments:
+Configure one public URL and choose one transport owner:
 
 ```yaml
 BIND: "0.0.0.0:8000"
@@ -158,99 +128,39 @@ DATA_DIR: "/var/lib/nazo_oauth"
 RUST_LOG: "info"
 ```
 
-For standalone HTTPS without a reverse proxy, select `TRANSPORT_MODE:
-"direct-tls"` and configure the server certificate, private key, mTLS client CA,
-and dedicated mTLS listener described in
-[`docs/operations/configuration.md`](docs/operations/configuration.md).
+For standalone HTTPS without a reverse proxy, use `TRANSPORT_MODE: "direct-tls"`
+and configure the server certificate, private key, client CA, and dedicated
+mTLS listener described in [configuration](docs/operations/configuration.md).
+The configuration guide also defines secret-file inputs, persisted module
+state, state-epoch recovery, and the precise authorization-code replay-marker
+retention rule.
 
-`CLIENT_SECRET_PEPPER`, the DCR initial-access token, and a pairwise-subject
-secret when required are generated under `DATA_DIR/secrets` if absent.
-Back up that directory with the database. A missing or malformed persisted
-secret fails startup instead of being silently replaced.
-
-Deployments use composable server capabilities and explicit, versioned
-per-client policy. Every OAuth client must have a current `security_policy`;
-the server does not infer one from a process-level preset.
-
-`PUBLIC_BASE_URL` drives the same-origin defaults:
-
-| Value | Default rule |
-| --- | --- |
-| `ISSUER` | `PUBLIC_BASE_URL` |
-| `FRONTEND_BASE_URL` | `PUBLIC_BASE_URL + "/ui/"` |
-| `CORS_ALLOWED_ORIGINS` | origin of `PUBLIC_BASE_URL` |
-| `COOKIE_SECURE` | `true` for HTTPS issuers |
-| `PASSKEY_ORIGIN` and `PASSKEY_RP_ID` | derived from issuer |
-| `PROTECTED_RESOURCE_IDENTIFIER` | `ISSUER + "/fapi/resource"` |
-
-`DATA_DIR` drives persistent local file paths:
-
-| Value | Default rule |
-| --- | --- |
-| `JWK_KEYS_DIR` | `DATA_DIR + "/keys"` |
-| `AVATAR_STORAGE_DIR` | `DATA_DIR + "/avatars"` |
-
-Advanced settings cover specialized deployments.
-They are documented in [docs/operations/configuration.md](docs/operations/configuration.md).
-
-## Default boundaries
-
-Stable, non-conflicting server handlers are active together on new databases.
-This includes signed Request Objects, JARM, Device Grant, CIBA poll/ping, the
-bounded Token Exchange and JWT Bearer Grant profiles, SCIM, Front-Channel
-Logout, and Session Management. Server support does not grant a client access:
-grant allowlists, registered metadata, sender constraints, and the versioned
-per-client `security_policy` still fail closed.
-
-The following capabilities remain conditional or excluded:
-
-- Dynamic Client Registration / RFC 7591 and Client Configuration Management
-  / RFC 7592 require a configured
-  `DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN`.
-- OpenID4VCI, OpenID4VP, SCIM Security Events, Native SSO, RAR, and experimental
-  HTTP Signatures require their complete role-specific prerequisites.
-- External-token, refresh-token, or ID-token Token Exchange profiles.
-- Modular third-party login providers such as QQ, WeChat, Google, Microsoft, or
-  enterprise SAML; these are roadmap items until provider-specific adapters,
-  configuration gates, account linking, and E2E/negative tests exist.
-- Request-level dynamic tenant or issuer routing.
-- RFC 9701 encrypted introspection responses outside the signed-introspection
-  profile, or without per-client JWE response metadata.
-- UserInfo or JARM encryption without supported per-client JWE metadata and a
-  unique matching public encryption key.
-
-See [docs/project/roadmap.md](docs/project/roadmap.md) for the current scope record.
+`PUBLIC_BASE_URL` seeds the initial system-tenant directory binding. Once the
+directory is active, each binding supplies the request tenant and issuer; its
+issuer derives that tenant's frontend and CORS defaults. Cookie and other
+deployment-wide security settings remain process configuration. Back up durable
+application secrets and the PostgreSQL state together. Valkey loss interrupts security-sensitive flows; a managed database
+restore changes the Valkey state epoch and applies token invalidation before
+public ingress reopens. See [PostgreSQL and Valkey operations](docs/operations/ha-operations.md).
 
 ## Documentation
 
 | Topic | Link |
 | --- | --- |
 | Documentation index | [docs/README.md](docs/README.md) |
-| Workspace architecture | [docs/project/architecture.md](docs/project/architecture.md) |
-| Configuration | [docs/operations/configuration.md](docs/operations/configuration.md) |
-| Deployment | [docs/operations/deployment.md](docs/operations/deployment.md) |
-| Chinese deployment guide | [docs/operations/deployment.zh-CN.md](docs/operations/deployment.zh-CN.md) |
-| One-click updates | [docs/operations/one-click-update.md](docs/operations/one-click-update.md) |
-| 一键升级 | [docs/operations/one-click-update.zh-CN.md](docs/operations/one-click-update.zh-CN.md) |
-| Conformance records | [docs/conformance](docs/conformance) |
-| Performance benchmarks | [docs/performance/performance-capacity-curve.md](docs/performance/performance-capacity-curve.md) |
-| OAuth/OIDC/FAPI best-practice matrix | [docs/protocol/rfc-compliance-matrix.md](docs/protocol/rfc-compliance-matrix.md) |
-| OAuth/OIDC/FAPI future roadmap | [docs/protocol/oauth-best-practice-implementation-plan.zh-CN.md](docs/protocol/oauth-best-practice-implementation-plan.zh-CN.md) |
-| Profile matrix | [docs/protocol/profile-matrix.md](docs/protocol/profile-matrix.md) |
-| Composable capability policy | [docs/protocol/composable-capability-policy.md](docs/protocol/composable-capability-policy.md) |
-| Ecosystem client onboarding | [docs/features/ecosystem-onboarding.md](docs/features/ecosystem-onboarding.md) |
-| Threat model | [docs/security/threat-model.md](docs/security/threat-model.md) |
-| Release security | [docs/operations/release-security.md](docs/operations/release-security.md) |
-| PostgreSQL and Valkey operations | [docs/operations/ha-operations.md](docs/operations/ha-operations.md) |
-| Resource server verifier | [docs/features/resource-server-verifier.md](docs/features/resource-server-verifier.md) |
-| SCIM | [docs/features/scim.md](docs/features/scim.md) |
-| Federation | [docs/features/federation.md](docs/features/federation.md) |
-| Passkeys | [docs/features/passkeys.md](docs/features/passkeys.md) |
-| MFA | [docs/features/mfa.md](docs/features/mfa.md) |
-| Security policy | [SECURITY.md](SECURITY.md) |
-| Changelog | [CHANGELOG.md](CHANGELOG.md) |
+| Configuration and ownership | [configuration](docs/operations/configuration.md) · [inventory](docs/operations/configuration-inventory.md) |
+| Deployment and recovery | [deployment](docs/operations/deployment.md) · [managed lifecycle](docs/operations/one-click-update.md) · [HA operations](docs/operations/ha-operations.md) |
+| Standards and profiles | [OpenID Connect](docs/integration/openid-connect.md) · [profile matrix](docs/protocol/profile-matrix.md) · [RFC matrix](docs/protocol/rfc-compliance-matrix.md) |
+| Security and release | [threat model](docs/security/threat-model.md) · [release security](docs/operations/release-security.md) · [SECURITY.md](SECURITY.md) |
+| External and performance evidence | [conformance records](docs/conformance/README.md) · [performance index](docs/performance/README.md) |
+| Current review record | [2026-09-10 project review](docs/project/review-2026-09-10.md) |
 
 ## Development
+
+The full test gate requires isolated PostgreSQL, Valkey, and S3-compatible
+object storage, plus the test configuration and schema setup in
+[`code-quality.yml`](.github/workflows/code-quality.yml). Use that workflow's
+fixtures when reproducing the gate locally; never point it at production data.
 
 ```sh
 cargo fmt --check
@@ -259,21 +169,20 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-HTTP and concurrency checks:
+The disposable Docker HTTP load gate is:
 
 ```sh
-python scripts/full_real_request_e2e.py
 python scripts/full_real_request_load.py
 ```
 
-Coverage runs are documented in
-[docs/coverage/codecov-docker-runbook.md](docs/coverage/codecov-docker-runbook.md).
+It exercises health, discovery, client-credentials token issuance, and
+introspection under concurrency against its isolated E2E deployment. It is not
+a performance benchmark or external-conformance result. Coverage instructions
+are in [docs/coverage/codecov-docker-runbook.md](docs/coverage/codecov-docker-runbook.md).
 
 ## License
 
-The public source code is licensed under
-[AGPL-3.0-or-later](LICENSE). This applies equally to individuals and
-organizations. A separate commercial license may be available for qualifying
-closed-source use, but is granted only by a signed agreement with the applicable
-copyright holders. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md).
+The public source code is licensed under [AGPL-3.0-or-later](LICENSE). A
+separate commercial license may be available only through a signed agreement
+with the applicable copyright holders; see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).

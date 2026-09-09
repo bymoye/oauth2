@@ -89,11 +89,25 @@ Compose starts PostgreSQL and Valkey with the explicitly supplied credentials,
 runs migrations through the lifecycle PostgreSQL role, and then starts the
 server with the separate runtime role. Migration startup depends only on
 PostgreSQL; Valkey readiness is required only by the server.
-Open:
+With the unmodified loopback origin and port, open:
 
 - `http://127.0.0.1:8000/health` for dependency readiness
 - `http://127.0.0.1:8000/live` for process liveness
 - `http://127.0.0.1:8000/.well-known/openid-configuration`
+
+All routes, including probes, resolve an active directory binding by Host.
+If the issuer uses `auth.example.com`, a plaintext backend probe must retain
+that host, for example:
+
+```sh
+curl --fail --header 'Host: auth.example.com' http://127.0.0.1:8000/health
+```
+
+Replace the backend port with the published port. An IP-only request to a
+hostname-bound deployment returns `404`; it does not select a default tenant.
+For Direct TLS, use the issuer hostname in the URL so both SNI and Host match;
+`curl --resolve auth.example.com:8443:127.0.0.1 https://auth.example.com:8443/health`
+can test a local listener while retaining certificate verification.
 
 The first source build requires network access to download Rust dependencies.
 Later builds reuse the local container cache.
@@ -160,7 +174,7 @@ change the deployment's client CA trust.
 
 ## Public deployment
 
-For a formal release, prefer the lifecycle entry point:
+For a released production installation, use the supported lifecycle entry point:
 
 ```sh
 nazoauthctl host add production-host --ssh production --privilege sudo
@@ -299,6 +313,8 @@ production:
 - require the exact-commit security and conformance gates described in
   [release-security.md](release-security.md).
 
-For an intentional clean-data replacement, use
-[Fresh Deployment and Production Activation](fresh-production-activation.md).
-Advanced settings are documented in [configuration.md](configuration.md).
+An intentional clean-data replacement is a new managed deployment, not an
+in-place reset. Keep it separate from the existing deployment identity and
+state epoch, and use the signed install/recovery lifecycle described in
+[one-click installation and updates](one-click-update.md). Advanced settings
+are documented in [configuration.md](configuration.md).

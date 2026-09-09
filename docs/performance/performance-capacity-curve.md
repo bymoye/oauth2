@@ -4,6 +4,10 @@ Generated at: `2026-07-06 13:03:57 UTC`
 
 本文是主容量矩阵与扩展容量矩阵的统一入口。详细阶段数据、步骤拆分、数据库指标、Valkey 指标和环境记录保留在各场景报告与 `perf/results/` JSON 中。
 
+This is a dated July 2026 measurement record. Its scenarios and values are a
+regression baseline for the recorded source commits and environment, not a
+capacity statement for the current release or another deployment.
+
 ## 文档结构
 
 - [主容量矩阵测试总结](summaries/performance-capacity-main-summary.md)

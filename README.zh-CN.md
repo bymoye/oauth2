@@ -10,62 +10,55 @@
 [![conformance-security](https://github.com/nazozero/NazoAuth/actions/workflows/conformance-security.yml/badge.svg?branch=main)](https://github.com/nazozero/NazoAuth/actions/workflows/conformance-security.yml)
 [![codecov](https://codecov.io/gh/nazozero/NazoAuth/branch/main/graph/badge.svg)](https://app.codecov.io/gh/nazozero/NazoAuth)
 
-[English](README.md) · [文档](#文档) · [快速启动](#快速启动) · [安全策略](SECURITY.md)
+[English](README.md) · [文档](#文档) · [运维](#受支持的部署与运维) · [安全策略](SECURITY.md)
 
-Nazo Auth Server 是一个用 Rust 写的自托管 OAuth 2.x / OAuth 2.1-aligned / OpenID Connect 授权服务器。它面向同域部署：issuer、浏览器 UI、passkey、CORS、cookie 和协议端点共享同一个公开 origin。
+NazoAuth 是用 Rust 编写的自托管 OAuth 2.x / OAuth 2.1-aligned / OpenID
+Connect 授权服务器数据面。每个目录管理的租户 issuer 都是同域的：其浏览器 UI、
+passkey、CORS、cookie 和协议端点共享该租户的公开 origin。
 
-项目包含授权服务器、小型 identity/admin 管理面、本地签名密钥管理、WebAuthn/passkeys、MFA、SCIM，以及 Rust resource-server verifier。模块化第三方 provider 登录属于未来路线图能力，不作为当前默认能力广告。PostgreSQL 保存持久状态，Valkey 保存短生命周期协议状态。
+## 职责与边界
 
-## 状态
+NazoAuth 负责面向 issuer 的协议、本地 identity/admin 管理面、按客户端安全策略、
+签名密钥使用和协议状态。PostgreSQL 是用户、client、grant、token、撤销和安全记录的
+持久权威来源。Valkey 保存 session、授权码重放标记、PAR、重放检测和限流等短生命周期
+协议安全状态。
 
-| 项目 | 值 |
+已发布的安装、更新、备份、恢复和灾难恢复由独立发布的
+[`nazoauthctl`](https://github.com/nazozero/NazoAuthCtl) 负责。控制端不是 token
+或 authorization 请求的在线依赖。长期运行的 NazoAuth 只拿权限更低的 PostgreSQL
+runtime role；生命周期操作通过签名控制端路径使用独立 role。
+
+服务制品不包含 OIDF Suite、浏览器自动化、验证者凭据、计划注册表或验证者专用路由。
+外部验证只是普通的公开协议客户端交互；带日期的记录与生产 runtime 分离。详见
+[发布边界](docs/operations/release-boundary.zh-CN.md)。
+
+## 当前可核实的支持边界
+
+| 范围 | 已核实边界 |
 | --- | --- |
-| 应用库 | `nazo-oauth-server`（不依赖具体数据库） |
-| 默认发行总包 | `nazoauth`（PostgreSQL + Valkey） |
-| 存储适配包 | `nazo-oauth-server-postgres`、`nazo-oauth-server-valkey` |
-| Workspace 版本 | `0.2.3` |
-| 许可证 | AGPL-3.0-or-later |
-| 语言 | Rust 2024 |
-| 运行依赖 | PostgreSQL、Valkey |
-| 一致性测试 issuer | 操作者提供的公网 HTTPS origin |
-| 默认部署模型 | 同域 |
+| 包与发布身份 | workspace manifest 是 [Cargo.toml](Cargo.toml)；Release 由已发布的签名 tag 与 attestation 标识，不以本 README 为准。 |
+| 运行依赖 | PostgreSQL 是持久权威来源。Valkey 保存短生命周期安全状态，不能作为可独立回滚的普通缓存。 |
+| 发布生命周期 | 控制端支持的 install、update、rollback 与 recovery 目标是 Linux `x86_64` 和 `aarch64`；详见[平台支持](docs/operations/platform-support.md)。 |
+| TLS 入口 | NazoAuth 支持 `direct-tls` 或受信任反向代理；两种信任模型互斥，详见[部署指南](docs/operations/deployment.zh-CN.md)。 |
+| 租户与 issuer 路由 | active directory binding 把规范化请求 Host 映射到一个不可变 tenant graph。未知 Host 没有默认租户回退；Direct TLS 还要求 SNI 与 Host 一致。详见[租户边界](docs/features/tenancy.md)。 |
+| 外部登录 federation | 已配置的 external OIDC、OAuth2 social 和受信任 SAML gateway 是可用的产品登录路径。这不同于尚未实现的 OpenID Federation trust-chain protocol；详见[federation](docs/features/federation.md)。 |
+| 外部 OIDF 证据 | [official-release 记录](docs/conformance/oidf-2026-09-06-official-release.md)是指定制品的、带日期的工程验收，不是 OIDF 认证声明。 |
+| 容量证据 | 性能文档是带日期的测量和回归基线，不承诺当前 Release 的容量。 |
 
-## 质量信号
+项目实现的 feature 与 profile 以[能力矩阵](docs/protocol/profile-matrix.md)和
+[RFC 一致性矩阵](docs/protocol/rfc-compliance-matrix.md)为准。每个 OAuth client
+仍必须有显式 grant allowlist、metadata、sender constraint 和当前
+`security_policy`；服务端存在某能力不等于 client 已获权。
 
-项目质量用直接、可审计的检查来表达，不使用综合评分：
+[路线图](docs/project/roadmap.md)记录尚需前提或独立建模的协议范围。动态 client
+注册仍需 initial-access token；external/refresh/ID-token exchange 与 OpenID
+Federation trust chain 仍和已实现的租户路由、外部登录 adapter 分开。
 
-| 信号 | 证据 |
-| --- | --- |
-| Rust 质量门禁 | `code-quality` 中的 `cargo fmt --check`、`cargo check --workspace --all-targets --all-features --locked`、`cargo clippy -D warnings`、迁移和完整 workspace tests。 |
-| 静态安全分析 | CodeQL Rust analysis，启用 `security-extended` 和 `security-and-quality` queries。 |
-| 依赖策略 | GitHub dependency review、`cargo audit`、`cargo deny`，覆盖 advisories、bans、licenses 和 sources。 |
-| 运行时安全行为 | `conformance-security` 中的真实 HTTP E2E、load/race gate、Valkey outage injection。 |
-| 外部协议一致性 | NazoAuthCtl 负责已签名 Suite 制品、外部执行、证据与清理；服务端只通过公开协议和 tenant-resource 接口接受黑盒验证。 |
-| 覆盖率趋势 | 专用 coverage workflow 上传 Codecov LCOV。 |
-| 发布来源证明 | CycloneDX SBOM、Trivy image scan、Sigstore signing、GitHub artifact attestations。 |
+## 受支持的部署与运维
 
-## 标准
-
-📚 [标准与 Profile 支持](docs/integration/openid-connect.zh-CN.md)
-
-## 认证
-
-🏅 一致性套件由 NazoAuthCtl 作为外部黑盒控制器执行。
-
-## 功能
-
-- Authorization code + PKCE、refresh token、client credentials、受限 JWT bearer grant、受限 Token Exchange、revocation、introspection、signed/encrypted introspection、discovery、protected resource metadata、JWKS、JSON/signed/encrypted UserInfo、signed/encrypted JARM、PAR、JAR、DPoP、mTLS。
-- Runtime profile：`oauth2-baseline`、`fapi2-security`、`fapi2-message-signing-authz-request`、`fapi2-message-signing-jarm`、`fapi2-message-signing-introspection`。
-- 本地用户、资料、OAuth client、grant、access request、TOTP MFA、backup code、remembered MFA、WebAuthn/passkeys、SCIM provisioning。
-- 本地签名密钥生命周期，包含 prepublish、active、grace、retired 状态。也可以用 external-command signer 接 KMS/HSM。
-- 与 Web 框架无关的 Rust resource-server verifier，以及项目使用的 Actix
-  HTTP 集成；不再提供历史 Axum/Tower 和 tonic adapter。
-- 发布安全 workflow：CodeQL、dependency review、cargo audit、cargo deny、SBOM、Trivy image scanning、keyless signing、provenance attestation。
-
-## 快速开始
-
-先按[已验证的 bootstrap 流程](docs/operations/one-click-update.zh-CN.md)从不可变
-GitHub Release 安装签名的 `nazoauthctl`，然后执行：
+已发布的生产安装使用签名控制端生命周期。先从其独立 Release 安装
+`nazoauthctl`，注册目标机，并提供已存在且互不相同的 PostgreSQL runtime/lifecycle
+role 与 Valkey 凭据：
 
 ```sh
 nazoauthctl host add production-host --ssh production --privilege sudo
@@ -78,43 +71,35 @@ nazoauthctl install --host production-host --name production \
   --database-lifecycle-password-file ./database-lifecycle-password \
   --valkey-host valkey.internal --valkey-port 6379 \
   --valkey-password-file ./valkey-password
-nazoauthctl admin create --instance production
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
-nazoauthctl status --instance production
-nazoauthctl doctor --instance production
+nazoauthctl admin create --instance production
 ```
 
-runtime 必须明确选择 `podman`、`docker` 或 `host`。NazoAuthCtl 不会为外部
-PostgreSQL 或 Valkey 创建凭据。lifecycle PostgreSQL role 负责迁移、备份与恢复；
-长期运行服务只拿权限更低的 runtime role。目标机私有边界可检查
-`http://127.0.0.1:8000/health` 和
-`http://127.0.0.1:8000/.well-known/openid-configuration`。数据、签名密钥、应用
-secret 和头像会持久保存。当前格式导入与备份策略见
-[受管安装、更新与恢复](docs/operations/one-click-update.zh-CN.md)。
+runtime 必须在 `podman`、`docker` 或 `host` 中明确选择一个。NazoAuthCtl 不会
+创建或替换 PostgreSQL 与 Valkey 凭据；它为受管操作创建 deployment identity、生成的
+应用 secret、签名 identity 和 Valkey state epoch。完整的版本选择、backup、restore-test、
+update、rollback 和 recovery 路径见[受管安装、更新与恢复](docs/operations/one-click-update.zh-CN.md)。
 
-数据库还没有管理员时，`nazoauthctl admin create` 会调用目标 runtime 内的
-`nazoauth admin-provision` 一次性命令。封闭的凭据文档只通过 controller 的受保护凭据
-路径交付；不会经过 HTTP 初始化路由，也不会进入 argv、普通环境变量、日志或审计记录。
-
-公开部署时传入 `--public-url https://auth.example.com`；TLS 入口要求见
-[部署指南](docs/operations/deployment.zh-CN.md)。`compose.yml` 仅保留为源码树开发沙箱，
-使用开发 operator identity，不是生产生命周期边界。
-
-直接运行二进制时，首次启动保护保持不变：
+通过控制端与公开协议边界运维已安装实例：
 
 ```sh
-nazoauth server
+nazoauthctl status --instance production
+nazoauthctl doctor --instance production
+nazoauthctl operation --instance production --limit 20
 ```
 
-如果当前目录没有 `.env.yaml`，该命令会创建最小配置，生成持久化应用秘密与签名密钥，
-然后使用安全默认值继续启动。显式 YAML 和环境配置仍然优先。受管部署的 schema
-变更只在精确验证 Release 的签名 install、update 或 recover 生命周期操作内执行；
-长期运行的服务身份不持有 DDL 权限。
+在目标机私有边界检查 `/health` 和 `/.well-known/openid-configuration`，再经配置的
+公开 HTTPS issuer 检查。部署指南给出了启用检查和反向代理/mTLS 边界。
+
+独立二进制可在操作者提供配置、证书、PostgreSQL 与 Valkey 时自己终止 Direct TLS。
+没有 `.env.yaml` 时，`nazoauth server` 会创建本地最小配置、生成服务自有 secret 并继续
+启动；它不会执行受管 schema 生命周期。`compose.yml` 只是源码树开发沙箱，不是已发布
+生产安装路径。
 
 ## 配置
 
-新部署只需要少量启动配置：
+配置一个公开 URL，并选择一个传输所有者：
 
 ```yaml
 BIND: "0.0.0.0:8000"
@@ -128,84 +113,35 @@ DATA_DIR: "/var/lib/nazo_oauth"
 RUST_LOG: "info"
 ```
 
-不使用反向代理时，设置 `TRANSPORT_MODE: "direct-tls"`，并按
-[`docs/operations/configuration.md`](docs/operations/configuration.md) 配置服务端证书、
-私钥、mTLS 客户端 CA 和独立 mTLS 监听地址。
+不使用反向代理的独立 HTTPS 部署设置 `TRANSPORT_MODE: "direct-tls"`，并按
+[配置文档](docs/operations/configuration.md)提供服务端证书、私钥、客户端 CA 和专用
+mTLS listener。该文档还定义了 secret 文件输入、持久化 module 状态、state epoch
+恢复和授权码重放标记的精确保留语义。
 
-部署使用可组合的服务端能力与显式、版本化的按客户端策略。每个 OAuth client 都必须
-持有当前 `security_policy`；服务不会从进程级 preset 推断缺失策略。
-
-`PUBLIC_BASE_URL` 派生同域默认值：
-
-| 值 | 默认规则 |
-| --- | --- |
-| `ISSUER` | `PUBLIC_BASE_URL` |
-| `FRONTEND_BASE_URL` | `PUBLIC_BASE_URL + "/ui/"` |
-| `CORS_ALLOWED_ORIGINS` | `PUBLIC_BASE_URL` 的 origin |
-| `COOKIE_SECURE` | HTTPS issuer 下为 `true` |
-| `PASSKEY_ORIGIN` 和 `PASSKEY_RP_ID` | 从 issuer 派生 |
-| `PROTECTED_RESOURCE_IDENTIFIER` | `ISSUER + "/fapi/resource"` |
-
-`DATA_DIR` 派生本地持久化路径：
-
-| 值 | 默认规则 |
-| --- | --- |
-| `JWK_KEYS_DIR` | `DATA_DIR + "/keys"` |
-| `AVATAR_STORAGE_DIR` | `DATA_DIR + "/avatars"` |
-
-高级配置用于明确的特殊部署。详见
-[docs/operations/configuration.md](docs/operations/configuration.md)。
-
-## 默认边界
-
-新数据库会同时开启稳定且不冲突的服务端处理器，包括签名 Request Object、
-JARM、Device Grant、CIBA poll/ping、受限 Token Exchange 与 JWT Bearer
-Grant、SCIM、Front-Channel Logout 和 Session Management。服务端支持不等于
-客户端获权；grant allowlist、注册元数据、sender constraint 与版本化
-`security_policy` 仍然默认拒绝。
-
-以下能力仍有前提或明确排除：
-
-- Dynamic Client Registration / RFC 7591 和 RFC 7592 需要配置非空
-  `DYNAMIC_CLIENT_REGISTRATION_INITIAL_ACCESS_TOKEN`。
-- OpenID4VCI、OpenID4VP、SCIM Security Events、Native SSO、RAR 与实验性
-  HTTP Signatures 需要各自完整的角色或部署前提。
-- 外部 token、refresh token 或 ID token 的 Token Exchange profile。
-- QQ、微信、Google、Microsoft、企业 SAML 等模块化第三方登录 provider；在 provider-specific adapter、配置 gate、账号绑定、E2E 和负向测试完成前仅属于路线图能力。
-- 请求级动态 tenant 或 issuer routing。
-- signed-introspection profile 外，或未配置 per-client JWE response metadata 的 RFC 9701 encrypted introspection response。
-- 未配置受支持的 per-client JWE metadata 与唯一匹配公开加密密钥时的 UserInfo 或 JARM 加密。
-
-当前范围见 [docs/project/roadmap.md](docs/project/roadmap.md)。
+`PUBLIC_BASE_URL` 用于初始化 system tenant 的 directory binding。目录启用后，每个
+binding 提供请求 tenant 与 issuer，并由该 issuer 派生该租户的 frontend/CORS 默认值；
+cookie 和其他部署级安全设置仍来自进程配置。持久化应用 secret 必须和 PostgreSQL
+状态一起备份。Valkey 丢失会中断安全敏感流程；受管数据库恢复会切换
+Valkey state epoch，并在重新开放公开入口前完成 token 失效处理。详见
+[PostgreSQL 和 Valkey 运维](docs/operations/ha-operations.md)。
 
 ## 文档
 
 | 主题 | 链接 |
 | --- | --- |
 | 文档索引 | [docs/README.md](docs/README.md) |
-| Workspace 架构 | [docs/project/architecture.md](docs/project/architecture.md) |
-| 配置 | [docs/operations/configuration.md](docs/operations/configuration.md) |
-| 部署 | [docs/operations/deployment.zh-CN.md](docs/operations/deployment.zh-CN.md) |
-| 英文部署文档 | [docs/operations/deployment.md](docs/operations/deployment.md) |
-| Conformance 记录 | [docs/conformance](docs/conformance) |
-| 性能基准 | [docs/performance/performance-capacity-curve.md](docs/performance/performance-capacity-curve.md) |
-| OAuth/OIDC/FAPI best-practice matrix | [docs/protocol/rfc-compliance-matrix.md](docs/protocol/rfc-compliance-matrix.md) |
-| OAuth/OIDC/FAPI 未来路线图 | [docs/protocol/oauth-best-practice-implementation-plan.zh-CN.md](docs/protocol/oauth-best-practice-implementation-plan.zh-CN.md) |
-| Profile matrix | [docs/protocol/profile-matrix.md](docs/protocol/profile-matrix.md) |
-| 可组合能力策略 | [docs/protocol/composable-capability-policy.md](docs/protocol/composable-capability-policy.md) |
-| Ecosystem client onboarding | [docs/features/ecosystem-onboarding.md](docs/features/ecosystem-onboarding.md) |
-| Threat model | [docs/security/threat-model.md](docs/security/threat-model.md) |
-| 发布安全 | [docs/operations/release-security.md](docs/operations/release-security.md) |
-| PostgreSQL 和 Valkey 运维 | [docs/operations/ha-operations.md](docs/operations/ha-operations.md) |
-| Resource server verifier | [docs/features/resource-server-verifier.md](docs/features/resource-server-verifier.md) |
-| SCIM | [docs/features/scim.md](docs/features/scim.md) |
-| Federation | [docs/features/federation.md](docs/features/federation.md) |
-| Passkeys | [docs/features/passkeys.md](docs/features/passkeys.md) |
-| MFA | [docs/features/mfa.md](docs/features/mfa.md) |
-| 安全策略 | [SECURITY.md](SECURITY.md) |
-| Changelog | [CHANGELOG.md](CHANGELOG.md) |
+| 配置与所有权 | [配置](docs/operations/configuration.md) · [清单](docs/operations/configuration-inventory.md) |
+| 部署与恢复 | [部署](docs/operations/deployment.zh-CN.md) · [受管生命周期](docs/operations/one-click-update.zh-CN.md) · [HA 运维](docs/operations/ha-operations.md) |
+| 标准与 profile | [OpenID Connect](docs/integration/openid-connect.zh-CN.md) · [能力矩阵](docs/protocol/profile-matrix.md) · [RFC 矩阵](docs/protocol/rfc-compliance-matrix.md) |
+| 安全与发布 | [威胁模型](docs/security/threat-model.md) · [发布安全](docs/operations/release-security.zh-CN.md) · [SECURITY.md](SECURITY.md) |
+| 外部与性能证据 | [一致性记录](docs/conformance/README.md) · [性能索引](docs/performance/README.md) |
+| 当前审查记录 | [2026-09-10 项目审查](docs/project/review-2026-09-10.md) |
 
 ## 开发
+
+完整测试需要隔离的 PostgreSQL、Valkey、S3 兼容对象存储，以及
+[`code-quality.yml`](.github/workflows/code-quality.yml) 中的测试配置与 schema
+准备步骤。本地复现应使用该 workflow 的测试环境，不要连接生产数据。
 
 ```sh
 cargo fmt --check
@@ -214,18 +150,17 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-HTTP 和并发检查：
+一次性 Docker HTTP load gate 为：
 
 ```sh
-python scripts/full_real_request_e2e.py
 python scripts/full_real_request_load.py
 ```
 
-Coverage 运行说明见
+它在隔离 E2E deployment 中并发检查 health、discovery、client-credentials token
+签发和 introspection；它不是性能基准或外部一致性结果。覆盖率运行说明见
 [docs/coverage/codecov-docker-runbook.md](docs/coverage/codecov-docker-runbook.md)。
 
 ## 许可证
 
-公开源码采用 [AGPL-3.0-or-later](LICENSE)，个人和企业遵守 AGPL 时适用同一许可。
-符合条件的闭源使用可以另行签署商业许可；仓库本身不自动授予商业权利。详见
-[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) 和 [CONTRIBUTING.md](CONTRIBUTING.md)。
+公开源码采用 [AGPL-3.0-or-later](LICENSE)。商业许可只可通过适用著作权人的签署协议
+另行授予；详见 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)。

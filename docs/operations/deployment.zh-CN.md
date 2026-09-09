@@ -66,11 +66,23 @@ Compose server 使用非特权容器用户 `10001:10001`；root `runtime-init` �
 
 Compose 使用显式提供的凭据启动 PostgreSQL 和 Valkey，通过 lifecycle PostgreSQL
 role 执行迁移，再使用独立的 runtime role 启动服务。迁移启动只依赖 PostgreSQL；
-只有服务端需要等待 Valkey 就绪。可直接打开：
+只有服务端需要等待 Valkey 就绪。保留默认 loopback origin 与端口时，可打开：
 
 - `http://127.0.0.1:8000/health`：依赖就绪探针
 - `http://127.0.0.1:8000/live`：进程存活探针
 - `http://127.0.0.1:8000/.well-known/openid-configuration`
+
+包括探针在内的所有路由都通过 Host 解析活动目录 binding。issuer 使用
+`auth.example.com` 时，明文后端探针也必须保留该 Host，例如：
+
+```sh
+curl --fail --header 'Host: auth.example.com' http://127.0.0.1:8000/health
+```
+
+请将后端端口替换为实际发布端口。对绑定域名的部署只发送 IP Host 会得到 `404`，
+不会回退到默认租户。Direct TLS 应在 URL 中保留 issuer 域名，使 SNI 与 Host 一致；
+可用 `curl --resolve auth.example.com:8443:127.0.0.1 https://auth.example.com:8443/health`
+检查本地 listener，并保留证书验证。
 
 首次源码构建需要联网下载 Rust 依赖；后续构建会复用本地容器缓存。
 
@@ -117,7 +129,7 @@ HTTP hop 接收经过清洗且已认证的证书证据；两种模式互斥。
 
 ## 公开部署
 
-正式发布优先使用生命周期入口：
+已发布的生产安装使用受支持的生命周期入口：
 
 ```sh
 nazoauthctl host add production-host --ssh production --privilege sudo
@@ -235,6 +247,6 @@ snapshot 恢复。完整边界见[一键安装与升级](one-click-update.zh-CN.
 - 对精确提交执行
   [release-security.md](release-security.md) 中的安全与一致性闸门。
 
-如需有意清空数据面，请使用
-[全新环境部署与生产启用](fresh-production-activation.zh-CN.md)。高级配置见
-[configuration.md](configuration.md)。
+有意替换为空的数据面属于新的受管 deployment，不能在原 deployment identity 或
+state epoch 上直接重置。请使用[一键安装与升级](one-click-update.zh-CN.md)中的已签名
+install/recovery 生命周期。高级配置见 [configuration.md](configuration.md)。

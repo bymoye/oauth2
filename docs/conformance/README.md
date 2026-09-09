@@ -14,6 +14,8 @@ server-side protocol or evidence exception.
 ## External OIDF evidence
 
 - [2026-09-06 Direct TLS and trusted proxy candidate acceptance](oidf-2026-09-06-dual-mode-candidate.md)
-  records actual binary identities, original outcomes, manual review, cleanup,
-  certificate lifecycle and signed evidence digests. Formal Release evidence is
-  recorded separately once the distributed artifact has been verified.
+  records the candidate's binary identities, original outcomes, manual review,
+  cleanup, certificate lifecycle, and signed evidence digests.
+- [2026-09-06 official-release acceptance](oidf-2026-09-06-official-release.md)
+  records the distributed artifacts and black-box result. It is engineering
+  acceptance for the identified artifacts, not an OIDF certification claim.

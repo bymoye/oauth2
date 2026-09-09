@@ -60,27 +60,16 @@ reconstruction and therefore fail closed if selected.
 
 ## M8-02: evidence and conformance status
 
-The Rust crate is the canonical canonicalization and cryptographic vector
-implementation. Its tests cover GET/POST, structured-field ambiguity, digest,
-time, algorithm/key policy, replay fingerprints, request binding, response
-binding, and altered inputs. `scripts/full_real_request_e2e.py` mirrors the
-fixed Ed25519 wire vector only to exercise the deployed HTTP boundary; it is
-guarded by a syntax/source-policy check and is not an independent
-cryptographic truth source.
+The Rust crate is the canonical canonicalization and cryptographic-vector
+implementation. Its request and response tests cover GET/POST,
+structured-field ambiguity, digest, time, algorithm/key policy, replay
+fingerprints, request binding, response binding, and altered inputs. The
+Actix resource-route tests cover the default-off boundary and its HTTP
+integration. No separate Python wire-vector runner is a current source of
+cryptographic truth or external-conformance evidence.
 
-The real-HTTP matrix covers signed GET and POST, a successful DPoP-bound
-resource request whose HTTP signature covers the nonce-bearing DPoP proof,
-client verification of the server signature and request binding, tampered
-method/URI/Authorization/DPoP/body, tampered signed response `Content-Type` and
-`X-Fapi-Interaction-Id`, stale and future creation times, replay, wrong key,
-wrong client, and the unsigned legacy path on a separately started default-off
-server. The matrix also exercises a successful request covering `Content-Type`
-and an idempotency header plus rejection after that extra field is changed.
-The executable registry contains 19 exact HTTP-signature cases. Test
-keys are generated in memory. No credential is accepted through command-line
-arguments or printed in output.
-
-These local tests are bounded implementation evidence, not certification.
+These tests are bounded implementation evidence, not certification. The
+experiment remains distinct from the dated external OIDF acceptance records.
 
 ## M8-03: isolation and future delta audit
 

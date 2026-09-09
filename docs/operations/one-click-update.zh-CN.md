@@ -1,6 +1,6 @@
 # 受管安装、更新与恢复
 
-NazoAuthCtl v0.2 只支持当前 protocol 2 谱系。控制端 Registry 负责主机与实例清单；目标机 `DeploymentState` 是 runtime、制品、配置、资源、journal 与备份事实的唯一权威。已删除的控制器状态、task envelope、旧命令和 secret-provider 入口不会被读取或转换。
+NazoAuthCtl 只支持当前 protocol 谱系。控制端 Registry 负责主机与实例清单；目标机 `DeploymentState` 是 runtime、制品、配置、资源、journal 与备份事实的唯一权威。已删除的控制器状态、task envelope、旧命令和 secret-provider 入口不会被读取或转换。
 
 ## 全新安装
 
@@ -13,7 +13,7 @@ nazoauthctl install \
   --host production-host \
   --name production \
   --public-url https://auth.example.com \
-  --to v0.2.3 \
+  --to <nazoauth-release-tag> \
   --runtime podman \
   --database-host db.internal \
   --database-port 5432 \
@@ -26,6 +26,8 @@ nazoauthctl install \
   --valkey-port 6379 \
   --valkey-password-file ./valkey-password
 ```
+
+将 `<nazoauth-release-tag>` 替换为所需的、已发布且经过签名验证的 NazoAuth Release tag。
 
 Ctl 会先验证官方 Release 与不可变 runtime 制品，再为每个 deployment 生成独立、非空的 UUIDv7 state epoch，按目标机 OS 的路径语义写入配置和 secret，启动 runtime、检查本地健康、提交 `DeploymentState`，最后才注册实例。SSH 响应丢失时，prepared-install journal 会重放同一个 deployment ID 与 operation ID，不会安装第二个实例。
 

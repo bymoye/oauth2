@@ -1,6 +1,6 @@
 # Managed installation, update, and recovery
 
-NazoAuthCtl v0.2 manages NazoAuth through one current protocol lineage. A
+NazoAuthCtl manages NazoAuth through one current protocol lineage. A
 controller uses its user-scoped Registry for host and instance inventory; the
 target host's `DeploymentState` remains authoritative for runtime, artifact,
 configuration, resources, journal, and backup facts. Removed controller state,
@@ -21,7 +21,7 @@ nazoauthctl install \
   --host production-host \
   --name production \
   --public-url https://auth.example.com \
-  --to v0.2.3 \
+  --to <nazoauth-release-tag> \
   --runtime podman \
   --database-host db.internal \
   --database-port 5432 \
@@ -34,6 +34,8 @@ nazoauthctl install \
   --valkey-port 6379 \
   --valkey-password-file ./valkey-password
 ```
+
+Replace `<nazoauth-release-tag>` with the required published, signed NazoAuth Release tag.
 
 The command verifies the official Release and immutable runtime artifact,
 creates a deployment-scoped non-nil UUIDv7 state epoch, writes the target
