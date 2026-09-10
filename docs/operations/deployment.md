@@ -34,11 +34,16 @@ From the repository root:
 ```sh
 export NAZOAUTH_POSTGRES_PASSWORD='replace-with-a-unique-runtime-password'
 export NAZOAUTH_POSTGRES_LIFECYCLE_PASSWORD='replace-with-a-different-lifecycle-password'
+export NAZOAUTH_SIGNING_KEY_ENCRYPTION_KEY_ID='deployment-signing-root'
+export NAZOAUTH_SIGNING_KEY_ENCRYPTION_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
 export NAZOAUTH_VALKEY_PASSWORD='replace-with-a-unique-valkey-password'
 export NAZOAUTH_VALKEY_STATE_EPOCH='replace-with-a-new-uuid'
 docker compose up -d --build
 docker compose ps
 ```
+
+Generate the signing-key wrapping root once and retain it with this database.
+Reuse it when restarting the deployment.
 
 Replace every placeholder before starting Compose. Passwords are embedded in
 connection URLs, so restrict them to RFC 3986 unreserved characters
@@ -51,7 +56,7 @@ new `postgres_data` volume, so changing these variables does not rotate an
 existing database's credentials.
 
 To change both the host port and the public origin seen by browsers, keep the
-four variables above exported and run:
+variables above exported and run:
 
 ```sh
 NAZOAUTH_PORT=443 \
@@ -194,8 +199,8 @@ nazoauthctl admin create --instance production
 
 Select exactly one runtime: `podman`, `docker`, or `host`. The two PostgreSQL
 roles and the Valkey credential must already exist; NazoAuthCtl does not create
-credentials for external services. Target-local current-data import and backup
-boundaries are documented in
+credentials for external services. Administrator creation, controller binding,
+and backup procedures are documented in
 [one-click installation and updates](one-click-update.md).
 
 `nazoauthctl` generates the private server configuration, deployment identity,

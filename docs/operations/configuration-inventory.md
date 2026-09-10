@@ -27,7 +27,7 @@ Legend:
 | `UI_ENABLED`, `UI_STATIC_DIR`, `AVATAR_STORAGE_DIR`, `AVATAR_MAX_BYTES` | **保留（默认/派生）**。Paths and the upload bound are operational policy; storage paths default below `DATA_DIR`. |
 | `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS`, `VALKEY_URL`, `VALKEY_COMMAND_TIMEOUT_MS` | **保留（外部/默认）**。CTL generates local managed dependency URLs; an independent server cannot create a reachable external database or Valkey service. Connection URLs are supplied directly; orchestrators such as Kubernetes can project Secret values into these environment variables without an application-specific file indirection. |
 | `VALKEY_STATE_EPOCH` | **保留（恢复切分）**。It namespaces transient protocol security state. A managed restore selects a new UUIDv7 epoch; it is not a cache value to roll back or reuse. |
-| `DEPLOYMENT_ID`, `RUNTIME_INSTANCE_ID`, `INSTANCE_IDENTITY_DIR`, `JWK_KEYS_DIR` | **保留（默认/自动生成）**。Identity IDs and signing-key paths are persisted; missing deployment/instance identity and signing material are generated atomically. |
+| `DEPLOYMENT_ID`, `RUNTIME_INSTANCE_ID`, `INSTANCE_IDENTITY_DIR` | **保留（默认/自动生成）**。Deployment and instance identities are persisted; missing identity is generated atomically. |
 | `AUTHORIZATION_SERVER_PROFILE`, `DEFAULT_AUDIENCE`, `PROTECTED_RESOURCE_IDENTIFIER`, `SUBJECT_TYPE` | **保留**。These change protocol semantics and issuer/client subject contracts. The protected-resource identifier defaults from the issuer. |
 | `ACCESS_TOKEN_TTL_SECONDS`, `AUTH_CODE_TTL_SECONDS`, `ID_TOKEN_TTL_SECONDS`, `REFRESH_TOKEN_TTL_SECONDS`, `SESSION_TTL_SECONDS`, `PAR_TTL_SECONDS`, `DEVICE_AUTHORIZATION_TTL_SECONDS`, `DEVICE_AUTHORIZATION_POLL_INTERVAL_SECONDS`, `CIBA_AUTH_REQ_ID_TTL_SECONDS`, `CIBA_POLL_INTERVAL_SECONDS`, `CLIENT_DELIVERY_TTL_SECONDS` | **保留**。These are bounded lifetime/back-pressure policy, not feature toggles. |
 | `DPOP_NONCE_POLICY`, `FAPI_RESOURCE_DPOP_NONCE_POLICY`, `REQUEST_OBJECT_JTI_POLICY`, `REQUIRE_PUSHED_AUTHORIZATION_REQUESTS`, `CIBA_SECURITY_PROFILE`, `FAPI_HTTP_SIGNATURE_MAX_AGE_SECONDS` | **保留**。They select protocol assurance and replay windows; invalid combinations fail closed. |
@@ -109,9 +109,8 @@ Install retains only deployment boundaries and external dependency facts:
 `--host`, `--name`, `--public-url`, `--to`, `--artifact-sha256`, `--runtime`,
 `--install-root`, PostgreSQL host/port/database, distinct runtime and lifecycle
 roles with one password file each, and Valkey host/port/password-file. The
-optional `--import-data-root` and `--import-mfa-key-file` are an inseparable
-pair of absolute target-side current-format import paths. The controller does
-not provision shared dependencies, infer roles, or read old deployment state.
+controller does not provision shared dependencies, infer roles, or import
+historical deployment data.
 
 The important design rule is therefore: configuration selects boundaries and
 policy; service-owned key material is generated once and persisted; only

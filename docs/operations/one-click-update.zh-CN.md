@@ -33,24 +33,25 @@ Ctl 会先验证官方 Release 与不可变 runtime 制品，再为每个 deploy
 
 runtime 与 lifecycle PostgreSQL role 必须不同。服务进程只拿 runtime URL；迁移、备份与恢复使用 lifecycle role。PostgreSQL 与 Valkey 属于 external/shared 资源；Ctl 记录其所有权边界，但不创建、替换或删除它们。
 
-若要从目标机上已经停止写入的当前格式数据建立全新 deployment，必须同时追加：
+## 创建管理员与绑定控制端
+
+先创建首个管理员：
 
 ```sh
-  --import-data-root /srv/nazoauth-import/data \
-  --import-mfa-key-file /srv/nazoauth-import/mfa-totp-key
+nazoauthctl admin create --instance production
 ```
 
-这两个绝对目标机路径不可拆分。导入只复制当前 allowlist 内的数据、签名密钥、应用 secret 与 MFA key；旧 DeploymentState、控制端状态、管理员创建状态、UI cache 和旧命令格式都不会被读取。
-
-## Controller 绑定与管理员创建
+登录 `https://auth.example.com/ui/auth`，完成 MFA 绑定，再使用该管理员账号和新的 MFA 验证码绑定控制端：
 
 ```sh
 nazoauthctl bind --instance production --label operations \
   --output-secret-file ./production-recovery-secret
-nazoauthctl admin create --instance production
+nazoauthctl verify --instance production
 ```
 
-首次 bind 会在同一事务注册 Controller Key 与 Recovery Root。Recovery Secret 必须在提交前离线保存。若提交中断，owner-only pending 记录只保留这一份已交付的 proposal 与 secret，重试不会悄悄生成另一份；终态对账后立即删除。
+创建管理员使用目标机的本地部署权限，不依赖 Controller Key；绑定控制端需要已有管理员和 MFA 授权。安装结果中的健康状态只覆盖本机，`verify` 另行检查公网 DNS、TLS 和 OIDC。
+
+首次绑定会同时注册 Controller Key 与 Recovery Root。Recovery Secret 必须在提交前离线保存。提交中断时，私有 pending 记录保留同一份 proposal 与 secret，直到确认结果。
 
 自动化通过 stdin 提交严格的 `email`/`password` JSON：
 
@@ -64,8 +65,11 @@ controller 的受保护凭据路径交付，不进入 argv、普通环境变量�
 
 ## 更新与回滚
 
+> [!WARNING]
+> 0.5.0 之前，本项目快速迭代，版本更新不做历史兼容。配置、持久化状态和控制消息必须符合当前格式。变更部署前，保留经过验证的备份及其配套恢复工具；更新命令不代表跨版本兼容承诺。
+
 ```sh
-nazoauthctl update --instance production --to v0.2.6
+nazoauthctl update --instance production --to <nazoauth-release-tag>
 nazoauthctl rollback --instance production
 ```
 
