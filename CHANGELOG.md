@@ -19,6 +19,11 @@ releases. Entries below describe their respective releases, not current support.
 
 - Rebuild the English and Chinese READMEs around deployment, application
   integration, and current capabilities; state the pre-0.5.0 version policy.
+- List all 29 profiles in the official `Nazo Auth Server 0.2.0` certification
+  records, including OID4VCI/OID4VP with HAIP, and display the OpenID Certified
+  mark with its registered version.
+- Describe the storage interfaces separately from the PostgreSQL and Valkey
+  adapters supplied by the current distribution.
 - Correct first installation to create an administrator, enroll MFA, and then
   bind the controller.
 

@@ -8,6 +8,7 @@
   </p>
   <p>
     <a href="docs/operations/one-click-update.md">Deploy</a> ·
+    <a href="#openid-certified">Certifications</a> ·
     <a href="docs/integration/openid-connect.md">Connect an application</a> ·
     <a href="docs/protocol/rfc-compliance-matrix.md">Protocol status</a> ·
     <a href="README.zh-CN.md">简体中文</a>
@@ -16,8 +17,8 @@
 
 NazoAuth runs sign-in, token issuance, and client access under your own issuer.
 It includes passkeys, MFA, tenant routing, and external identity providers.
-PostgreSQL holds durable state; Valkey holds sessions, replay protection, and
-short-lived protocol state.
+Its protocol and business cores access persistent and transient state through
+storage interfaces. Concrete adapters provide the storage implementation.
 
 > [!WARNING]
 > **Before 0.5.0, this project iterates rapidly. Version updates do not preserve
@@ -25,6 +26,30 @@ short-lived protocol state.
 > administrative interfaces, and control messages follow the current format.
 > Back up a deployment before upgrading and follow the target release's setup
 > requirements. Historical format readers and conversion layers are not maintained.
+
+## OpenID Certified
+
+<p align="center">
+  <a href="https://openid.net/certification/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm-300x157.png" width="180" alt="OpenID Certified — Nazo Auth Server 0.2.0"></a>
+</p>
+
+The OpenID Foundation's public certification directory lists **NazoAuth / Nazo
+Auth Server 0.2.0** for the following **29 conformance profiles**. Each link
+opens the official register, including the certification and test-result records.
+
+| Certification | Certified profiles | Registered |
+| --- | --- | --- |
+| [OpenID Provider](https://openid.net/certification/certified-openid-providers-profiles/) | `Basic OP` · `Config OP` · `Form Post OP` · `3rd Party-Init OP` | 2026-07-29 |
+| [OpenID Connect Logout](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) | `RP-Initiated OP` · `Session OP` · `Front-Channel OP` · `Back-Channel OP` | 2026-07-29 |
+| [FAPI 2.0 Security Profile Final](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2SP OP MTLS + MTLS`<br>`FAPI2SP OP MTLS + DPoP`<br>`FAPI2SP OP private key + MTLS`<br>`FAPI2SP OP private key + DPoP`<br>`FAPI2SP OP OpenID Connect` | 2026-07-29 |
+| [FAPI 2.0 Message Signing Final](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2MS OP JAR` · `FAPI2MS OP JARM` | 2026-07-29 |
+| [FAPI 2.0 Client Credentials](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2SP OP Client Credentials MTLS + MTLS`<br>`FAPI2SP OP Client Credentials MTLS + DPoP`<br>`FAPI2SP OP Client Credentials private key + MTLS`<br>`FAPI2SP OP Client Credentials private key + DPoP` | 2026-07-29 |
+| [FAPI-CIBA](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/) | `FAPI-CIBA OP Poll w/ MTLS`<br>`FAPI-CIBA OP Poll w/ Private Key`<br>`FAPI-CIBA OP Ping w/ MTLS`<br>`FAPI-CIBA OP Ping w/ Private Key` | 2026-07-29 |
+| [**OID4VCI 1.0 + HAIP 1.0**](https://openid.net/certification/certified-oid4vci-haip-final/) | `OID4VCI-1.0+HAIP-1.0 Issuer sd_jwt_vc issuer_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer sd_jwt_vc wallet_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer mdoc issuer_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer mdoc wallet_initiated` | 2026-08-21 |
+| [**OID4VP 1.0 + HAIP 1.0**](https://openid.net/certification/certified-oid4vp-haip-final/) | `OID4VP-1.0+HAIP-1.0 Verifier sd_jwt_vc direct_post.jwt`<br>`OID4VP-1.0+HAIP-1.0 Verifier iso_mdl direct_post.jwt` | 2026-08-23 |
+
+The OID4VCI and OID4VP registers spell the implementation version `v0.2.0`.
+The certification mark and scope above refer to these registered deployments.
 
 ## What it handles
 
@@ -45,9 +70,9 @@ grants, unsigned Request Objects, and CIBA push are not supported.
 ## Deploy
 
 Use [NazoAuthCtl](https://github.com/nazozero/NazoAuthCtl) to install and operate a
-release on a local or SSH host. Choose Docker, Podman, or a host binary. Prepare
-a public HTTPS issuer, PostgreSQL with separate runtime and lifecycle roles,
-and Valkey.
+release on a local or SSH host. Choose Docker, Podman, or a host binary. The
+current distribution uses the PostgreSQL and Valkey adapters. Prepare a public
+HTTPS issuer, PostgreSQL with separate runtime and lifecycle roles, and Valkey.
 
 <details>
 <summary><strong>Install on an SSH host</strong></summary>
@@ -113,23 +138,27 @@ every client access to it.
 
 ## Inside the server
 
-One executable composes the protocol cores, identity services, and storage
-adapters. Tenant selection happens before request handlers run.
+One executable composes the protocol cores, identity services, and adapters.
+The cores depend on semantic persistence and state interfaces; adapters
+implement those contracts and own driver calls, transactions, and storage
+mechanics.
 
 ~~~mermaid
 flowchart LR
-    Apps["Applications and users"] --> TLS["HTTPS"]
-    TLS --> Server["NazoAuth · tenant by Host"]
-    Server --> PG[("PostgreSQL")]
-    Server --> VK[("Valkey")]
-    Server --> Objects["Local or S3 avatar storage"]
-    Ctl["NazoAuthCtl"] --> Host["Local / SSH host"]
-    Host --> Server
+    Core["Protocol and identity cores"] --> Persistence["Persistence interfaces"]
+    Core --> State["Transient-state interfaces"]
+    PG["PostgreSQL adapter"] -. implements .-> Persistence
+    VK["Valkey adapter"] -. implements .-> State
 ~~~
 
-PostgreSQL owns the tenant directory and durable security state. Each active
-tenant has its own service graph and signing-key lifecycle. Host routing uses
-an immutable in-process index; unknown hosts are rejected. See
+PostgreSQL and Valkey are the currently implemented adapters, not requirements
+of the core architecture. The composition root selects them; the protocol and
+business crates do not depend on their drivers. Avatar storage has separate
+local and S3-compatible adapters.
+
+Tenant selection happens before request handlers run. Each active tenant has
+its own service graph and signing-key lifecycle. Host routing uses an
+immutable in-process index; unknown hosts are rejected. See
 [architecture](docs/project/architecture.md) and
 [tenant boundaries](docs/features/tenancy.md) for the ownership rules.
 
@@ -148,8 +177,8 @@ cargo test --workspace --all-features --locked
 
 [Testing](docs/project/testing.md) explains the checks and external test setup.
 [Conformance records](docs/conformance/README.md) identify the artifacts and
-conditions covered by published black-box runs. Those records are engineering
-evidence, not an OIDF certification claim.
+conditions covered by project regression runs. Official certification profiles
+and registration dates are listed in [OpenID Certified](#openid-certified).
 
 ## Documentation
 

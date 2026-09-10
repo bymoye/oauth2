@@ -414,7 +414,14 @@ async fn active_database_external_key_signs_only_with_a_matching_public_signatur
         .encode_jwt(SigningPurpose::IdToken, &header, &claims)
         .await
         .expect_err("a database external signature must match the active public JWK");
-    assert!(format!("{error}").contains("does not verify"));
+    assert!(
+        matches!(
+            error.kind(),
+            jsonwebtoken::errors::ErrorKind::Provider(message)
+                if message == &nazo_auth::SignError::SigningFailed.to_string()
+        ),
+        "wrong signature rejection: {error:?}"
+    );
 }
 
 #[test]

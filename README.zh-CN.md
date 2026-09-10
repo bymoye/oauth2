@@ -8,6 +8,7 @@
   </p>
   <p>
     <a href="docs/operations/one-click-update.zh-CN.md">部署</a> ·
+    <a href="#openid-certified">OIDF 认证</a> ·
     <a href="docs/integration/openid-connect.zh-CN.md">接入应用</a> ·
     <a href="docs/protocol/rfc-compliance-matrix.md">协议状态</a> ·
     <a href="README.md">English</a>
@@ -15,12 +16,35 @@
 </div>
 
 在自己的基础设施上管理登录、令牌签发和应用授权。NazoAuth 支持通行密钥、MFA、
-租户路由和外部身份提供方。PostgreSQL 保存持久化状态；Valkey 保存会话、重放保护和短期协议状态。
+租户路由和外部身份提供方。协议与业务核心通过存储接口访问持久化状态和短期状态，
+具体存储由适配器实现。
 
 > [!WARNING]
 > **0.5.0 之前，本项目快速迭代，版本更新不做任何历史兼容。**
 > 配置、持久化状态、管理接口和控制消息均以当前格式为准。
 > 升级前备份，并按目标版本的要求准备部署；项目不维护旧格式读取、转换或兼容层。
+
+## OpenID Certified
+
+<p align="center">
+  <a href="https://openid.net/certification/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm-300x157.png" width="180" alt="OpenID Certified — Nazo Auth Server 0.2.0"></a>
+</p>
+
+OpenID Foundation 的公开认证目录收录了 **NazoAuth / Nazo Auth Server 0.2.0**，
+覆盖下列 **29 个 conformance profile**。表中链接均指向官方登记页，可查看认证及测试结果记录。
+
+| 认证 | 已认证的 profile | 登记日期 |
+| --- | --- | --- |
+| [OpenID Provider](https://openid.net/certification/certified-openid-providers-profiles/) | `Basic OP` · `Config OP` · `Form Post OP` · `3rd Party-Init OP` | 2026-07-29 |
+| [OpenID Connect Logout](https://openid.net/certification/certified-openid-providers-for-logout-profiles/) | `RP-Initiated OP` · `Session OP` · `Front-Channel OP` · `Back-Channel OP` | 2026-07-29 |
+| [FAPI 2.0 Security Profile Final](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2SP OP MTLS + MTLS`<br>`FAPI2SP OP MTLS + DPoP`<br>`FAPI2SP OP private key + MTLS`<br>`FAPI2SP OP private key + DPoP`<br>`FAPI2SP OP OpenID Connect` | 2026-07-29 |
+| [FAPI 2.0 Message Signing Final](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2MS OP JAR` · `FAPI2MS OP JARM` | 2026-07-29 |
+| [FAPI 2.0 Client Credentials](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/) | `FAPI2SP OP Client Credentials MTLS + MTLS`<br>`FAPI2SP OP Client Credentials MTLS + DPoP`<br>`FAPI2SP OP Client Credentials private key + MTLS`<br>`FAPI2SP OP Client Credentials private key + DPoP` | 2026-07-29 |
+| [FAPI-CIBA](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/) | `FAPI-CIBA OP Poll w/ MTLS`<br>`FAPI-CIBA OP Poll w/ Private Key`<br>`FAPI-CIBA OP Ping w/ MTLS`<br>`FAPI-CIBA OP Ping w/ Private Key` | 2026-07-29 |
+| [**OID4VCI 1.0 + HAIP 1.0**](https://openid.net/certification/certified-oid4vci-haip-final/) | `OID4VCI-1.0+HAIP-1.0 Issuer sd_jwt_vc issuer_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer sd_jwt_vc wallet_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer mdoc issuer_initiated`<br>`OID4VCI-1.0+HAIP-1.0 Issuer mdoc wallet_initiated` | 2026-08-21 |
+| [**OID4VP 1.0 + HAIP 1.0**](https://openid.net/certification/certified-oid4vp-haip-final/) | `OID4VP-1.0+HAIP-1.0 Verifier sd_jwt_vc direct_post.jwt`<br>`OID4VP-1.0+HAIP-1.0 Verifier iso_mdl direct_post.jwt` | 2026-08-23 |
+
+OID4VCI、OID4VP 登记页中的实现版本写作 `v0.2.0`。上方认证标识与范围对应这些已登记的实现。
 
 ## 能力
 
@@ -40,8 +64,8 @@ Implicit、Hybrid、密码授权、未签名 Request Object 和 CIBA push 不受
 ## 部署
 
 使用 [NazoAuthCtl](https://github.com/nazozero/NazoAuthCtl) 在本机或 SSH 主机上安装并管理正式版本。
-运行方式可选 Docker、Podman 或宿主机二进制。部署前需要准备公网 HTTPS issuer、
-具有独立 runtime/lifecycle 角色的 PostgreSQL，以及 Valkey。
+运行方式可选 Docker、Podman 或宿主机二进制。当前发行版使用 PostgreSQL、Valkey 适配器，
+部署前需要准备公网 HTTPS issuer、具有独立 runtime/lifecycle 角色的 PostgreSQL，以及 Valkey。
 
 <details>
 <summary><strong>在 SSH 主机上安装</strong></summary>
@@ -101,21 +125,22 @@ https://auth.example.com/.well-known/openid-configuration
 
 ## 服务结构
 
-一个可执行程序组合协议内核、身份服务和存储适配器。请求进入业务处理前，先完成租户选择。
+一个可执行程序组合协议核心、身份服务和适配器。核心依赖表达业务语义的持久化与状态接口；
+适配器实现这些契约，并负责驱动调用、事务和存储机制。
 
 ~~~mermaid
 flowchart LR
-    Apps["应用与用户"] --> TLS["HTTPS"]
-    TLS --> Server["NazoAuth · 按 Host 选择租户"]
-    Server --> PG[("PostgreSQL")]
-    Server --> VK[("Valkey")]
-    Server --> Objects["本地或 S3 头像存储"]
-    Ctl["NazoAuthCtl"] --> Host["本机 / SSH 主机"]
-    Host --> Server
+    Core["协议与身份核心"] --> Persistence["持久化接口"]
+    Core --> State["短期状态接口"]
+    PG["PostgreSQL 适配器"] -. 实现 .-> Persistence
+    VK["Valkey 适配器"] -. 实现 .-> State
 ~~~
 
-PostgreSQL 是租户目录和持久化安全状态的权威来源。
-每个活跃租户拥有独立服务图和签名密钥生命周期。
+PostgreSQL、Valkey 是目前已经实现的适配器，并非核心架构必须依赖的存储。
+入口程序负责选择和装配它们，协议与业务 crate 不依赖对应驱动。
+头像存储另有本地和 S3 兼容适配器。
+
+请求进入业务处理前，先完成租户选择。每个活跃租户拥有独立服务图和签名密钥生命周期。
 Host 路由读取进程内的不可变索引，未知 Host 会被拒绝。
 具体边界见[架构](docs/project/architecture.md)与[租户模型](docs/features/tenancy.md)。
 
@@ -132,8 +157,8 @@ cargo test --workspace --all-features --locked
 ~~~
 
 [测试说明](docs/project/testing.md)列出了检查项与外部测试环境。
-[一致性验证记录](docs/conformance/README.md)注明了每次黑盒验证对应的制品与条件；
-这些记录属于工程验证，不代表 OIDF 认证。
+[一致性验证记录](docs/conformance/README.md)注明了项目回归验证对应的制品与条件。
+正式认证的 profile 与登记日期见上方 [OpenID Certified](#openid-certified)。
 
 ## 文档
 
