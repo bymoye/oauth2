@@ -1,16 +1,17 @@
-# FAPI 2.0 HTTP Signatures Draft Audit
+# Experimental FAPI 2.0 HTTP Signatures
 
 ## Decision and source boundary
 
 NazoAuth implements a bounded, experimental resource profile against the
-OpenID FAPI 2.0 HTTP Signatures working draft built on 2026-06-26. It is not an
-the FAPI 2.0 Security Profile Final Specification and is distinct from FAPI 2.0 Message Signing Final.
+[OpenID FAPI 2.0 HTTP Signatures working draft](https://openid.bitbucket.io/fapi/fapi-2_0-http-signatures.html)
+built on 2026-06-26. It is separate from the FAPI 2.0 Security Profile and
+FAPI 2.0 Message Signing Final Specifications.
 The implementation uses RFC 9421 HTTP Message Signatures and RFC 9530
 `Content-Digest` primitives. A newer working draft, Implementer's Draft, or
 Final Specification requires a normative delta audit before changing this
 claim or behavior.
 
-## M8-01: product and threat boundary
+## Product and threat boundary
 
 The intended user is a registered confidential resource client that needs
 application-layer evidence binding an access-token exchange to the exact
@@ -58,7 +59,7 @@ header context once per request using lowercase unique names and valid
 control-free text; ambiguous or non-text values are unavailable to component
 reconstruction and therefore fail closed if selected.
 
-## M8-02: evidence and conformance status
+## Evidence and conformance status
 
 The Rust crate is the canonical canonicalization and cryptographic-vector
 implementation. Its request and response tests cover GET/POST,
@@ -69,13 +70,9 @@ integration. No separate Python wire-vector runner is a current source of
 cryptographic truth or external-conformance evidence.
 
 These tests are bounded implementation evidence, not certification. The
-experiment remains distinct from the dated external OIDF acceptance records.
+experiment is not covered by certification of other FAPI profiles.
 
-## M8-03: isolation and future delta audit
-
-The feature is default-off, route-local, non-advertised, and tested alongside
-an unsigned default-off server. This closes M8-01, M8-02, and M8-03 only for
-this bounded candidate. It does not change the status of any other M8 item.
+## Specification update policy
 
 For every newer publication, compare covered components, structured-field
 rules, time and replay requirements, key discovery, algorithm requirements,

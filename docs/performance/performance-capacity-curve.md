@@ -42,7 +42,7 @@ capacity statement for the current release or another deployment.
 ## 覆盖判断
 
 - 主矩阵覆盖默认可对外开放的 OAuth/OIDC/FAPI2 热路径，包括 client_credentials、已登录 authorization code、refresh rotation、FAPI2 高安全已登录路径，以及短测形式的冷登录路径。
-- 扩展矩阵覆盖 mTLS、DPoP、JAR/PAR、CIBA、introspection、revocation、Discovery/JWKS 和同用户压力路径。
+- 扩展矩阵覆盖 mTLS、JAR/PAR、introspection、revocation、Discovery/JWKS 和同用户压力路径。
 - 本轮是容量基准测试，不替代协议一致性测试；协议正确性仍应由 conformance/security matrix 单独证明。
 - 对包含密码验证或其它刻意安全限流的路径，应把拒绝/限流视为安全容量边界的一部分，不应简单与无密码哈希的热路径吞吐比较。
 
@@ -50,4 +50,4 @@ capacity statement for the current release or another deployment.
 
 - Token-only 与 refresh-only 热路径达到较高吞吐，延迟主要随目标速率和 PostgreSQL/Valkey 资源占用上升。
 - 已登录 OIDC/FAPI2 路径更能代表实际登录后授权链路；冷登录容量受密码哈希并发门禁约束，适合短测和独立保护策略评估。
-- 扩展矩阵中的 CIBA、mTLS、PAR/JAR 等场景已经纳入 30 分钟 sustained 测试，可作为后续优化和回归比较基线。
+- 扩展矩阵中的 mTLS、PAR/JAR 等场景已经纳入 30 分钟 sustained 测试，可作为后续优化和回归比较基线。
