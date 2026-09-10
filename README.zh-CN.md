@@ -129,11 +129,10 @@ https://auth.example.com/.well-known/openid-configuration
 适配器实现这些契约，并负责驱动调用、事务和存储机制。
 
 ~~~mermaid
-flowchart LR
-    Core["协议与身份核心"] --> Persistence["持久化接口"]
-    Core --> State["短期状态接口"]
-    PG["PostgreSQL 适配器"] -. 实现 .-> Persistence
-    VK["Valkey 适配器"] -. 实现 .-> State
+flowchart TB
+    Core["协议与身份核心"] --> Ports["持久化与状态接口"]
+    PG["PostgreSQL 适配器"] -. 持久化 .-> Ports
+    VK["Valkey 适配器"] -. 短期状态 .-> Ports
 ~~~
 
 PostgreSQL、Valkey 是目前已经实现的适配器，并非核心架构必须依赖的存储。

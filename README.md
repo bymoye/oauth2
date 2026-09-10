@@ -144,11 +144,10 @@ implement those contracts and own driver calls, transactions, and storage
 mechanics.
 
 ~~~mermaid
-flowchart LR
-    Core["Protocol and identity cores"] --> Persistence["Persistence interfaces"]
-    Core --> State["Transient-state interfaces"]
-    PG["PostgreSQL adapter"] -. implements .-> Persistence
-    VK["Valkey adapter"] -. implements .-> State
+flowchart TB
+    Core["Protocol and identity cores"] --> Ports["Persistence and state interfaces"]
+    PG["PostgreSQL adapter"] -. persistence .-> Ports
+    VK["Valkey adapter"] -. transient state .-> Ports
 ~~~
 
 PostgreSQL and Valkey are the currently implemented adapters, not requirements
