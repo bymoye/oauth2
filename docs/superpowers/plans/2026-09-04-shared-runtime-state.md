@@ -1,5 +1,12 @@
 # Shared runtime state implementation and acceptance
 
+> [!NOTE]
+> Historical implementation record for 4 September 2026. The file-key import
+> and controller data-copy paths described below have since been removed.
+> Use the current [configuration](../../operations/configuration.md) and
+> [installation guide](../../operations/one-click-update.md); releases before
+> 0.5.0 do not preserve historical compatibility.
+
 ## Goal and boundaries
 
 Provide browser-direct avatar uploads and database-authoritative signing keys
