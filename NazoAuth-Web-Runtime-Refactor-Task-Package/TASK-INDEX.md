@@ -5,7 +5,7 @@
 | 状态 | Task | 任务 | 硬前置 | 执行文件 | 完成反馈 |
 |---|---|---|---|---|---|
 | [x] | T00 | 锁定代码与行为基线 | 无 | `tasks/T00-锁定代码与行为基线.md` | `feedback/T00.md` |
-| [ ] | T01 | 现有package的Native / Application原子切割 | T00 | `tasks/T01-现有package的Native-Application原子切割.md` | `feedback/T01.md` |
+| [x] | T01 | 现有package的Native / Application原子切割 | T00 | `tasks/T01-现有package的Native-Application原子切割.md` | `feedback/T01.md` |
 | [ ] | T02 | 中立HTTP / VC contracts归位 | T01 | `tasks/T02-中立HTTP-VC-contracts归位.md` | `feedback/T02.md` |
 | [ ] | T03 | Key Management语义refresh与Native执行分离 | T01, T02 | `tasks/T03-Key-Management语义refresh与Native执行分离.md` | `feedback/T03.md` |
 | [ ] | T04 | 共享服务别名、配置、快照与能力闭包 | T01, T02, T03 | `tasks/T04-共享服务别名配置快照与能力闭包.md` | `feedback/T04.md` |
