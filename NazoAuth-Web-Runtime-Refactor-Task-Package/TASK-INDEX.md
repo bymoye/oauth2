@@ -17,7 +17,7 @@
 | [x] | T10 | CIBA / Device创建、查看和授权决定 | T08, T09 | `tasks/T10-CIBA-Device创建查看和授权决定.md` | `feedback/T10.md` |
 | [x] | T11 | OpenID4VC业务与mdoc执行桥 | T02, T03, T04 | `tasks/T11-OpenID4VC业务与mdoc执行桥.md` | `feedback/T11.md` |
 | [x] | T12 | 后台单批业务与Native任务生命周期 | T03, T04, T05, T10 | `tasks/T12-后台单批业务与Native任务生命周期.md` | `feedback/T12.md` |
-| [-] | T13 | 静态守卫、全量回归与删除遗留 | T00, T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12 | `tasks/T13-静态守卫全量回归与删除遗留.md` | `feedback/T13.md` |
+| [x] | T13 | 静态守卫、全量回归与删除遗留 | T00, T01, T02, T03, T04, T05, T06, T07, T08, T09, T10, T11, T12 | `tasks/T13-静态守卫全量回归与删除遗留.md` | `feedback/T13.md` |
 
 ## 执行规则
 
@@ -27,3 +27,5 @@
 2. 每次只将一个任务置为 `[-]`；不要并行修改存在写冲突或依赖关系的任务。
 3. 任务 `[x]` 的必要条件是该任务 feedback 最终判定为 PASS。
 4. T13 完成后还必须按 `references/FINAL-ACCEPTANCE.md` 完成最终 Gate。
+
+2026-09-12 统一验收完成：T00–T13 PASS，详见 `feedback/FINAL-ACCEPTANCE.md`。K41 官方 OIDF 按用户明确要求由用户手动执行，USER-OWNED / NOT RUN；正式发布及 Hostinger 部署独立记录。
