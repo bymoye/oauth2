@@ -367,7 +367,7 @@ COVERAGE_LIVE_TESTS=(
   par_fapi2_rejects_shared_secret_client_auth_after_authentication
 )
 for test_name in "${COVERAGE_LIVE_TESTS[@]}"; do
-  cargo test --locked -p nazo-oauth-server --lib "$test_name" -- --ignored
+  cargo test --locked -p nazoauth --lib "$test_name" -- --ignored
 done
 
 # Export exactly the test executables recorded by Cargo's JSON artifact stream.
