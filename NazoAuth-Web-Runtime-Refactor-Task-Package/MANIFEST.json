@@ -1,0 +1,281 @@
+{
+  "baseline_commit": "ff344fc37d36231ac7e648fd24d0bc657643327f",
+  "files": {
+    "00-GOAL.md": {
+      "bytes": 4897,
+      "sha256": "a54e53850f99a68d4c6660b85d5caf01f2951eb1fd6914ce11694e813e96718c"
+    },
+    "01-ARCHITECTURE.md": {
+      "bytes": 12845,
+      "sha256": "351a83dd88ae020cc1e1f3331664901fa3ec0e6faf75a6f2732e546704a27950"
+    },
+    "02-EXECUTION-PROTOCOL.md": {
+      "bytes": 4727,
+      "sha256": "ff1feddb6a8067f982610c1e85009cdd3032678d21053490a8953bb1fb725a38"
+    },
+    "PROMPT-GPT-5.3-CODEX-SPARK.md": {
+      "bytes": 5033,
+      "sha256": "e722ce1a04fc112a00e3dcd449e27d924e2b255336c6802ba9788a695a466caa"
+    },
+    "README.md": {
+      "bytes": 1895,
+      "sha256": "41eee3de396c16a4f76619a3fab8f5e8ebc5772b8880c0d0697b94809e4edef1"
+    },
+    "TASK-INDEX.md": {
+      "bytes": 2696,
+      "sha256": "56ec22af268098b3365e2240508a8fb6540236fc957ba4a863ef48aff69534b8"
+    },
+    "feedback/README.md": {
+      "bytes": 463,
+      "sha256": "c3be4978b2b6447a6459785bf3b54321430caf487ffe7d8c14370babb18ecf93"
+    },
+    "feedback/T00.md": {
+      "bytes": 1315,
+      "sha256": "b321f4ee4cfc62f0b9ad99a75cc1985d1c5c346a2af43eb5ece6f945a0363311"
+    },
+    "feedback/T01.md": {
+      "bytes": 1315,
+      "sha256": "8da2474bc95b8b1ed9f7fcda8b584d3c92074b0fdfc230d8d80c234f9ed350ed"
+    },
+    "feedback/T02.md": {
+      "bytes": 1315,
+      "sha256": "82d4ef677c125ca99fede820506eb1e1afd787bee45686859eb93f898b4c4ecd"
+    },
+    "feedback/T03.md": {
+      "bytes": 1315,
+      "sha256": "9f57c00c7e57e89c8ce74f3cf15d64e12f105d78c1f6391f29a62799110fcf8c"
+    },
+    "feedback/T04.md": {
+      "bytes": 1315,
+      "sha256": "916d20c8fcea29d0cde23fb235c6d2295abfb3381f44accd5bbc5b8b3afad39d"
+    },
+    "feedback/T05.md": {
+      "bytes": 1315,
+      "sha256": "c595527cf4057fbef2c2308643146ef94108f348d1bb40c893a496c75726a68d"
+    },
+    "feedback/T06.md": {
+      "bytes": 1315,
+      "sha256": "f2e909afd294a263db6b2b5318af3908bf23e96c714a569452528136bfce0853"
+    },
+    "feedback/T07.md": {
+      "bytes": 1315,
+      "sha256": "ca864fdaec6aa9eb9a4db7dd2d0ed0bf9a9a3132ee49abc97604bdd1c54cdcd3"
+    },
+    "feedback/T08.md": {
+      "bytes": 1315,
+      "sha256": "fc5053efcaab4ada10b2231ec03a5118d751c5682c1d44a124211477acdcb1a3"
+    },
+    "feedback/T09.md": {
+      "bytes": 1315,
+      "sha256": "d4ce5d622ce8d76ee6df39cd4ff7dd7d1c454dfe6a52c028e34aa979316312ff"
+    },
+    "feedback/T10.md": {
+      "bytes": 1315,
+      "sha256": "dd642363e58455341984dd2f4a23ccf2cac69cc6db9c4e8a8b534fdfe89a0ae9"
+    },
+    "feedback/T11.md": {
+      "bytes": 1315,
+      "sha256": "ef2934e0e2fa52ef18b8e1f82c50c2e081eea3cd28d22bf51939ad90f1630d95"
+    },
+    "feedback/T12.md": {
+      "bytes": 1315,
+      "sha256": "51455e91854ef183d6311f6ea196413af06ad86646f454eae9941cd501270f9a"
+    },
+    "feedback/T13.md": {
+      "bytes": 1315,
+      "sha256": "fa4914f3b04fc4dfffbba59762e1e84f2f90dbb3729f671ee1fffb2b0fad567e"
+    },
+    "references/CARGO-DEPENDENCY-PLAN.md": {
+      "bytes": 3748,
+      "sha256": "04d5653d78124bf45410996739ad6dcde5da8126ae1a7f15a570f05205cb9018"
+    },
+    "references/FILE-MIGRATION-MAP-FULL.md": {
+      "bytes": 52097,
+      "sha256": "69071151a2063e36a582070db5558c078e7e4b63f5259d6bb7880a6582397915"
+    },
+    "references/FINAL-ACCEPTANCE.md": {
+      "bytes": 12727,
+      "sha256": "d30b25b366e38fa4cda83ccae940f46c77272558663d108c11dc58c805785614"
+    },
+    "references/STATIC-ARCHITECTURE-GUARDS.md": {
+      "bytes": 2525,
+      "sha256": "44dc7cf1c457e28603a9e3f938b54bb2dfa7ebf8970bdb2e29bc71e6968572af"
+    },
+    "references/SYMBOL-AND-INTERFACE-CONTRACTS.md": {
+      "bytes": 41028,
+      "sha256": "1193ccf91cdadb9d63cd2142e1a7e463a41529ce52686dafdace3824181a8f99"
+    },
+    "references/TEST-REGRESSION-STRATEGY.md": {
+      "bytes": 4345,
+      "sha256": "f4aca540730e47a5b969acb86987043c86703289200a89b14e04d3102cb65b2e"
+    },
+    "references/tasks/T00-FILE-MAP.md": {
+      "bytes": 167,
+      "sha256": "fda61b2066313f75d9124650e631349484decc49aa853f5b8571f960946e330b"
+    },
+    "references/tasks/T00-INTERFACES.md": {
+      "bytes": 143,
+      "sha256": "ceaa5e7e0edecdfcd052174dcaba69d89f40105a2b475984defc560acdc5e5da"
+    },
+    "references/tasks/T01-FILE-MAP.md": {
+      "bytes": 42148,
+      "sha256": "c450880d9918e7f9821e6397227d022833ed91a958ab32e91bba8075bc425556"
+    },
+    "references/tasks/T01-INTERFACES.md": {
+      "bytes": 1111,
+      "sha256": "a176e93cb53d0d0ca07ed931889f7e47aeb4b0243cb64c3f9a27a92dde7d2670"
+    },
+    "references/tasks/T02-FILE-MAP.md": {
+      "bytes": 4480,
+      "sha256": "a1f135e7eff386b794cb072cbfcbf9cc3c468f0a300156af0e7c470b5b7dc331"
+    },
+    "references/tasks/T02-INTERFACES.md": {
+      "bytes": 37302,
+      "sha256": "5557926af878ac72c68a3dd7423dd604b9af762eba5d6423e6c08362c609385d"
+    },
+    "references/tasks/T03-FILE-MAP.md": {
+      "bytes": 512,
+      "sha256": "933698519437536e0cf6d1f2b6fd93482abb64e9c61ff6d8b37c2948507a99b8"
+    },
+    "references/tasks/T03-INTERFACES.md": {
+      "bytes": 4677,
+      "sha256": "6578799cf28cf8d6ff424722d2cabe2cbe2d222a23043aea7e6a3808052e22ad"
+    },
+    "references/tasks/T04-FILE-MAP.md": {
+      "bytes": 5816,
+      "sha256": "d14df0fbcd9537d403aceb690b30944694cf26ac84c181b3a2e3d0009139ad41"
+    },
+    "references/tasks/T04-INTERFACES.md": {
+      "bytes": 11713,
+      "sha256": "e1df3ab17f6a9d3393280aedfefca95d17df1514c633ec0894156328f3b78db8"
+    },
+    "references/tasks/T05-FILE-MAP.md": {
+      "bytes": 6148,
+      "sha256": "6499097d05216f4ce73b4192eecda3b2e7f0266aef6fbab8435685c944be02f4"
+    },
+    "references/tasks/T05-INTERFACES.md": {
+      "bytes": 5194,
+      "sha256": "3d77fc5c0b920eb48cf37451df22603975f565af1007f7cfede66365a4bf7bd1"
+    },
+    "references/tasks/T06-FILE-MAP.md": {
+      "bytes": 3923,
+      "sha256": "248428d85959766c184d6942b0e50891567b33cdb6530f9d15070fe51c717846"
+    },
+    "references/tasks/T06-INTERFACES.md": {
+      "bytes": 26775,
+      "sha256": "1039219a74dc5abd6904db989bf80387c990e16aad7d4910c4ca39d3432c504e"
+    },
+    "references/tasks/T07-FILE-MAP.md": {
+      "bytes": 2872,
+      "sha256": "74f9231b3afd089405caf438975b42d46d1cb905135ba6235802df3432c9a86b"
+    },
+    "references/tasks/T07-INTERFACES.md": {
+      "bytes": 3019,
+      "sha256": "2c42bda06110a40fe09660938dda88dc49fed248b58bf8fb4add82948f53ffb5"
+    },
+    "references/tasks/T08-FILE-MAP.md": {
+      "bytes": 5126,
+      "sha256": "0c51c004fd810849d307b1d9e1a933f251477852c61629e0c32d0fcfbe709263"
+    },
+    "references/tasks/T08-INTERFACES.md": {
+      "bytes": 5859,
+      "sha256": "40dcf8771b7d85423d6c903ab521020f6077d5babe53f9c0e8be048595c66aba"
+    },
+    "references/tasks/T09-FILE-MAP.md": {
+      "bytes": 4955,
+      "sha256": "21f61a5844296539e001c883138bb6ebcf93e8b148a6cb4987a7e1dce6d57a0b"
+    },
+    "references/tasks/T09-INTERFACES.md": {
+      "bytes": 2094,
+      "sha256": "9f7090745e26ba05f01ca5efe032c8072337282e45186e1543a0379440151b20"
+    },
+    "references/tasks/T10-FILE-MAP.md": {
+      "bytes": 2435,
+      "sha256": "9b57d37ccd1b93bce3b489374afa5d4bbfe3d9f424752f04f86b4795e5bd375b"
+    },
+    "references/tasks/T10-INTERFACES.md": {
+      "bytes": 1499,
+      "sha256": "04467f1b2e5c4ce62a02f2973c755c2d7d02a8a52b1bb25d0f9888b34f6dc650"
+    },
+    "references/tasks/T11-FILE-MAP.md": {
+      "bytes": 4825,
+      "sha256": "2f76cfebe02108984afe19fa4f7f67a23e7fbfc426ad9ba181b9d773ab0473a9"
+    },
+    "references/tasks/T11-INTERFACES.md": {
+      "bytes": 22145,
+      "sha256": "06e45e604981a961769cb538adc3366b3009d7a038b62a020083667c7625d5fb"
+    },
+    "references/tasks/T12-FILE-MAP.md": {
+      "bytes": 1659,
+      "sha256": "f5d2ec79cd539f10d0c5b363ef03c436cd04339eb855cbe75b176f8c5090b86a"
+    },
+    "references/tasks/T12-INTERFACES.md": {
+      "bytes": 1529,
+      "sha256": "0c32f99c66b31398aed11ed28175c19de3e165a21c199166aed86ec42108b050"
+    },
+    "references/tasks/T13-FILE-MAP.md": {
+      "bytes": 512,
+      "sha256": "a42d4c0ee6e897042b0a12f13d4671b12d0de26e5a54e70d8cd2191ca82fe2c3"
+    },
+    "references/tasks/T13-INTERFACES.md": {
+      "bytes": 143,
+      "sha256": "19b22f3f2c4533d33ed25ec8a01938125acb050844e08e5a8e5d5371fa91ff64"
+    },
+    "tasks/T00-锁定代码与行为基线.md": {
+      "bytes": 3250,
+      "sha256": "d4b8cfb209c3fdc0508376c5f4cef409c3daec12290d7878dc27aab251d64663"
+    },
+    "tasks/T01-现有package的Native-Application原子切割.md": {
+      "bytes": 4642,
+      "sha256": "d68b1e129b2011124f2f2f5964546c9367748b32adc1cb2a9fa63f25161dafed"
+    },
+    "tasks/T02-中立HTTP-VC-contracts归位.md": {
+      "bytes": 3743,
+      "sha256": "18e478e42745ba3a490a8dadf36cfd6b5e984206cfcfadbf60d04f8f49a84b39"
+    },
+    "tasks/T03-Key-Management语义refresh与Native执行分离.md": {
+      "bytes": 4790,
+      "sha256": "e7809d8690919e12fa896dae11a22ae08370a607f0b377948e6e0ceefef395b2"
+    },
+    "tasks/T04-共享服务别名配置快照与能力闭包.md": {
+      "bytes": 5319,
+      "sha256": "a3f8ea187d77f4cd307497622115c8baab51e0ac3eda0f5080b2f79f0c603dad"
+    },
+    "tasks/T05-会话身份操作元数据与DCR编排.md": {
+      "bytes": 4766,
+      "sha256": "b6b29b5da3c1b39e7b15b8ca408a39b4103d6649ba07c77f2f602f3f2de555a1"
+    },
+    "tasks/T06-UserInfo-FAPI-SCIM-mTLS-客户端认证.md": {
+      "bytes": 5428,
+      "sha256": "868e22ea8f30bbbbb35eb5fd7ab0de084eaa4449633622aa36c6de258bbfeed3"
+    },
+    "tasks/T07-Token结果闭包与共享签发语义.md": {
+      "bytes": 4722,
+      "sha256": "db5d31dfed44d1493ae55b962d268810757f71eb9bcefce6abefe7f5808f7397"
+    },
+    "tasks/T08-Token各Grant与Dispatcher迁入Application.md": {
+      "bytes": 4747,
+      "sha256": "f804e8e6a62ee61145673cf410229ee93ea62eeb9925d34ebbb2d366222a8302"
+    },
+    "tasks/T09-Authorization-PAR-JAR-JARM与决策迁移.md": {
+      "bytes": 5039,
+      "sha256": "c22f13fdd0f499916afa2c27b6a310bffbf610bfad60f462daeeef8d9e5be74f"
+    },
+    "tasks/T10-CIBA-Device创建查看和授权决定.md": {
+      "bytes": 4552,
+      "sha256": "fa6370456ec153ccff84bc97d5beff3afe26b622482c86923abbe5f1f4b53e06"
+    },
+    "tasks/T11-OpenID4VC业务与mdoc执行桥.md": {
+      "bytes": 4776,
+      "sha256": "c02fe1a3cc20a3a528e10a92e44e92391d3220d2909a02a07573d23b87933aeb"
+    },
+    "tasks/T12-后台单批业务与Native任务生命周期.md": {
+      "bytes": 5486,
+      "sha256": "38a707b77baed078c63a9958f372b7550f30a5f59a2c03225494a7015b759030"
+    },
+    "tasks/T13-静态守卫全量回归与删除遗留.md": {
+      "bytes": 5266,
+      "sha256": "37a4c57ef98b79267fe69457d879eecb99bad05c0f46cf81a6ff931510e5cd2c"
+    }
+  }
+}
