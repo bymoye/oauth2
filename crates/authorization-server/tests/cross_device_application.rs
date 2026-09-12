@@ -209,12 +209,13 @@ fn fixture_with_client(
         intents: Mutex::new(vec![]),
         failure,
     });
-    let authorization = authorization_fixture::Fixture::new(Ok(Some(client)), Ok(None));
+    let mut authorization = authorization_fixture::Fixture::new(Ok(Some(client)), Ok(None));
+    authorization.config.client_secret_pepper = app::crypto::random_urlsafe_token().into();
     let config = CibaConfig {
         issuer: "https://issuer.example".into(),
         mtls_endpoint_base_url: "".into(),
         frontend_base_url: "https://frontend.example".into(),
-        client_secret_pepper: "".into(),
+        client_secret_pepper: authorization.config.client_secret_pepper.clone(),
         default_audience: "resource://default".into(),
         tenant_id: authorization.tenant_id,
         auth_req_id_ttl_seconds: 60,
