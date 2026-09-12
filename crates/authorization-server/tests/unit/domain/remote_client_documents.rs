@@ -444,7 +444,10 @@ async fn remote_fetch_rejects_oversize_bodies_dns_failures_and_exhausted_slots()
     let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
     assert!(resolver.jwks_for_kid(&uri, None).await.is_err());
-    server.join().expect("oversized TLS server should exit");
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("oversized TLS join task should complete")
+        .expect("oversized TLS server should exit");
 
     let (address, server, certificate_der) = tls_server(
         200,
@@ -455,8 +458,9 @@ async fn remote_fetch_rejects_oversize_bodies_dns_failures_and_exhausted_slots()
     let resolver = resolver_for(address, &certificate_der);
     let uri = format!("https://localhost:{}/jwks", address.port());
     assert!(resolver.jwks_for_kid(&uri, None).await.is_err());
-    server
-        .join()
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("streamed oversized TLS join task should complete")
         .expect("streamed oversized TLS server should exit");
 
     let resolver = RemoteClientDocumentResolver::new(&[]).expect("resolver should build");
