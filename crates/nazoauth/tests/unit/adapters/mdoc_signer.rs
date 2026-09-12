@@ -33,3 +33,40 @@ fn async_cose_signer_uses_credential_scope_and_propagates_signing_errors() {
     };
     assert!(failing.sign(b"credential tbs").is_err());
 }
+
+#[tokio::test]
+async fn tokio_mdoc_signer_builds_document_and_propagates_lease_failure() {
+    use mdoc_rs::model::types::ValidityInfo;
+    let key = p256::ecdsa::SigningKey::from_slice(&[83; 32]).unwrap();
+    let point = key.verifying_key().to_sec1_point(false);
+    for behavior in [TestSigningBehavior::Working, TestSigningBehavior::Failing] {
+        let now = chrono::Utc::now();
+        let device_key = coset::CoseKeyBuilder::new_ec2_pub_key(
+            coset::iana::EllipticCurve::P_256,
+            point.x().unwrap().to_vec(),
+            point.y().unwrap().to_vec(),
+        )
+        .build();
+        let builder = DocumentBuilder::new("org.iso.18013.5.1.mDL")
+            .device_key(device_key)
+            .validity(ValidityInfo {
+                signed: now,
+                valid_from: now,
+                valid_until: now + chrono::Duration::minutes(10),
+                expected_update: None,
+            })
+            .add_namespace(
+                "org.iso.18013.5.1",
+                vec![("given_name", ciborium::Value::Text("Ada".into()))],
+            );
+        let succeeds = matches!(behavior, TestSigningBehavior::Working);
+        let result = TokioMdocDocumentSigner
+            .sign(builder, signing_lease(behavior), vec![1, 2, 3])
+            .await;
+        if succeeds {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(CredentialTrustError::Unavailable)));
+        }
+    }
+}

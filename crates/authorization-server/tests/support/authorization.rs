@@ -45,6 +45,11 @@ pub struct RecordedAuthorizationCode {
 }
 
 pub struct Ports {
+    pub assertion_replay: Mutex<Option<Result<bool, AuthorizationPortError>>>,
+    pub client_secret: Mutex<Option<(String, String)>>,
+    pub par_rate: Mutex<Option<Result<u64, AuthorizationPortError>>>,
+    pub par_write: Mutex<Option<Result<(), AuthorizationPortError>>>,
+    pub stored_par: Mutex<Vec<(String, PushedAuthorizationRequest, u64)>>,
     pub record_code_writes: AtomicBool,
     pub stored_codes: Mutex<Vec<RecordedAuthorizationCode>>,
     client: Result<Option<OAuthClient>, AuthorizationPortError>,
@@ -88,14 +93,35 @@ impl AuthorizationRepositoryPort for Ports {
         &'a self,
         _client_id: Uuid,
     ) -> AuthorizationFuture<'a, Option<String>> {
-        panic!("unexpected AuthorizationRepositoryPort::client_secret_salt call")
+        self.record("secret_salt");
+        Box::pin(async {
+            Ok(Some(
+                self.client_secret
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("secret lookup must be configured")
+                    .0
+                    .clone(),
+            ))
+        })
     }
     fn client_secret_digest_matches<'a>(
         &'a self,
         _client_id: Uuid,
-        _candidate_digest: &'a str,
+        candidate_digest: &'a str,
     ) -> AuthorizationFuture<'a, bool> {
-        panic!("unexpected AuthorizationRepositoryPort::client_secret_digest_matches call")
+        self.record("secret_digest");
+        Box::pin(async move {
+            Ok(self
+                .client_secret
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("secret lookup must be configured")
+                .1
+                == candidate_digest)
+        })
     }
 }
 impl AuthorizationStateStorePort for Ports {
@@ -127,11 +153,23 @@ impl AuthorizationStateStorePort for Ports {
     }
     fn store_par<'a>(
         &'a self,
-        _request_uri: &'a str,
-        _payload: &'a PushedAuthorizationRequest,
-        _ttl_seconds: u64,
+        request_uri: &'a str,
+        payload: &'a PushedAuthorizationRequest,
+        ttl_seconds: u64,
     ) -> AuthorizationFuture<'a, ()> {
-        panic!("unexpected AuthorizationStateStorePort::store_par call")
+        self.record("store_par");
+        Box::pin(async move {
+            self.par_write
+                .lock()
+                .unwrap()
+                .expect("unexpected PAR write")?;
+            self.stored_par.lock().unwrap().push((
+                request_uri.into(),
+                payload.clone(),
+                ttl_seconds,
+            ));
+            Ok(())
+        })
     }
     fn take_consent<'a>(
         &'a self,
@@ -222,7 +260,15 @@ impl AuthorizationStateStorePort for Ports {
         _jti: &'a str,
         _ttl_seconds: u64,
     ) -> AuthorizationFuture<'a, bool> {
-        panic!("unexpected AuthorizationStateStorePort::consume_private_key_jwt call")
+        self.record("assertion_replay");
+        Box::pin(async {
+            *self
+                .assertion_replay
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("replay must be configured")
+        })
     }
     fn consume_jwt_bearer<'a>(
         &'a self,
@@ -264,7 +310,13 @@ impl AuthorizationStateStorePort for Ports {
         _subject: &'a str,
         _window_seconds: u64,
     ) -> AuthorizationFuture<'a, u64> {
-        panic!("unexpected AuthorizationStateStorePort::increment_rate call")
+        self.record("rate");
+        Box::pin(async {
+            self.par_rate
+                .lock()
+                .unwrap()
+                .expect("unexpected PAR rate lookup")
+        })
     }
 }
 impl SessionStorePort for Ports {
@@ -454,6 +506,11 @@ impl Fixture {
         session: Result<Option<SessionSnapshot>, RepositoryError>,
     ) -> Self {
         let ports = Arc::new(Ports {
+            assertion_replay: Mutex::new(None),
+            client_secret: Mutex::new(None),
+            par_rate: Mutex::new(None),
+            par_write: Mutex::new(None),
+            stored_par: Mutex::new(Vec::new()),
             record_code_writes: AtomicBool::new(false),
             stored_codes: Mutex::new(Vec::new()),
             client,

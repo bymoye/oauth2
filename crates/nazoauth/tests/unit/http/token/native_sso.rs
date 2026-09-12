@@ -419,3 +419,81 @@ async fn native_sso_id_token_decoder_rejects_invalid_authentication_context_clai
         Err(nazo_auth::TokenPortError::CorruptData)
     ));
 }
+
+#[tokio::test]
+async fn native_sso_exchange_rejects_unbound_inputs_before_secret_store_access() {
+    let state = native_sso_state_with_signing_key();
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
+    let authorization = crate::http::token::issue::test_support::test_authorization_service(&state);
+    let service = ServerTokenService::new(
+        crate::test_support::token_issuance_repository(state.diesel_db.clone()),
+        Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(
+            &state.valkey_connection(),
+        )),
+        state.keyset.clone(),
+    );
+    let valid_id_token = signed_native_sso_id_token(&state, &state.settings.endpoint.issuer).await;
+    for case in 0..7 {
+        let mut modules = state.active_module_snapshot();
+        if case != 0 {
+            modules
+                .accepting
+                .insert(nazo_runtime_modules::ModuleId::NativeSso);
+        }
+        let issuance = TokenIssuanceContext {
+            config: &config,
+            modules: &modules,
+            authorization: &authorization,
+            security_audit: crate::http::authorization::test_support::test_security_audit(),
+            remote_client_documents: crate::test_support::test_remote_client_documents(),
+        };
+        let mut client = native_sso_client(json!(["openid", "offline_access", "device_sso"]));
+        let mut form = token_form();
+        form.audiences = vec![state.settings.endpoint.issuer.clone()];
+        form.subject_token = Some(valid_id_token.clone());
+        form.actor_token = Some("wrong-device-secret".into());
+        let expected = match case {
+            0 => "unsupported_grant_type",
+            1 => {
+                client.scopes.clear();
+                "unauthorized_client"
+            }
+            2 => {
+                form.audiences.clear();
+                "invalid_target"
+            }
+            3 => {
+                form.subject_token = None;
+                "invalid_request"
+            }
+            4 => {
+                form.actor_token = None;
+                "invalid_request"
+            }
+            5 => {
+                form.subject_token = Some("invalid-id-token".into());
+                "invalid_grant"
+            }
+            _ => "invalid_grant",
+        };
+        let request = actix_web::test::TestRequest::post()
+            .uri("/token")
+            .to_http_request();
+        let result = nazo_oauth_server::token::native_sso::token_native_sso_exchange(
+            &service,
+            &issuance,
+            &crate::http::token::issue::test_support::token_request_facts(
+                &request,
+                state.settings.as_ref(),
+            ),
+            &client,
+            &form,
+            None,
+        )
+        .await;
+        let error = result.expect_err("unbound input must be rejected");
+        let response = nazo_http_actix::oauth_endpoint_error_response(error);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case {case}");
+        assert_eq!(oauth_error_code(response).await, expected, "case {case}");
+    }
+}

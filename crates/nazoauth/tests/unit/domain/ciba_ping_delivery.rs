@@ -173,3 +173,31 @@ fn ciba_ping_sender_preserves_notification_idempotency_key() {
         "nazo-ciba-ping-request-hash"
     );
 }
+
+#[tokio::test]
+async fn ciba_ping_sender_blocks_private_networks_and_keeps_certificate_validation_for_exceptions()
+{
+    use nazo_oauth_server::{
+        ports::transient_state::CibaPingDelivery, workers::ciba_ping::CibaPingSender,
+    };
+    let (address, server) = single_version_tls_server(&rustls::version::TLS13);
+    let origin = format!("https://{address}");
+    let delivery = CibaPingDelivery {
+        auth_req_id_hash: "request-hash".into(),
+        auth_req_id: "request-id".into(),
+        endpoint: format!("{origin}/notify"),
+        client_notification_token: uuid::Uuid::now_v7().to_string(),
+        attempts: 0,
+        expires_at: chrono::Utc::now().timestamp() + 60,
+    };
+    let denied = super::CibaPingHttpSender::new(&[])
+        .unwrap()
+        .send(&delivery)
+        .await
+        .unwrap_err();
+    assert!(denied.to_string().contains("blocked network"));
+    let sender = super::CibaPingHttpSender::new(&[origin]).unwrap();
+    let error = sender.send(&delivery).await.unwrap_err();
+    assert!(error.to_string().contains("CIBA ping request failed"));
+    server.join().unwrap();
+}

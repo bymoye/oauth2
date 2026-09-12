@@ -14,6 +14,9 @@ use std::{collections::HashMap, sync::Arc};
 mod authorization_fixture;
 use authorization_fixture::{Fixture, Ports, client, session};
 
+#[path = "support/par_application.rs"]
+mod par_application;
+
 fn application(
     client: Result<Option<OAuthClient>, AuthorizationPortError>,
     session: Result<Option<SessionSnapshot>, RepositoryError>,

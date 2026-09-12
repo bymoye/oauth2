@@ -175,6 +175,15 @@ async fn token_with_remote_documents(
     body: Bytes,
     resolver: Arc<crate::adapters::remote_client_documents::RemoteClientDocumentResolver>,
 ) -> HttpResponse {
+    token_with_credential_issuer(state, req, body, resolver, Openid4vcTokenHandles::default()).await
+}
+async fn token_with_credential_issuer(
+    state: Data<TestInfrastructure>,
+    req: HttpRequest,
+    body: Bytes,
+    resolver: Arc<crate::adapters::remote_client_documents::RemoteClientDocumentResolver>,
+    openid4vc: Openid4vcTokenHandles,
+) -> HttpResponse {
     let service = Data::new(ServerTokenService::new(
         crate::test_support::token_issuance_repository(state.diesel_db.clone()),
         Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(
@@ -226,7 +235,7 @@ async fn token_with_remote_documents(
             issuance_config.into_inner(),
             runtime_modules,
             resolver,
-            Openid4vcTokenHandles::default(),
+            openid4vc,
         )),
         Data::new(nazo_http_actix::ClientIpConfig::new(
             &state.settings.endpoint.trusted_proxy_cidrs,
@@ -2019,3 +2028,105 @@ fn fapi2_client_policy_accepts_self_signed_mtls_confidential_sender_constrained_
 
 #[path = "dispatch/pre_authorized.rs"]
 mod pre_authorized_parser_tests;
+
+#[actix_web::test]
+async fn token_dispatch_preserves_grant_validation_and_unconfigured_issuer_error() {
+    let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
+        return;
+    };
+    let client_id = format!("dispatch-grants-{}", Uuid::now_v7());
+    let secret = Uuid::now_v7().to_string();
+    let grants = vec![
+        "authorization_code",
+        "refresh_token",
+        "urn:ietf:params:oauth:grant-type:device_code",
+        "urn:openid:params:grant-type:ciba",
+        "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        "urn:ietf:params:oauth:grant-type:token-exchange",
+    ];
+    insert_token_client(
+        &state,
+        &client_id,
+        "confidential",
+        "client_secret_post",
+        Some(fixture_secret_hash(&state, &secret)),
+        grants.clone(),
+        false,
+        false,
+        true,
+    )
+    .await;
+    let policy = nazo_auth::ClientSecurityPolicy {
+        allow_cross_device_flows: true,
+        ..Default::default()
+    };
+    set_token_client_security_policy(&state, &client_id, policy).await;
+    for grant in grants {
+        let body = Bytes::from(format!(
+            "grant_type={}&client_id={}&client_secret={}",
+            urlencoding::encode(grant),
+            client_id,
+            secret
+        ));
+        let response = token(
+            state.clone(),
+            token_request("application/x-www-form-urlencoded"),
+            body,
+        )
+        .await;
+        let expected = "invalid_request";
+        assert_token_error(response, StatusCode::BAD_REQUEST, expected, false).await;
+    }
+    for authenticated in [false, true] {
+        let mut body = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Apre-authorized_code&pre-authorized_code=unused".to_owned();
+        if authenticated {
+            body.push_str(&format!("&client_id={client_id}&client_secret={secret}"));
+        }
+        assert_token_error(
+            token(
+                state.clone(),
+                token_request("application/x-www-form-urlencoded"),
+                Bytes::from(body),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            false,
+        )
+        .await;
+    }
+    let partial = actix_web::test::TestRequest::post()
+        .uri("/token")
+        .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
+        .insert_header(("OAuth-Client-Attestation", "incomplete-pair"))
+        .to_http_request();
+    assert_token_error(
+        token(
+            state.clone(),
+            partial,
+            Bytes::from_static(b"grant_type=authorization_code"),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        false,
+    )
+    .await;
+    let inactive_id = format!("inactive-preauth-{}", Uuid::now_v7());
+    insert_token_client(
+        &state,
+        &inactive_id,
+        "confidential",
+        "client_secret_post",
+        Some(fixture_secret_hash(&state, &secret)),
+        vec!["authorization_code"],
+        false,
+        false,
+        false,
+    )
+    .await;
+    assert_token_error(token(state, token_request("application/x-www-form-urlencoded"), Bytes::from(format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Apre-authorized_code&pre-authorized_code=unused&client_id={inactive_id}&client_secret={secret}"))).await, StatusCode::UNAUTHORIZED, "invalid_client", false).await;
+}
+
+#[path = "dispatch_credential_issuer.rs"]
+mod credential_issuer;

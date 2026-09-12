@@ -33,8 +33,11 @@ enum AuditFailure {
     None,
     Preflight,
     Intent,
+    Create,
 }
 struct Ports {
+    account: Mutex<Option<Result<Option<PublicAccount>, RepositoryError>>>,
+    allow_create: bool,
     state: Mutex<CibaRequestState>,
     calls: Mutex<Vec<&'static str>>,
     intents: Mutex<Vec<Map<String, Value>>>,
@@ -64,9 +67,17 @@ impl CibaStateStorePort for Ports {
     fn create<'a>(
         &'a self,
         _: &'a str,
-        _: &'a CibaRequestState,
+        state: &'a CibaRequestState,
     ) -> CibaStateFuture<'a, CibaAtomicResult> {
-        panic!("creation must not reach the state store in these preflight tests")
+        assert!(self.allow_create);
+        self.record_call("create");
+        Box::pin(async move {
+            if matches!(self.failure, AuditFailure::Create) {
+                return Ok(CibaAtomicResult::Conflict);
+            }
+            *self.state.lock().unwrap() = state.clone();
+            Ok(CibaAtomicResult::Applied)
+        })
     }
     fn replace<'a>(
         &'a self,
@@ -101,7 +112,9 @@ impl SecurityAudit for Ports {
     fn record(&self, event: &str, _: Map<String, Value>) {
         assert!(matches!(
             event,
-            "ciba_authorization_approved" | "ciba_authorization_denied"
+            "ciba_authorization_approved"
+                | "ciba_authorization_denied"
+                | "ciba_authorization_started"
         ));
         self.record_call("audit_result");
     }
@@ -110,7 +123,10 @@ impl SecurityAudit for Ports {
         event: &'a str,
         fields: Map<String, Value>,
     ) -> AuditFuture<'a> {
-        assert_eq!(event, "ciba_decision_intent");
+        assert!(matches!(
+            event,
+            "ciba_decision_intent" | "ciba_authorization_intent"
+        ));
         self.record_call("audit_intent");
         self.intents.lock().unwrap().push(fields);
         Box::pin(async {
@@ -128,7 +144,15 @@ impl nazo_persistence::CibaAccountStore for Ports {
         _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<PublicAccount>, RepositoryError>> + Send + 'a>>
     {
-        panic!("unexpected account lookup")
+        self.record_call("account");
+        Box::pin(async {
+            self.account
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("account lookup must be configured")
+                .clone()
+        })
     }
     fn by_id(
         &self,
@@ -141,6 +165,18 @@ impl nazo_persistence::CibaAccountStore for Ports {
 }
 fn fixture(
     failure: AuditFailure,
+) -> (
+    CibaApplication,
+    Arc<Ports>,
+    CurrentSession,
+    authorization_fixture::Fixture,
+) {
+    fixture_with_client(failure, authorization_fixture::client(true), false)
+}
+fn fixture_with_client(
+    failure: AuditFailure,
+    client: nazo_auth::OAuthClient,
+    allow_create: bool,
 ) -> (
     CibaApplication,
     Arc<Ports>,
@@ -166,15 +202,14 @@ fn fixture(
         ping_notification: None,
     };
     let ports = Arc::new(Ports {
+        account: Mutex::new(None),
+        allow_create,
         state: Mutex::new(state),
         calls: Mutex::new(vec![]),
         intents: Mutex::new(vec![]),
         failure,
     });
-    let authorization = authorization_fixture::Fixture::new(
-        Ok(Some(authorization_fixture::client(true))),
-        Ok(None),
-    );
+    let authorization = authorization_fixture::Fixture::new(Ok(Some(client)), Ok(None));
     let config = CibaConfig {
         issuer: "https://issuer.example".into(),
         mtls_endpoint_base_url: "".into(),
@@ -404,3 +439,6 @@ fn ciba_invalid_decision_does_not_read_store_or_emit_audit() {
         assert!(ports.calls().is_empty());
     });
 }
+
+#[path = "support/ciba_creation_application.rs"]
+mod ciba_creation;

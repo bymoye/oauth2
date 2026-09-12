@@ -268,3 +268,55 @@ fn dummy_password_hash_is_valid_and_never_matches_the_probe_password() {
     let hash = nazo_identity::PasswordHash::new(hash).expect("valid dummy password hash");
     assert!(!hash.verify_password("attacker supplied password"));
 }
+
+#[tokio::test]
+async fn mfa_secret_hasher_preserves_candidate_order_and_rejects_wrong_secret() {
+    use nazo_identity::ports::MfaSecretHashPort;
+    let hasher = super::ServerMfaSecretHasher;
+    let first = uuid::Uuid::now_v7().to_string();
+    let second = uuid::Uuid::now_v7().to_string();
+    let hashes = hasher
+        .hash_secrets(vec![first.clone(), second.clone()])
+        .await
+        .unwrap();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(
+        hasher
+            .find_matching_secret(second, hashes.clone())
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        hasher
+            .find_matching_secret(first, hashes.clone())
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        hasher
+            .find_matching_secret("wrong-secret".into(), hashes)
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(hasher.hash_secrets(vec![]).await.unwrap().is_empty());
+}
+#[tokio::test]
+async fn scim_bootstrap_password_provider_returns_valid_independent_hashes() {
+    use nazo_oauth_server::contracts::scim::ScimBootstrapPasswordProvider;
+    let provider = super::ServerScimBootstrapPasswordProvider;
+    let first = provider
+        .password_hash()
+        .await
+        .unwrap()
+        .into_persistence_value();
+    let second = provider
+        .password_hash()
+        .await
+        .unwrap()
+        .into_persistence_value();
+    assert_ne!(first.as_str(), second.as_str());
+    assert!(argon2::PasswordHash::new(first.as_str()).is_ok());
+}

@@ -555,3 +555,136 @@ async fn device_code_replay_rejects_a_consumed_code_even_with_a_persisted_respon
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(oauth_error_code(response).await, "invalid_grant");
 }
+
+#[actix_web::test]
+async fn device_http_boundaries_preserve_validation_csrf_and_verification_representation() {
+    let Some(state) = live_device_replay_state().await else {
+        return;
+    };
+    let runtime = crate::runtime_modules::test_support::runtime_module_registry_for_test(
+        state.diesel_db.clone(),
+        state.settings.as_ref(),
+    )
+    .unwrap();
+    let handles = decision_handles(
+        &state,
+        device_grant_service(&state).into_inner(),
+        runtime.snapshot_store(),
+    );
+    let config = Data::new(DeviceHttpConfig::from(state.settings.as_ref()));
+    let sessions = Data::new(crate::http::sessions::test_support::profile_session_handles(&state));
+    for (content_type, body, expected) in [
+        (
+            "application/json",
+            Bytes::from_static(b"{}"),
+            "invalid_request",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(&[255]),
+            "invalid_request",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(b"client_id=a&client_id=b"),
+            "invalid_request",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(b"resource=relative"),
+            "invalid_target",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(b"scope=openid"),
+            "invalid_request",
+        ),
+        (
+            "application/x-www-form-urlencoded",
+            Bytes::from_static(b"client_id=unknown-device-boundary-client"),
+            "invalid_client",
+        ),
+    ] {
+        let request = TestRequest::post()
+            .insert_header((header::CONTENT_TYPE, content_type))
+            .to_http_request();
+        let response = device_authorization(handles.clone(), config.clone(), request, body).await;
+        assert_eq!(oauth_error_code(response).await, expected);
+    }
+    let response = device_verification_page(
+        handles.clone(),
+        config.clone(),
+        Query(HashMap::from([("user_code".into(), "ABCD 1234".into())])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("?user_code=ABCD%201234")
+    );
+    let response = device_verification(
+        handles.clone(),
+        sessions.clone(),
+        TestRequest::get()
+            .cookie(actix_web::cookie::Cookie::new(
+                state.settings.session.csrf_cookie_name.clone(),
+                "csrf-probe",
+            ))
+            .to_http_request(),
+        Query(HashMap::from([("user_code".into(), "not-found".into())])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    let body = actix_web::body::to_bytes(response.into_body())
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["csrf_token"], "csrf-probe");
+    assert!(body["request"].is_null());
+    for session_cookie in [false, true] {
+        let mut request = TestRequest::post();
+        if session_cookie {
+            request = request.cookie(actix_web::cookie::Cookie::new(
+                state.settings.session.session_cookie_name.clone(),
+                "unused-session",
+            ));
+        }
+        let response = device_decision(
+            handles.clone(),
+            sessions.clone(),
+            config.clone(),
+            request.to_http_request(),
+            Form(DeviceDecisionForm {
+                user_code: "unused".into(),
+                decision: "approve".into(),
+                csrf_token: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            if session_cookie {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
+        assert_eq!(
+            oauth_error_code(response).await,
+            if session_cookie {
+                "invalid_request"
+            } else {
+                "login_required"
+            }
+        );
+    }
+}

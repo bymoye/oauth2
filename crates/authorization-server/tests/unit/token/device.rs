@@ -290,3 +290,6 @@ fn device_user_code_normalization_is_case_insensitive_and_separator_safe() {
     assert_eq!(normalize_user_code(" ab-cd_12 "), "ABCD12");
     assert_eq!(normalize_user_code("\t\n"), "");
 }
+
+#[path = "device_application.rs"]
+mod application;
