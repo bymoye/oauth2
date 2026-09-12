@@ -11,3 +11,7 @@ pub(crate) mod sessions;
 pub(crate) mod token;
 pub(crate) mod views;
 pub(crate) mod well_known;
+
+#[cfg(test)]
+#[path = "../../tests/unit/http/framework_boundary_transport.rs"]
+mod framework_boundary_transport;
