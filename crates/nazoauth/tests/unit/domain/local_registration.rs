@@ -16,27 +16,30 @@ use fred::{
 use nazo_auth::{
     RequestRateLimitBucket, RequestRateLimitError, RequestRateLimitFuture, RequestRateLimitPort,
 };
-use nazo_http_actix::{
-    AuthenticationRateLimit, AuthenticationRateLimitError, LocalRegistrationOperations,
-};
 use nazo_identity::{
     RegisterLocalAccountError, RegisterLocalAccountInput, SendVerificationCodeOutcome,
 };
+use nazo_oauth_server::contracts::local_registration::{
+    AuthenticationRateLimit, AuthenticationRateLimitError, LocalRegistrationOperations,
+};
 use uuid::Uuid;
 
-use super::*;
-use crate::{
-    adapters::{
-        email::normalize_email_address,
-        security::{blake3_hex, hash_password, random_urlsafe_token},
-    },
-    config::ConfigSource,
-    settings::{EmailDelivery, Settings, SmtpEmailSettings, SmtpTlsMode},
-    test_support::TestInfrastructure,
-    test_support::{
-        registration_service,
-        valkey::{valkey_get, valkey_set_ex},
-    },
+use crate::adapters::email::normalize_email_address;
+use crate::adapters::security::hash_password;
+use crate::config::ConfigSource;
+use crate::settings::EmailDelivery;
+use crate::settings::Settings;
+use crate::settings::SmtpEmailSettings;
+use crate::settings::SmtpTlsMode;
+use crate::test_support::TestInfrastructure;
+use crate::test_support::registration_service;
+use crate::test_support::valkey::valkey_get;
+use crate::test_support::valkey::valkey_set_ex;
+use nazo_identity::ports::EmailVerificationStorePort;
+use nazo_oauth_server::crypto::blake3_hex;
+use nazo_oauth_server::crypto::random_urlsafe_token;
+use nazo_oauth_server::domain::local_registration::{
+    ServerAuthenticationRateLimit, ServerLocalRegistrationOperations,
 };
 
 struct LiveFixture {
@@ -121,8 +124,8 @@ impl LiveFixture {
         &self,
     ) -> ServerLocalRegistrationOperations<
         Arc<dyn EmailVerificationStorePort>,
-        crate::bootstrap::RegistrationSecretHasher,
-        crate::adapters::email::SmtpVerificationEmailDelivery,
+        Arc<dyn nazo_identity::ports::SecretHashPort>,
+        Arc<dyn nazo_identity::ports::VerificationEmailDeliveryPort>,
     > {
         ServerLocalRegistrationOperations::new(
             registration_service(self.state.get_ref()).get_ref().clone(),
@@ -131,7 +134,7 @@ impl LiveFixture {
 
     async fn store_code(&self, email: &str, code: &str) {
         let email = normalize_email_address(email).unwrap();
-        let tenant_id = nazo_identity::TenantId::new(crate::domain::tenancy::DEFAULT_TENANT_ID)
+        let tenant_id = nazo_identity::TenantId::new(nazo_identity::DEFAULT_TENANT_ID)
             .expect("default tenant must be non-nil");
         valkey_set_ex(
             &self.state.valkey,
@@ -194,7 +197,7 @@ async fn concurrent_registration_consumes_once_and_keeps_valkey_key_contract() {
     let registered = outcomes.into_iter().find_map(Result::ok).unwrap();
     assert_eq!(registered.email, email);
 
-    let tenant_id = nazo_identity::TenantId::new(crate::domain::tenancy::DEFAULT_TENANT_ID)
+    let tenant_id = nazo_identity::TenantId::new(nazo_identity::DEFAULT_TENANT_ID)
         .expect("default tenant must be non-nil");
     let code_key = format!(
         "oauth:email_verify:{}:code:{}",

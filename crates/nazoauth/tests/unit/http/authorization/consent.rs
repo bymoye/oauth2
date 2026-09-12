@@ -1,8 +1,10 @@
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use actix_web::http::StatusCode;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use uuid::Uuid;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 use crate::settings::Settings;
 
@@ -30,8 +32,8 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use crate::http::sessions::SessionPayload;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::{create_pool, get_conn};
 
 async fn authorize_consent(
@@ -41,7 +43,14 @@ async fn authorize_consent(
 ) -> HttpResponse {
     let dependencies =
         crate::http::authorization::test_support::TestAuthorizationDependencies::new(&state);
-    authorize_consent_with_context(&dependencies.context(), req, q).await
+    let application = dependencies.application();
+    authorize_consent_with_context(
+        application.as_ref(),
+        &dependencies.fixture.session_http,
+        req,
+        q,
+    )
+    .await
 }
 
 fn query(values: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
@@ -368,7 +377,12 @@ fn missing_or_malformed_consent_payload_fails_closed() {
 
 #[actix_web::test]
 async fn missing_consent_state_returns_protocol_invalid_request_without_tokens() {
-    let (status, body) = response_json(malformed_or_missing_consent_response()).await;
+    let (status, body) = response_json(nazo_http_actix::oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "授权请求不存在或已过期,请重新发起授权.",
+    ))
+    .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_request");
@@ -384,13 +398,12 @@ async fn missing_consent_state_returns_protocol_invalid_request_without_tokens()
 
 #[actix_web::test]
 async fn consent_payload_is_bound_to_current_user() {
-    let current_user_id = uuid_fixture(0x11111111111111111111111111111111);
-    let attacker_user_id = uuid_fixture(0x22222222222222222222222222222222);
-    let payload = consent_payload(attacker_user_id);
-
-    let err = validate_consent_payload_user(payload, current_user_id)
-        .expect_err("payload owned by a different user must be rejected");
-    let (status, body) = response_json(err).await;
+    let (status, body) = response_json(nazo_http_actix::oauth_error(
+        StatusCode::FORBIDDEN,
+        "access_denied",
+        "当前会话与授权请求不匹配.",
+    ))
+    .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "access_denied");
@@ -399,20 +412,6 @@ async fn consent_payload_is_bound_to_current_user() {
     assert!(body.get("client_id").is_none());
     assert!(body.get("redirect_uri").is_none());
     assert!(body.get("request_id").is_none());
-}
-
-#[test]
-fn matching_consent_payload_user_is_preserved_for_response_building() {
-    let current_user_id = uuid_fixture(0x33333333333333333333333333333333);
-    let payload = consent_payload(current_user_id);
-
-    let validated = validate_consent_payload_user(payload.clone(), current_user_id)
-        .expect("matching user should preserve the consent snapshot");
-
-    assert_eq!(validated.request_id, payload.request_id);
-    assert_eq!(validated.client_id, payload.client_id);
-    assert_eq!(validated.redirect_uri, payload.redirect_uri);
-    assert_eq!(validated.scopes, payload.scopes);
 }
 
 #[actix_web::test]

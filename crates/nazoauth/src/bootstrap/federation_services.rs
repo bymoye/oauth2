@@ -1,11 +1,11 @@
+use nazo_oauth_server::ports::audit::{SecurityAudit, audit_fields};
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::adapters::audit::audit_event;
-use crate::adapters::audit::audit_fields;
 use crate::adapters::security::PasswordHashingError;
-use crate::adapters::security::blake3_hex;
 use crate::adapters::security::hash_password_blocking_limited;
-use crate::adapters::security::random_urlsafe_token;
+use nazo_oauth_server::crypto::blake3_hex;
+use nazo_oauth_server::crypto::random_urlsafe_token;
 
 #[derive(Clone, Copy)]
 pub(crate) struct FederationBootstrapPasswordHasher;
@@ -34,8 +34,16 @@ impl nazo_identity::ports::FederationPasswordHasherPort for FederationBootstrapP
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct TracingFederationAudit;
+#[derive(Clone)]
+pub(crate) struct TracingFederationAudit {
+    audit: Arc<dyn SecurityAudit>,
+}
+
+impl TracingFederationAudit {
+    pub(crate) fn new(audit: Arc<dyn SecurityAudit>) -> Self {
+        Self { audit }
+    }
+}
 
 impl nazo_identity::ports::FederationAuditPort for TracingFederationAudit {
     fn record(&self, event: nazo_identity::FederationAuditEvent) {
@@ -44,7 +52,7 @@ impl nazo_identity::ports::FederationAuditPort for TracingFederationAudit {
                 provider_type,
                 provider_id,
                 email,
-            } => audit_event(
+            } => self.audit.record(
                 "external_identity_relink_denied",
                 audit_fields(&[
                     ("provider_type", json!(provider_type)),
@@ -56,7 +64,7 @@ impl nazo_identity::ports::FederationAuditPort for TracingFederationAudit {
                 user_id,
                 provider_type,
                 provider_id,
-            } => audit_event(
+            } => self.audit.record(
                 "external_identity_linked",
                 audit_fields(&[
                     ("user_id", json!(user_id.as_uuid())),
@@ -68,7 +76,7 @@ impl nazo_identity::ports::FederationAuditPort for TracingFederationAudit {
                 user_id,
                 method,
                 source_ip,
-            } => audit_event(
+            } => self.audit.record(
                 "federation_login_success",
                 audit_fields(&[
                     ("user_id", json!(user_id.as_uuid())),
@@ -79,23 +87,16 @@ impl nazo_identity::ports::FederationAuditPort for TracingFederationAudit {
             nazo_identity::FederationAuditEvent::ProviderMismatchRejected {
                 expected_provider_id,
                 actual_provider_id,
-            } => audit_event(
+            } => self.audit.record(
                 "federation_provider_mismatch_rejected",
                 audit_fields(&[
                     ("expected_provider_id", json!(expected_provider_id)),
                     ("actual_provider_id", json!(actual_provider_id)),
                 ]),
             ),
-            nazo_identity::FederationAuditEvent::SamlReplayRejected => {
-                audit_event("federation_saml_replay_rejected", serde_json::Map::new())
-            }
+            nazo_identity::FederationAuditEvent::SamlReplayRejected => self
+                .audit
+                .record("federation_saml_replay_rejected", serde_json::Map::new()),
         }
     }
 }
-
-pub(crate) type LocalFederationService = nazo_identity::FederationService<
-    std::sync::Arc<dyn nazo_identity::ports::FederationStatePort>,
-    FederationBootstrapPasswordHasher,
-    std::sync::Arc<dyn nazo_identity::ports::LoginSessionPort>,
-    TracingFederationAudit,
->;

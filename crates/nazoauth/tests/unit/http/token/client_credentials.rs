@@ -1,18 +1,33 @@
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
 use crate::test_support::TestInfrastructure;
+use actix_web::HttpRequest;
+use actix_web::HttpResponse;
+use actix_web::http::StatusCode;
+use nazo_auth::ValidatedClientAssertion;
+use nazo_oauth_server::contracts::token_forms::TokenForm;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::client_credentials::ClientCredentialsIssue;
+use nazo_oauth_server::token::client_credentials::client_credentials_issuance_mode;
+use nazo_oauth_server::token::client_credentials::client_credentials_issue_request_with_default_audience;
+use nazo_oauth_server::token::client_credentials::reject_non_confidential_client_credentials_client;
+use nazo_oauth_server::token::client_credentials::token_client_credentials_with_service;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
+use serde_json::json;
 
-use crate::adapters::security::blake3_hex;
+use nazo_oauth_server::crypto::blake3_hex;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 use crate::settings::Settings;
 
 use actix_web::web::Data;
-
-use nazo_http_actix::OAuthJsonErrorFields;
 
 use uuid::Uuid;
 
@@ -26,6 +41,7 @@ pub(super) fn client_credentials_issue_request(
         client,
         form,
     )
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
 }
 
 pub(crate) async fn token_client_credentials(
@@ -41,38 +57,43 @@ pub(crate) async fn token_client_credentials(
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
-    let authorization_service = crate::http::authorization::ServerAuthorizationService::new(
+    let authorization_service = nazo_oauth_server::services::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(state.diesel_db.clone(), DEFAULT_TENANT_ID),
         std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    token_client_credentials_with_service(
-        &service,
-        &authorization_service,
-        &TokenIssuanceContext {
-            config: &config,
-            modules: &modules,
-            authorization: &authorization_service,
-            remote_client_documents: crate::test_support::test_remote_client_documents(),
-        },
-        req,
-        client,
-        form,
-        client_assertion,
+    crate::http::token::issue::test_support::present_token_result(
+        token_client_credentials_with_service(
+            &service,
+            &authorization_service,
+            &TokenIssuanceContext {
+                config: &config,
+                modules: &modules,
+                authorization: &authorization_service,
+                security_audit: crate::http::authorization::test_support::test_security_audit(),
+                remote_client_documents: crate::test_support::test_remote_client_documents(),
+            },
+            &crate::http::token::issue::test_support::token_request_facts(
+                req,
+                state.settings.as_ref(),
+            ),
+            client,
+            form,
+            client_assertion,
+        )
+        .await,
     )
-    .await
 }
 
-use super::*;
 use std::sync::Arc;
 
 use nazo_postgres::create_pool;
 
-use crate::settings::AuthorizationServerProfile;
 use actix_web::test::TestRequest;
 use nazo_http_actix::IpCidr;
+use nazo_oauth_server::policy::AuthorizationServerProfile;
 
 fn settings(profile: AuthorizationServerProfile) -> Settings {
     let mut settings =
@@ -154,14 +175,6 @@ fn form(scope: Option<&str>, audiences: &[&str]) -> TokenForm {
     }
 }
 
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
 fn client_credentials_state() -> TestInfrastructure {
     TestInfrastructure {
         diesel_db: create_pool(
@@ -185,7 +198,12 @@ fn token_request() -> HttpRequest {
 #[test]
 fn client_credentials_issuance_mode_is_fresh_or_idempotent_from_request_header() {
     assert!(matches!(
-        client_credentials_issuance_mode(&token_request()),
+        client_credentials_issuance_mode(
+            &crate::http::token::issue::test_support::token_request_facts(
+                &token_request(),
+                &settings(AuthorizationServerProfile::Oauth2Baseline)
+            )
+        ),
         nazo_auth::TokenIssuanceMode::Fresh
     ));
 
@@ -194,7 +212,7 @@ fn client_credentials_issuance_mode_is_fresh_or_idempotent_from_request_header()
         .insert_header(("Idempotency-Key", "client-credentials-test-key"))
         .to_http_request();
     assert!(matches!(
-        client_credentials_issuance_mode(&request),
+        client_credentials_issuance_mode(&crate::http::token::issue::test_support::token_request_facts(&request, &settings(AuthorizationServerProfile::Oauth2Baseline))),
         nazo_auth::TokenIssuanceMode::Idempotent { ref grant_key }
             if grant_key == &format!(
                 "idempotency:{}",
@@ -218,8 +236,8 @@ fn client_credentials_defaults_to_allowed_scopes_and_default_audience() {
     assert_eq!(issue.audiences, vec!["resource://default".to_owned()]);
 }
 
-#[test]
-fn client_credentials_scope_request_may_only_narrow_registered_scopes() {
+#[actix_web::test]
+async fn client_credentials_scope_request_may_only_narrow_registered_scopes() {
     let settings = settings(AuthorizationServerProfile::Oauth2Baseline);
     let client = client();
 
@@ -239,11 +257,11 @@ fn client_credentials_scope_request_may_only_narrow_registered_scopes() {
     let response = client_credentials_issue_request(&settings, &client, &form(Some("admin"), &[]))
         .expect_err("client_credentials must reject scope privilege expansion");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_scope");
+    assert_eq!(oauth_error_code(response).await, "invalid_scope");
 }
 
-#[test]
-fn client_credentials_rejects_openid_scope_even_if_registered() {
+#[actix_web::test]
+async fn client_credentials_rejects_openid_scope_even_if_registered() {
     let settings = settings(AuthorizationServerProfile::Oauth2Baseline);
     let mut client = client();
     client.scopes = vec!["accounts".to_owned(), "openid".to_owned()];
@@ -251,37 +269,40 @@ fn client_credentials_rejects_openid_scope_even_if_registered() {
     let default_response = client_credentials_issue_request(&settings, &client, &form(None, &[]))
         .expect_err("client_credentials must not inherit openid from legacy client metadata");
     assert_eq!(default_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&default_response), "invalid_scope");
+    assert_eq!(oauth_error_code(default_response).await, "invalid_scope");
 
     let explicit_response =
         client_credentials_issue_request(&settings, &client, &form(Some("openid"), &[]))
             .expect_err("client_credentials must not accept explicit openid scope");
     assert_eq!(explicit_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&explicit_response), "invalid_scope");
+    assert_eq!(oauth_error_code(explicit_response).await, "invalid_scope");
 }
 
-#[test]
-fn client_credentials_rejects_public_clients_before_issue_construction() {
+#[actix_web::test]
+async fn client_credentials_rejects_public_clients_before_issue_construction() {
     let mut client = client();
     client.client_type = "public".to_owned();
     client.token_endpoint_auth_method = "none".to_owned();
 
     let response = reject_non_confidential_client_credentials_client(&client)
+        .map(nazo_http_actix::oauth_endpoint_error_response)
         .expect("public clients must not receive client_credentials tokens");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
+    assert_eq!(oauth_error_code(response).await, "unauthorized_client");
 
     let mut confidential = client;
     confidential.client_type = "confidential".to_owned();
     assert!(
-        reject_non_confidential_client_credentials_client(&confidential).is_none(),
+        reject_non_confidential_client_credentials_client(&confidential)
+            .map(nazo_http_actix::oauth_endpoint_error_response)
+            .is_none(),
         "confidential client must proceed to sender-constraint and grant validation"
     );
 }
 
-#[test]
-fn client_credentials_rejects_unregistered_audience() {
+#[actix_web::test]
+async fn client_credentials_rejects_unregistered_audience() {
     let settings = settings(AuthorizationServerProfile::Oauth2Baseline);
     let client = client();
 
@@ -293,7 +314,7 @@ fn client_credentials_rejects_unregistered_audience() {
     .expect_err("client_credentials access token audience must be client-registered");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_target");
+    assert_eq!(oauth_error_code(response).await, "invalid_target");
 }
 
 #[actix_web::test]
@@ -307,7 +328,7 @@ async fn token_client_credentials_rejects_public_clients_at_endpoint_boundary() 
         token_client_credentials(&state, &token_request(), &client, &form(None, &[]), None).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
+    assert_eq!(oauth_error_code(response).await, "unauthorized_client");
 }
 
 #[actix_web::test]
@@ -325,7 +346,7 @@ async fn token_client_credentials_requires_configured_sender_constraints() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_dpop_proof");
+    assert_eq!(oauth_error_code(response).await, "invalid_dpop_proof");
 
     let mut mtls_client = client();
     mtls_client.require_mtls_bound_tokens = true;
@@ -338,7 +359,7 @@ async fn token_client_credentials_requires_configured_sender_constraints() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
+    assert_eq!(oauth_error_code(response).await, "invalid_grant");
 }
 
 #[actix_web::test]
@@ -365,7 +386,7 @@ async fn token_client_credentials_binds_mtls_thumbprint_from_verified_certificat
     let response = token_client_credentials(&state, &req, &client, &form(None, &[]), None).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(oauth_error_code(&response), "server_error");
+    assert_eq!(oauth_error_code(response).await, "server_error");
 
     let idempotent_request = TestRequest::post()
         .uri("/token")
@@ -383,7 +404,7 @@ async fn token_client_credentials_binds_mtls_thumbprint_from_verified_certificat
         idempotent_response.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    assert_eq!(oauth_error_code(&idempotent_response), "server_error");
+    assert_eq!(oauth_error_code(idempotent_response).await, "server_error");
 }
 
 #[actix_web::test]
@@ -401,5 +422,5 @@ async fn token_client_credentials_rejects_invalid_scope_before_issuing_token() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_scope");
+    assert_eq!(oauth_error_code(response).await, "invalid_scope");
 }

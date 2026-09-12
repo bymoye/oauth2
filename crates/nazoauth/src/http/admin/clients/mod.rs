@@ -5,7 +5,7 @@ pub(crate) mod list;
 pub(crate) mod templates;
 pub(crate) mod update;
 
-use crate::domain::remote_client_documents::RemoteClientDocumentResolver;
+use crate::adapters::remote_client_documents::RemoteClientDocumentResolver;
 use crate::settings::Settings;
 use nazo_auth::AdminClientPolicy;
 use std::sync::Arc;

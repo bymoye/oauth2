@@ -1,5 +1,6 @@
 use super::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use nazo_oauth_server::crypto::{client_jwt_decoding_key, jwt_decoding_key_from_jwk};
 
 #[test]
 fn par_private_key_jwt_endpoint_audiences_require_explicit_client_opt_in() {
@@ -239,7 +240,18 @@ fn private_key_jwt_decode_accepts_small_future_nbf_and_iat() {
 #[test]
 fn client_jwt_algorithm_and_jwk_decoder_fail_closed_for_unsupported_shapes() {
     assert!(nazo_key_management::signing_algorithm_from_name("HS256").is_none());
-    assert!(supported_client_jwt_algorithm(jsonwebtoken::Algorithm::HS256).is_none());
+    let symmetric_client = private_key_jwt_client(json!({"keys": [{
+        "kid": "symmetric", "kty": "oct", "k": URL_SAFE_NO_PAD.encode([7u8; 32]),
+        "alg": "HS256", "use": "sig"
+    }]}));
+    assert!(
+        client_jwt_decoding_key(
+            &symmetric_client,
+            "symmetric",
+            jsonwebtoken::Algorithm::HS256
+        )
+        .is_none()
+    );
 
     let mut wrong_alg = json!({
         "kty": "OKP",

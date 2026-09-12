@@ -191,8 +191,6 @@ fn mdoc_database_config(data_dir: &Path) -> ConfigSource {
 
 fn database_key_settings() -> KeySettings {
     KeySettings {
-        external_command: Vec::new(),
-        external_timeout: std::time::Duration::from_secs(1),
         rotation_interval: chrono::Duration::days(90),
         prepublish_window: chrono::Duration::days(1),
         verification_grace: chrono::Duration::hours(1),
@@ -345,6 +343,7 @@ async fn database_manager(
 ) -> KeyManager {
     KeyManager::load_or_create_database(
         database_key_settings(),
+        None,
         tenant_id,
         repository,
         SigningKeyWrappingKeyRing::new("keyctl-test-root", [0x42; 32], None)

@@ -11,9 +11,11 @@ pub mod cli;
 pub mod config;
 mod control_discovery;
 pub mod controller_registry;
-mod crypto;
+#[cfg(test)]
+#[path = "../tests/unit/domain.rs"]
 mod domain;
 mod http;
+mod jobs;
 mod keyctl;
 pub mod operator_task;
 pub mod recovery_root;

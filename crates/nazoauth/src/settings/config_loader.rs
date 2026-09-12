@@ -237,7 +237,7 @@ impl Settings {
         {
             bail!("__Host- cookie names require COOKIE_SECURE=true");
         }
-        let subject_type = SubjectType::from_config(config)?;
+        let subject_type = profile::subject_type_from_config(config)?;
         let pairwise_subject_secret = config.optional_string("PAIRWISE_SUBJECT_SECRET");
         if subject_type == SubjectType::Pairwise && pairwise_subject_secret.is_none() {
             bail!("PAIRWISE_SUBJECT_SECRET is required when SUBJECT_TYPE=pairwise");
@@ -255,8 +255,9 @@ impl Settings {
             }
             None => bail!("CLIENT_SECRET_PEPPER is required for non-loopback issuers"),
         };
-        let authorization_server_profile = AuthorizationServerProfile::from_config(config)?;
-        let ciba_security_profile = CibaSecurityProfile::from_config(config)?;
+        let authorization_server_profile =
+            profile::authorization_server_profile_from_config(config)?;
+        let ciba_security_profile = profile::ciba_security_profile_from_config(config)?;
         let protected_resource_identifier = config
             .optional_string("PROTECTED_RESOURCE_IDENTIFIER")
             .unwrap_or_else(|| default_protected_resource_identifier(&issuer));
@@ -264,7 +265,7 @@ impl Settings {
         let dpop_nonce_policy = profile::dpop_nonce_policy_from_config(config)?;
         let fapi_resource_dpop_nonce_policy =
             profile::fapi_resource_dpop_nonce_policy_from_config(config)?;
-        let request_object_jti_policy = RequestObjectJtiPolicy::from_config(config)?;
+        let request_object_jti_policy = profile::request_object_jti_policy_from_config(config)?;
         let auth_code_ttl_seconds =
             positive_u64(config, "AUTH_CODE_TTL_SECONDS", 60, "AUTH_CODE_TTL_SECONDS")?;
         if authorization_server_profile.requires_fapi2_security() && auth_code_ttl_seconds > 60 {
@@ -417,7 +418,7 @@ impl Settings {
                 "OPENID4VCI_ISSUER_MANAGEMENT_TOKEN and OPENID4VP_VERIFIER_MANAGEMENT_TOKEN must differ"
             );
         }
-        let openid4vc_revocation_policy = Openid4vcRevocationPolicy::from_config(config)?;
+        let openid4vc_revocation_policy = profile::openid4vc_revocation_policy_from_config(config)?;
         if enable_openid4vp_verifier
             && openid4vc_revocation_policy != Openid4vcRevocationPolicy::Required
         {
@@ -655,8 +656,10 @@ impl Settings {
                 federation,
             },
             keys: KeyManagementSettings {
-                signing_external_command: task_key_settings.external_command,
-                signing_external_timeout_ms: task_key_settings.external_timeout.as_millis() as u64,
+                signing_external_command: parse_signing_external_command(
+                    config.optional_string("SIGNING_EXTERNAL_COMMAND"),
+                ),
+                signing_external_timeout_ms: config.parse("SIGNING_EXTERNAL_TIMEOUT_MS", 2_000)?,
                 signing_key_rotation_interval_seconds: task_key_settings
                     .rotation_interval
                     .num_seconds(),

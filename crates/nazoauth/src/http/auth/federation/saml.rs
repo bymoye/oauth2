@@ -1,7 +1,7 @@
-use crate::adapters::security::constant_time_eq;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
+use nazo_oauth_server::crypto::constant_time_eq;
 use serde::Deserialize;
 use sha2::Sha256;
 

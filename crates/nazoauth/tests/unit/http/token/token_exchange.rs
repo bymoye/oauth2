@@ -1,11 +1,44 @@
-use super::*;
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
+use chrono::Utc;
+use nazo_auth::Claims;
+use nazo_auth::TokenExchangeError;
+use nazo_auth::TokenExchangePolicy;
+use nazo_auth::TokenExchangeSenderBinding;
+use nazo_auth::admit_token_exchange;
+use nazo_auth::token_exchange_actor_claim;
+use nazo_auth::validate_token_exchange_grant_prerequisites;
+use nazo_auth::validate_token_exchange_subject;
+use nazo_oauth_server::contracts::token_forms::TokenForm;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::TOKEN_EXCHANGE_GRANT_TYPE;
+use nazo_oauth_server::token::ValidatedSenderConstraints;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
+use nazo_oauth_server::token::token_exchange::TokenExchangeTokenError;
+use nazo_oauth_server::token::token_exchange::exchange_token_error_response;
+use nazo_oauth_server::token::token_exchange::token_exchange_admission_error_response;
+use nazo_oauth_server::token::token_exchange::token_exchange_error_response;
+use nazo_oauth_server::token::token_exchange::token_exchange_issue_binding;
+use nazo_oauth_server::token::token_exchange::token_exchange_policy;
+use nazo_oauth_server::token::token_exchange::token_exchange_request;
+use nazo_oauth_server::token::token_exchange::token_exchange_subject_error_response;
+use nazo_oauth_server::token::token_exchange::validate_actor_token;
+use nazo_oauth_server::token::token_exchange::validate_exchange_access_token;
+use nazo_oauth_server::token::token_exchange::validate_subject_sender_binding;
+use serde_json::Value;
+use serde_json::json;
+use uuid::Uuid;
+
 use crate::config::ConfigSource;
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
 use crate::settings::Settings;
 use crate::test_support::TestInfrastructure;
 use actix_web::{body::to_bytes, http::StatusCode};
 use nazo_auth::ACCESS_TOKEN_TYPE;
-use nazo_http_actix::OAuthJsonErrorFields;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 use nazo_postgres::create_pool;
 use std::sync::Arc;
 
@@ -324,24 +357,6 @@ fn token_exchange_actor_claim_rejects_cross_client_and_cross_tenant_claims() {
     assert!(token_exchange_actor_claim(&cross_tenant_actor, policy(&client)).is_err());
 }
 
-#[test]
-fn token_exchange_binding_claims_preserve_sender_constraint_type() {
-    assert_eq!(
-        token_exchange_binding_claims(TokenExchangeSenderBinding::Bearer),
-        (None, None)
-    );
-    assert_eq!(
-        token_exchange_binding_claims(TokenExchangeSenderBinding::Dpop("dpop-jkt".to_owned())),
-        (Some("dpop-jkt".to_owned()), None)
-    );
-    assert_eq!(
-        token_exchange_binding_claims(TokenExchangeSenderBinding::MutualTls(
-            "mtls-thumbprint".to_owned(),
-        )),
-        (None, Some("mtls-thumbprint".to_owned()))
-    );
-}
-
 #[actix_web::test]
 async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() {
     let presented =
@@ -358,6 +373,7 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
             &presented(None, None),
             policy(&bearer_client),
         )
+        .map_err(nazo_http_actix::oauth_endpoint_error_response)
         .expect("an unconstrained exchange may remain bearer"),
         TokenExchangeSenderBinding::Bearer
     );
@@ -370,6 +386,7 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
             &presented(Some("dpop-jkt"), None),
             policy(&bearer_client),
         )
+        .map_err(nazo_http_actix::oauth_endpoint_error_response)
         .expect("matching DPoP proof must preserve the subject binding"),
         dpop_subject
     );
@@ -382,13 +399,11 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
         &presented(Some("dpop-jkt"), None),
         policy(&mtls_required),
     )
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("a DPoP subject binding must not be converted to mTLS");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 
@@ -400,13 +415,11 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
         &presented(None, Some("mtls-thumbprint")),
         policy(&dpop_required),
     )
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("an mTLS subject binding must not be converted to DPoP");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 
@@ -416,13 +429,11 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
         &presented(Some("different-jkt"), None),
         policy(&bearer_client),
     )
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("a mismatched subject proof must fail closed");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 }
@@ -430,13 +441,14 @@ async fn token_exchange_issue_binding_preserves_or_rejects_sender_constraints() 
 #[actix_web::test]
 async fn token_exchange_subject_binding_requires_the_presented_sender_proof() {
     let state = token_exchange_state();
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = crate::http::token::issue::test_support::test_authorization_service(&state);
     let issuance = TokenIssuanceContext {
         config: &config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let request = actix_web::test::TestRequest::post()
@@ -447,19 +459,20 @@ async fn token_exchange_subject_binding_requires_the_presented_sender_proof() {
     dpop_required.require_dpop_bound_tokens = true;
     let response = validate_subject_sender_binding(
         &issuance,
-        &request,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
         &dpop_required,
         "subject-token",
         &TokenExchangeSenderBinding::MutualTls("mtls-thumbprint".to_owned()),
     )
     .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("an mTLS subject token cannot silently become DPoP-bound");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 
@@ -467,19 +480,20 @@ async fn token_exchange_subject_binding_requires_the_presented_sender_proof() {
     mtls_required_for_dpop.require_mtls_bound_tokens = true;
     let response = validate_subject_sender_binding(
         &issuance,
-        &request,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
         &mtls_required_for_dpop,
         "subject-token",
         &TokenExchangeSenderBinding::Dpop("dpop-jkt".to_owned()),
     )
     .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("a DPoP subject token must not be converted to mTLS");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_dpop_proof")
     );
 
@@ -487,19 +501,20 @@ async fn token_exchange_subject_binding_requires_the_presented_sender_proof() {
     mtls_subject_required.require_mtls_bound_tokens = true;
     let response = validate_subject_sender_binding(
         &issuance,
-        &request,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
         &mtls_subject_required,
         "subject-token",
         &TokenExchangeSenderBinding::MutualTls("mtls-thumbprint".to_owned()),
     )
     .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("an mTLS subject token still needs a verified certificate");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 
@@ -507,31 +522,36 @@ async fn token_exchange_subject_binding_requires_the_presented_sender_proof() {
     mtls_required.require_mtls_bound_tokens = true;
     let response = validate_subject_sender_binding(
         &issuance,
-        &request,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
         &mtls_required,
         "subject-token",
         &TokenExchangeSenderBinding::Bearer,
     )
     .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("an mTLS-required exchange needs a verified certificate");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 
     let bearer_client = client();
     let response = validate_subject_sender_binding(
         &issuance,
-        &request,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
         &bearer_client,
         "subject-token",
         &TokenExchangeSenderBinding::Dpop("dpop-jkt".to_owned()),
     )
     .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
     .expect_err("a DPoP subject token requires its proof");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -602,24 +622,25 @@ async fn token_exchange_error_responses_follow_rfc8693_error_classes() {
 
     for (name, case, expected_status, expected_error) in cases {
         let response = match case {
-            ErrorCase::Policy(error) => token_exchange_error_response(error),
-            ErrorCase::TokenState(error) => exchange_token_error_response(error),
+            ErrorCase::Policy(error) => {
+                nazo_http_actix::oauth_endpoint_error_response(token_exchange_error_response(error))
+            }
+            ErrorCase::TokenState(error) => {
+                nazo_http_actix::oauth_endpoint_error_response(exchange_token_error_response(error))
+            }
         };
         assert_eq!(response.status(), expected_status, "{name} status");
-        assert_eq!(
-            response
-                .extensions()
-                .get::<OAuthJsonErrorFields>()
-                .map(|fields| fields.error.as_str()),
-            Some(expected_error),
-            "{name} extension error code",
-        );
         let body: Value = serde_json::from_slice(
             &to_bytes(response.into_body())
                 .await
                 .expect("OAuth error response should be readable"),
         )
         .expect("OAuth error response should be JSON");
+        assert_eq!(
+            body.get("error").and_then(Value::as_str),
+            Some(expected_error),
+            "{name} OAuth error code",
+        );
         assert_eq!(
             body.get("error").and_then(Value::as_str),
             Some(expected_error),
@@ -782,14 +803,16 @@ async fn token_exchange_subject_boundaries_and_safe_default_scope_are_table_driv
             ),
             (Err(error), Some(expected_error)) => {
                 assert_eq!(error, expected_error, "{} error class", case.name);
-                let response = token_exchange_subject_error_response(
-                    error,
-                    &client,
-                    &TokenForm {
-                        scope: case.requested_scope.map(str::to_owned),
-                        ..form()
-                    },
-                    &case.claims,
+                let response = nazo_http_actix::oauth_endpoint_error_response(
+                    token_exchange_subject_error_response(
+                        error,
+                        &client,
+                        &TokenForm {
+                            scope: case.requested_scope.map(str::to_owned),
+                            ..form()
+                        },
+                        &case.claims,
+                    ),
                 );
                 assert_eq!(
                     response.status(),
@@ -797,21 +820,18 @@ async fn token_exchange_subject_boundaries_and_safe_default_scope_are_table_driv
                     "{} status",
                     case.name
                 );
-                assert_eq!(
-                    response
-                        .extensions()
-                        .get::<OAuthJsonErrorFields>()
-                        .map(|fields| fields.error.as_str()),
-                    Some(expected_error.oauth_error()),
-                    "{} HTTP error class",
-                    case.name,
-                );
                 let body: Value = serde_json::from_slice(
                     &to_bytes(response.into_body())
                         .await
                         .expect("subject error response should be readable"),
                 )
                 .expect("subject error response should be JSON");
+                assert_eq!(
+                    body.get("error").and_then(serde_json::Value::as_str),
+                    Some(expected_error.oauth_error()),
+                    "{} HTTP error class",
+                    case.name,
+                );
                 assert_eq!(
                     body.get("error_description").and_then(Value::as_str),
                     Some(case.expected_description),
@@ -827,8 +847,8 @@ async fn token_exchange_subject_boundaries_and_safe_default_scope_are_table_driv
     }
 }
 
-#[test]
-fn token_exchange_request_policy_and_admission_wrappers_preserve_boundaries() {
+#[actix_web::test]
+async fn token_exchange_request_policy_and_admission_wrappers_preserve_boundaries() {
     let input = form();
     let request = token_exchange_request(&input);
     assert_eq!(request.subject_token.as_deref(), Some("subject-token"));
@@ -839,13 +859,14 @@ fn token_exchange_request_policy_and_admission_wrappers_preserve_boundaries() {
     assert_eq!(request.audiences, input.audiences);
 
     let state = token_exchange_state();
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = crate::http::token::issue::test_support::test_authorization_service(&state);
     let issuance = TokenIssuanceContext {
         config: &config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let mut constrained = client();
@@ -859,56 +880,61 @@ fn token_exchange_request_policy_and_admission_wrappers_preserve_boundaries() {
 
     let mut no_target = form();
     no_target.audiences.clear();
-    let explicit_target =
-        token_exchange_admission_error_response(TokenExchangeError::InvalidTarget, &no_target);
+    let explicit_target = nazo_http_actix::oauth_endpoint_error_response(
+        token_exchange_admission_error_response(TokenExchangeError::InvalidTarget, &no_target),
+    );
     assert_eq!(explicit_target.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        explicit_target
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(explicit_target).await.as_str()),
         Some("invalid_target")
     );
     assert_eq!(
-        token_exchange_admission_error_response(TokenExchangeError::InvalidTarget, &input).status(),
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_admission_error_response(
+            TokenExchangeError::InvalidTarget,
+            &input
+        ))
+        .status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        token_exchange_admission_error_response(TokenExchangeError::Disabled, &input).status(),
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_admission_error_response(
+            TokenExchangeError::Disabled,
+            &input
+        ))
+        .status(),
         StatusCode::BAD_REQUEST
     );
 }
 
-#[test]
-fn token_exchange_subject_error_wrapper_handles_safe_scope_and_claim_boundaries() {
+#[actix_web::test]
+async fn token_exchange_subject_error_wrapper_handles_safe_scope_and_claim_boundaries() {
     let client = client();
     let mut oidc_only = claims(
         "resource-server",
         json!("https://backend.example/api"),
         "openid",
     );
-    let response = token_exchange_subject_error_response(
-        TokenExchangeError::InvalidScope,
-        &client,
-        &form(),
-        &oidc_only,
-    );
+    let response =
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_subject_error_response(
+            TokenExchangeError::InvalidScope,
+            &client,
+            &form(),
+            &oidc_only,
+        ));
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_scope")
     );
 
     oidc_only.scope = "accounts".to_owned();
-    let response = token_exchange_subject_error_response(
-        TokenExchangeError::InvalidScope,
-        &client,
-        &form(),
-        &oidc_only,
-    );
+    let response =
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_subject_error_response(
+            TokenExchangeError::InvalidScope,
+            &client,
+            &form(),
+            &oidc_only,
+        ));
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let mut wrong_client = claims(
@@ -917,31 +943,33 @@ fn token_exchange_subject_error_wrapper_handles_safe_scope_and_claim_boundaries(
         "accounts",
     );
     wrong_client.client_id = "other-client".to_owned();
-    let response = token_exchange_subject_error_response(
-        TokenExchangeError::InvalidGrant,
-        &client,
-        &form(),
-        &wrong_client,
-    );
+    let response =
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_subject_error_response(
+            TokenExchangeError::InvalidGrant,
+            &client,
+            &form(),
+            &wrong_client,
+        ));
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     wrong_client.client_id = client.client_id.clone();
     wrong_client.user_id = Some("not-a-uuid".to_owned());
-    let response = token_exchange_subject_error_response(
-        TokenExchangeError::InvalidGrant,
-        &client,
-        &form(),
-        &wrong_client,
-    );
+    let response =
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_subject_error_response(
+            TokenExchangeError::InvalidGrant,
+            &client,
+            &form(),
+            &wrong_client,
+        ));
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     assert_eq!(
-        token_exchange_subject_error_response(
+        nazo_http_actix::oauth_endpoint_error_response(token_exchange_subject_error_response(
             TokenExchangeError::InvalidTarget,
             &client,
             &form(),
             &wrong_client,
-        )
+        ))
         .status(),
         StatusCode::BAD_REQUEST
     );

@@ -1,7 +1,5 @@
-//! 密码、哈希、客户端认证和客户端 JWT 验证工具。
-
-use super::audit::{audit_event, audit_fields};
-use crate::domain::ClientRow;
+use nazo_oauth_server::crypto::random_urlsafe_token;
+// Native password execution and client credential extraction.
 
 use crate::http::mtls::request_mtls_client_certificate;
 
@@ -13,37 +11,50 @@ use argon2::Argon2;
 use argon2::PasswordHash;
 use argon2::PasswordHasher;
 use argon2::PasswordVerifier;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::Utc;
-use hmac::{Hmac, KeyInit, Mac};
-use nazo_auth::{
-    Claims, ClientAssertionVerificationInput, rsa_public_key_components_are_safe,
-    unverified_client_assertion_client_id, verify_private_key_jwt,
-};
-use serde_json::{Value, json};
-use sha2::Digest;
-use sha2::Sha256;
+use nazo_auth::unverified_client_assertion_client_id;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
-use uuid::Uuid;
 
 #[cfg(test)]
 #[path = "../../tests/support/adapters/security/tokens.rs"]
 pub(crate) mod tokens;
 
-type HmacSha256 = Hmac<Sha256>;
+#[derive(Clone, Copy)]
+pub(crate) struct ServerScimBootstrapPasswordProvider;
+
+impl nazo_oauth_server::contracts::scim::ScimBootstrapPasswordProvider
+    for ServerScimBootstrapPasswordProvider
+{
+    fn password_hash(
+        &self,
+    ) -> nazo_oauth_server::contracts::scim::ScimFuture<
+        '_,
+        Result<
+            nazo_identity::ports::PasswordHashInput,
+            nazo_oauth_server::contracts::scim::ScimDependencyError,
+        >,
+    > {
+        use nazo_oauth_server::contracts::scim::ScimDependencyError;
+        Box::pin(async {
+            let hash = hash_password_blocking_limited(random_urlsafe_token())
+                .await
+                .map_err(|_| ScimDependencyError::Unavailable)?;
+            nazo_identity::ports::PasswordHashInput::new(hash)
+                .map_err(|_| ScimDependencyError::Unavailable)
+        })
+    }
+}
 
 const ARGON2_MEMORY_COST_KIB: u32 = 19_456;
 const ARGON2_TIME_COST: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
 const DEFAULT_PASSWORD_HASH_MAX_CONCURRENCY: usize = 8;
 const DEFAULT_PASSWORD_HASH_QUEUE_TIMEOUT_MS: u64 = 100;
-const CLIENT_SECRET_HASH_VERSION: &str = "client-secret-v1";
+
 pub(crate) const LOCAL_DEVELOPMENT_CLIENT_SECRET_PEPPER: &str =
     "local-development-client-secret-pepper-00000001";
 
@@ -65,16 +76,6 @@ pub(crate) enum PasswordHashingError {
     Saturated,
     WorkerFailed,
     HashFailed,
-}
-
-pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right.iter())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
 }
 
 pub(crate) fn hash_password(password: &str) -> argon2::password_hash::Result<String> {
@@ -189,23 +190,6 @@ pub(crate) async fn verify_encoded_hashes_blocking_limited(
     .map_err(|_| PasswordVerificationError::WorkerFailed)
 }
 
-pub(crate) fn client_secret_digest(secret: &str, pepper: &str, salt: &str) -> String {
-    let mac = client_secret_mac(secret, pepper, salt);
-    format!("{CLIENT_SECRET_HASH_VERSION}:{salt}:{mac}")
-}
-
-pub(crate) fn access_delivery_token(secret: &str, user_id: Uuid, request_id: Uuid) -> String {
-    nazo_identity::access_delivery_token(secret, user_id, request_id)
-}
-
-fn client_secret_mac(secret: &str, pepper: &str, salt: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(pepper.as_bytes()).expect("HMAC accepts any key");
-    mac.update(salt.as_bytes());
-    mac.update(b":");
-    mac.update(secret.as_bytes());
-    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-}
-
 fn password_hasher() -> Argon2<'static> {
     let params = argon2::Params::new(
         ARGON2_MEMORY_COST_KIB,
@@ -233,27 +217,7 @@ fn password_hash_queue_timeout() -> Duration {
     ))
 }
 
-pub(crate) fn blake3_hex(value: &str) -> String {
-    blake3::hash(value.as_bytes()).to_hex().to_string()
-}
-
-pub(crate) fn access_token_tenant_id(claims: &Claims) -> Option<Uuid> {
-    claims.tenant_id.parse::<Uuid>().ok()
-}
-
-pub(crate) fn random_urlsafe_token() -> String {
-    URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
-}
-
-pub(crate) fn pkce_s256(verifier: &str) -> String {
-    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-}
-
-pub(crate) use nazo_auth::{CLIENT_ASSERTION_TYPE_JWT_BEARER, ValidatedClientAssertion};
-
-pub(crate) use nazo_auth::{
-    SUPPORTED_CLIENT_JWE_CONTENT_ENC_ALGS, SUPPORTED_CLIENT_JWE_KEY_MANAGEMENT_ALGS,
-};
+use nazo_auth::CLIENT_ASSERTION_TYPE_JWT_BEARER;
 
 pub(crate) use nazo_auth::PresentedClientCredentials as ClientCredentials;
 
@@ -312,184 +276,46 @@ pub(crate) fn extract_client_credentials_with_trusted_proxies(
     facts.presented_credentials(assertion_client_id, mtls_client_id)
 }
 
-#[derive(Debug)]
-pub(crate) enum ClientAssertionError {
-    Invalid,
-    ReplayDetected,
-    StoreUnavailable,
-}
-
-pub(crate) fn verify_private_key_jwt_claims_for_issuer(
-    issuer: &str,
-    endpoint_path: &str,
-    endpoint_audience_aliases: &[&str],
-    client: &ClientRow,
-    assertion: &str,
-) -> Result<ValidatedClientAssertion, ClientAssertionError> {
-    verify_private_key_jwt_claims_with_issuer(
-        issuer,
-        endpoint_path,
-        endpoint_audience_aliases,
-        client,
-        assertion,
-    )
-}
-
-fn verify_private_key_jwt_claims_with_issuer(
-    issuer: &str,
-    endpoint_path: &str,
-    endpoint_audience_aliases: &[&str],
-    client: &ClientRow,
-    assertion: &str,
-) -> Result<ValidatedClientAssertion, ClientAssertionError> {
-    verify_private_key_jwt(ClientAssertionVerificationInput {
-        issuer,
-        endpoint_path,
-        endpoint_audience_aliases,
-        client,
-        assertion,
-        now: Utc::now().timestamp(),
-        expected_signing_algorithm: client.token_endpoint_auth_signing_alg.as_deref(),
-    })
-    .map_err(|error| {
-        log_client_assertion_rejection(endpoint_path, client, error.audit_reason());
-        ClientAssertionError::Invalid
-    })
-}
-
-fn log_client_assertion_rejection(endpoint_path: &str, client: &ClientRow, reason: &'static str) {
-    tracing::warn!(
-        target: "client_assertion",
-        "client_assertion_rejected reason={} path={} client_id_hash={}",
-        reason,
-        endpoint_path,
-        blake3_hex(&client.client_id)
-    );
-}
-
-pub(crate) async fn consume_private_key_jwt_with_authorization_service(
-    service: &crate::http::authorization::ServerAuthorizationService,
-    client: &ClientRow,
-    assertion: &ValidatedClientAssertion,
-) -> Result<(), ClientAssertionError> {
-    let now = Utc::now().timestamp();
-    let ttl_seconds = assertion.replay_ttl_seconds(now);
-    match service
-        .consume_private_key_jwt(&client.client_id, assertion.jti(), ttl_seconds)
-        .await
-    {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            audit_event(
-                "client_assertion_replay_detected",
-                audit_fields(&[
-                    ("client_id", json!(client.client_id)),
-                    ("jti_hash", json!(blake3_hex(assertion.jti()))),
-                    ("kid", json!(assertion.kid())),
-                ]),
-            );
-            Err(ClientAssertionError::ReplayDetected)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "failed to store private_key_jwt jti");
-            Err(ClientAssertionError::StoreUnavailable)
-        }
-    }
-}
-
-enum SupportedClientJwtAlgorithm {
-    EdDsa,
-    Rsa,
-    Ec,
-}
-
-pub(crate) fn client_jwt_decoding_key(
-    client: &ClientRow,
-    kid: &str,
-    alg: jsonwebtoken::Algorithm,
-) -> Option<jsonwebtoken::DecodingKey> {
-    let keys = client.jwks.as_ref()?.get("keys")?.as_array()?;
-    let key = keys
-        .iter()
-        .find(|key| key.get("kid").and_then(Value::as_str) == Some(kid))?;
-    jwt_decoding_key_from_jwk(key, alg)
-}
-
-pub(crate) fn jwt_decoding_key_from_jwk(
-    key: &Value,
-    alg: jsonwebtoken::Algorithm,
-) -> Option<jsonwebtoken::DecodingKey> {
-    let (expected_alg, supported_alg) = supported_client_jwt_algorithm(alg)?;
-    if let Some(key_alg) = key.get("alg").and_then(Value::as_str)
-        && key_alg != expected_alg
-    {
-        return None;
-    }
-    if key.get("d").is_some() {
-        return None;
-    }
-    if let Some(use_) = key.get("use").and_then(Value::as_str)
-        && use_ != "sig"
-    {
-        return None;
-    }
-    match supported_alg {
-        SupportedClientJwtAlgorithm::EdDsa => {
-            if key.get("kty").and_then(Value::as_str) != Some("OKP")
-                || key.get("crv").and_then(Value::as_str) != Some("Ed25519")
-            {
-                return None;
-            }
-            let x = key.get("x").and_then(Value::as_str)?;
-            let bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
-            if bytes.len() != 32 {
-                return None;
-            }
-            jsonwebtoken::DecodingKey::from_ed_components(x).ok()
-        }
-        SupportedClientJwtAlgorithm::Rsa => {
-            if key.get("kty").and_then(Value::as_str) != Some("RSA") {
-                return None;
-            }
-            let n = key.get("n").and_then(Value::as_str)?;
-            let e = key.get("e").and_then(Value::as_str)?;
-            let modulus = URL_SAFE_NO_PAD.decode(n).ok()?;
-            let exponent = URL_SAFE_NO_PAD.decode(e).ok()?;
-            if !rsa_public_key_components_are_safe(&modulus, &exponent) {
-                return None;
-            }
-            jsonwebtoken::DecodingKey::from_rsa_components(n, e).ok()
-        }
-        SupportedClientJwtAlgorithm::Ec => {
-            if key.get("kty").and_then(Value::as_str) != Some("EC")
-                || key.get("crv").and_then(Value::as_str) != Some("P-256")
-            {
-                return None;
-            }
-            let x = key.get("x").and_then(Value::as_str)?;
-            let y = key.get("y").and_then(Value::as_str)?;
-            let x_bytes = URL_SAFE_NO_PAD.decode(x).ok()?;
-            let y_bytes = URL_SAFE_NO_PAD.decode(y).ok()?;
-            if x_bytes.len() != 32 || y_bytes.len() != 32 {
-                return None;
-            }
-            jsonwebtoken::DecodingKey::from_ec_components(x, y).ok()
-        }
-    }
-}
-
-fn supported_client_jwt_algorithm(
-    alg: jsonwebtoken::Algorithm,
-) -> Option<(&'static str, SupportedClientJwtAlgorithm)> {
-    match alg {
-        jsonwebtoken::Algorithm::EdDSA => Some(("EdDSA", SupportedClientJwtAlgorithm::EdDsa)),
-        jsonwebtoken::Algorithm::RS256 => Some(("RS256", SupportedClientJwtAlgorithm::Rsa)),
-        jsonwebtoken::Algorithm::ES256 => Some(("ES256", SupportedClientJwtAlgorithm::Ec)),
-        jsonwebtoken::Algorithm::PS256 => Some(("PS256", SupportedClientJwtAlgorithm::Rsa)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[path = "../../tests/unit/adapters/security.rs"]
 mod tests;
+
+use nazo_identity::ports::{EncodedSecretHash, MfaHashError, MfaHashFuture, MfaSecretHashPort};
+
+#[derive(Clone, Copy)]
+pub(crate) struct ServerMfaSecretHasher;
+
+impl MfaSecretHashPort for ServerMfaSecretHasher {
+    fn hash_secrets(&self, secrets: Vec<String>) -> MfaHashFuture<'_, Vec<EncodedSecretHash>> {
+        Box::pin(async move {
+            let mut hashes = Vec::with_capacity(secrets.len());
+            for secret in secrets {
+                let hash =
+                    hash_password_blocking_limited(secret)
+                        .await
+                        .map_err(|error| match error {
+                            PasswordHashingError::Saturated => MfaHashError::Busy,
+                            PasswordHashingError::WorkerFailed
+                            | PasswordHashingError::HashFailed => MfaHashError::Failed,
+                        })?;
+                hashes.push(EncodedSecretHash::new(hash).map_err(|_| MfaHashError::Failed)?);
+            }
+            Ok(hashes)
+        })
+    }
+
+    fn find_matching_secret(
+        &self,
+        secret: String,
+        candidates: Vec<EncodedSecretHash>,
+    ) -> MfaHashFuture<'_, Option<usize>> {
+        Box::pin(async move {
+            verify_encoded_hashes_blocking_limited(secret, candidates)
+                .await
+                .map_err(|error| match error {
+                    PasswordVerificationError::Saturated => MfaHashError::Busy,
+                    PasswordVerificationError::WorkerFailed => MfaHashError::Failed,
+                })
+        })
+    }
+}

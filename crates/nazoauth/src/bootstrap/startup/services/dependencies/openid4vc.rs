@@ -3,6 +3,8 @@ use super::*;
 use anyhow::Context as _;
 
 pub(super) struct Openid4vcServices {
+    pub(super) credential_issuer_operations:
+        Option<Arc<dyn nazo_openid4vci::application::CredentialIssuerOperations>>,
     pub(super) credential_issuer_endpoint: Option<web::Data<CredentialIssuerEndpoint>>,
     pub(super) credential_dataset_admin: Option<web::Data<CredentialDatasetAdminService>>,
     pub(super) presentation_endpoint: Option<web::Data<PresentationEndpoint>>,
@@ -11,7 +13,7 @@ pub(super) struct Openid4vcServices {
 
 pub(super) async fn build(
     startup: &StartupConfiguration,
-    token_service: &web::Data<crate::http::token::ServerTokenService>,
+    token_service: &web::Data<nazo_oauth_server::services::ServerTokenService>,
     authorization_service: &web::Data<ServerAuthorizationService>,
     runtime_registry: Arc<ServerRuntimeModuleRegistry>,
     keyset: &nazo_key_management::KeyManager,
@@ -33,6 +35,7 @@ pub(super) async fn build(
                 keyset.clone(),
                 nazo_digital_credentials::VcIssuerTrustPolicy::san_bound(),
                 settings.openid4vc.revocation_policy,
+                Arc::new(crate::adapters::mdoc_signer::TokioMdocDocumentSigner),
             )
             .context("failed to initialize OpenID4VC credential crypto from managed material")?,
         )
@@ -68,7 +71,7 @@ pub(super) async fn build(
             .map(Arc::new)
         })
         .transpose()?;
-    let (credential_issuer_endpoint, credential_dataset_admin) =
+    let (credential_issuer_endpoint, credential_dataset_admin, credential_issuer_operations) =
         if settings.modules.enable_openid4vci_issuer {
             let data_key = data_key.expect("enabled OpenID4VCI requires a data encryption key");
             let issuance_store = persistence.openid4vci_store(data_key);
@@ -95,7 +98,8 @@ pub(super) async fn build(
                 data_key,
                 token_service.clone().into_inner(),
                 authorization_service.clone().into_inner(),
-                runtime_registry.clone(),
+                runtime_registry.snapshot_store(),
+                Arc::new(crate::bootstrap::RegistrationSecretHasher),
                 openid4vc_crypto
                     .as_ref()
                     .expect("enabled OpenID4VCI requires crypto")
@@ -127,11 +131,14 @@ pub(super) async fn build(
                     }),
                 )),
                 Some(web::Data::new(CredentialDatasetAdminService::new(
-                    operations,
+                    operations.clone(),
                 ))),
+                Some(
+                    operations as Arc<dyn nazo_openid4vci::application::CredentialIssuerOperations>,
+                ),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
     let presentation_endpoint = if settings.modules.enable_openid4vp_verifier {
         let data_key = data_key.expect("enabled OpenID4VP requires a data encryption key");
@@ -145,7 +152,7 @@ pub(super) async fn build(
                     .as_ref()
                     .expect("enabled OpenID4VP requires crypto")
                     .clone(),
-                runtime_registry,
+                runtime_registry.snapshot_store(),
                 trust_policy_store.expect("enabled OpenID4VP requires a trust policy store"),
                 PresentationVerifierConfig {
                     issuer: settings.endpoint.issuer.clone(),
@@ -165,6 +172,7 @@ pub(super) async fn build(
     };
 
     Ok(Openid4vcServices {
+        credential_issuer_operations,
         credential_issuer_endpoint,
         credential_dataset_admin,
         presentation_endpoint,

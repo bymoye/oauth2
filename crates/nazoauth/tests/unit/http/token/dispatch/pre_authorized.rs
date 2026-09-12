@@ -1,8 +1,8 @@
-use super::pre_authorized_parameters;
-use actix_web::http::{StatusCode, header};
+use actix_web::http::header;
 use actix_web::test::TestRequest;
 use actix_web::web::Bytes;
-use nazo_http_actix::{PreAuthorizedTokenParameters, parse_token_form_with_pre_authorized};
+use nazo_http_actix::parse_token_form_with_pre_authorized;
+use nazo_oauth_server::contracts::token_forms::PreAuthorizedTokenParameters;
 
 fn parsed_parameters(body: &str) -> PreAuthorizedTokenParameters {
     let body = format!("grant_type=client_credentials&{body}");
@@ -16,24 +16,29 @@ fn parsed_parameters(body: &str) -> PreAuthorizedTokenParameters {
 
 #[test]
 fn parses_required_code_and_optional_tx_code_once() {
-    let mut parameters = parsed_parameters("pre-authorized_code=code-1&tx_code=1234&ignored=value");
-    let parsed =
-        pre_authorized_parameters(&mut parameters).expect("valid pre-authorized token parameters");
-    assert_eq!(parsed, ("code-1".to_owned(), Some("1234".to_owned())));
+    let parameters = parsed_parameters("pre-authorized_code=code-1&tx_code=1234&ignored=value");
+    assert_eq!(parameters.pre_authorized_code.as_deref(), Some("code-1"));
+    assert_eq!(parameters.tx_code.as_deref(), Some("1234"));
+    assert!(!parameters.invalid);
 }
 
 #[test]
 fn rejects_missing_empty_and_repeated_issuance_parameters() {
-    for body in [
-        "",
-        "tx_code=1234",
-        "pre-authorized_code=",
-        "pre-authorized_code=one&pre-authorized_code=two",
-        "tx_code=one&tx_code=two",
+    for (body, code, tx_code, invalid) in [
+        ("", None, None, false),
+        ("tx_code=1234", None, Some("1234"), false),
+        ("pre-authorized_code=", None, None, true),
+        (
+            "pre-authorized_code=one&pre-authorized_code=two",
+            Some("one"),
+            None,
+            true,
+        ),
+        ("tx_code=one&tx_code=two", None, Some("one"), true),
     ] {
-        let mut parameters = parsed_parameters(body);
-        let error = pre_authorized_parameters(&mut parameters)
-            .expect_err("invalid pre-authorized parameters must fail");
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        let parameters = parsed_parameters(body);
+        assert_eq!(parameters.pre_authorized_code.as_deref(), code, "{body}");
+        assert_eq!(parameters.tx_code.as_deref(), tx_code, "{body}");
+        assert_eq!(parameters.invalid, invalid, "{body}");
     }
 }

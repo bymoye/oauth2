@@ -1,5 +1,5 @@
-use crate::adapters::security::{jwt_decoding_key_from_jwk, pkce_s256};
 use chrono::Utc;
+use nazo_oauth_server::crypto::{jwt_decoding_key_from_jwk, pkce_s256};
 use serde::Deserialize;
 use serde_json::Value;
 

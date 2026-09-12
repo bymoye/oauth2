@@ -12,12 +12,11 @@ use nazo_valkey::test_support::par_storage_key;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use crate::adapters::security::jwt_decoding_key_from_jwk;
 use crate::config::ConfigSource;
-use crate::domain::{ConsentPayload, PushedAuthorizationRequest};
-use crate::http::authorization::unverified_request_object_client_id;
-use crate::settings::AuthorizationServerProfile;
 use crate::test_support::{ClientSigningFixture, client_signing_fixture};
+use nazo_oauth_server::crypto::jwt_decoding_key_from_jwk;
+use nazo_oauth_server::domain::oauth::{ConsentPayload, PushedAuthorizationRequest};
+use nazo_oauth_server::policy::AuthorizationServerProfile;
 use nazo_postgres::{create_pool, get_conn};
 
 const VALID_CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -60,10 +59,6 @@ fn endpoint_state(require_par: bool) -> TestInfrastructure {
     }
 }
 
-fn rs256_test_key_manager() -> nazo_key_management::KeyManager {
-    crate::test_support::test_key_manager_with_algorithm(jsonwebtoken::Algorithm::RS256)
-}
-
 async fn json_body(response: HttpResponse) -> (StatusCode, Value) {
     let status = response.status();
     let body = actix_web::body::to_bytes(response.into_body())
@@ -77,21 +72,6 @@ fn unsigned_request_object(claims: Value) -> String {
     let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
     let payload = URL_SAFE_NO_PAD.encode(claims.to_string());
     format!("{header}.{payload}.")
-}
-
-#[test]
-fn unverified_request_object_routing_extracts_only_parseable_signed_payloads() {
-    let state = endpoint_state(false);
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"routing-only"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(json!({"client_id": "routed-client"}).to_string());
-    let object = format!("{header}.{payload}.not-a-real-signature");
-
-    assert_eq!(
-        unverified_request_object_client_id(&state.keyset, &object).as_deref(),
-        Some("routed-client")
-    );
-    assert!(unverified_request_object_client_id(&state.keyset, "broken").is_none());
-    assert!(unverified_request_object_client_id(&state.keyset, "a.b.c.d.e").is_none());
 }
 
 fn signed_request_object(client_id: &str, fixture: &ClientSigningFixture) -> String {
@@ -115,61 +95,12 @@ fn signed_request_object(client_id: &str, fixture: &ClientSigningFixture) -> Str
     fixture.encode_jwt(&header, &claims)
 }
 
-fn request_object_client_with_remote_jwks() -> crate::domain::ClientRow {
-    let mut client = client_row! {
-        id: Uuid::now_v7(),
-        tenant_id: DEFAULT_TENANT_ID,
-        realm_id: DEFAULT_REALM_ID,
-        organization_id: DEFAULT_ORGANIZATION_ID,
-        client_id: "remote-jar-client".to_owned(),
-        client_name: "Remote JAR Client".to_owned(),
-        client_type: "confidential".to_owned(),
-        client_secret_hash: None,
-        redirect_uris: json!(["https://client.example/callback"]),
-        scopes: json!(["openid"]),
-        allowed_audiences: json!([]),
-        grant_types: json!(["authorization_code"]),
-        token_endpoint_auth_method: "private_key_jwt".to_owned(),
-        require_dpop_bound_tokens: false,
-        require_mtls_bound_tokens: false,
-        tls_client_auth_subject_dn: None,
-        tls_client_auth_cert_sha256: None,
-        tls_client_auth_san_dns: json!([]),
-        tls_client_auth_san_uri: json!([]),
-        tls_client_auth_san_ip: json!([]),
-        tls_client_auth_san_email: json!([]),
-        allow_client_assertion_audience_array: false,
-        allow_client_assertion_endpoint_audience: false,
-        require_par_request_object: false,
-        is_active: true,
-        jwks: Some(json!({"keys": [{"kid": "persisted"}]})),
-        introspection_encrypted_response_alg: None,
-        introspection_encrypted_response_enc: None,
-        userinfo_signed_response_alg: None,
-        userinfo_encrypted_response_alg: None,
-        userinfo_encrypted_response_enc: None,
-        authorization_signed_response_alg: None,
-        authorization_encrypted_response_alg: None,
-        authorization_encrypted_response_enc: None,
-        post_logout_redirect_uris: json!([]),
-        backchannel_logout_uri: None,
-        backchannel_logout_session_required: false,
-        frontchannel_logout_uri: None,
-        frontchannel_logout_session_required: false,
-        subject_type: "public".to_owned(),
-        sector_identifier_uri: None,
-        sector_identifier_host: None,
-    };
-    client.jwks_uri = Some("https://localhost:1/jwks".to_owned());
-    client
-}
-
-struct LiveAuthorizationFixture {
-    state: Data<TestInfrastructure>,
+pub(super) struct LiveAuthorizationFixture {
+    pub(super) state: Data<TestInfrastructure>,
 }
 
 impl LiveAuthorizationFixture {
-    async fn new() -> Option<Self> {
+    pub(super) async fn new() -> Option<Self> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
         let valkey_url = std::env::var("VALKEY_URL").ok()?;
         let config = ConfigSource::from_pairs_for_test([
@@ -225,7 +156,7 @@ impl LiveAuthorizationFixture {
         })
     }
 
-    async fn create_user(
+    pub(super) async fn create_user(
         &self,
         suffix: &str,
         auth_role: &str,
@@ -258,7 +189,7 @@ impl LiveAuthorizationFixture {
         .expect("test user should insert")
     }
 
-    async fn insert_client(
+    pub(super) async fn insert_client(
         &self,
         client_id: &str,
         redirect_uris: Vec<&str>,
@@ -370,7 +301,12 @@ impl LiveAuthorizationFixture {
         .expect("test client security policy update should succeed");
     }
 
-    async fn store_session(&self, user: &DatabaseUserFixture, sid: &str, auth_time: i64) {
+    pub(super) async fn store_session(
+        &self,
+        user: &DatabaseUserFixture,
+        sid: &str,
+        auth_time: i64,
+    ) {
         let payload = SessionPayload {
             user_id: user.id,
             auth_time,
@@ -388,7 +324,7 @@ impl LiveAuthorizationFixture {
         .expect("session should store");
     }
 
-    fn session_request(&self, sid: &str, uri: &str) -> HttpRequest {
+    pub(super) fn session_request(&self, sid: &str, uri: &str) -> HttpRequest {
         actix_web::test::TestRequest::get()
             .uri(uri)
             .cookie(Cookie::new(
@@ -525,36 +461,6 @@ fn decode_jarm_claims(state: &TestInfrastructure, response_jwt: &str, audience: 
         .claims
 }
 
-fn rsa_jarm_jwe_keypair(kid: &str) -> (crate::test_support::TestRsaKey, Value) {
-    let rsa = crate::test_support::TestRsaKey::generate();
-    let jwk = json!({
-        "kty": "RSA",
-        "kid": kid,
-        "use": "enc",
-        "alg": "RSA-OAEP-256",
-        "n": URL_SAFE_NO_PAD.encode(&rsa.modulus),
-        "e": URL_SAFE_NO_PAD.encode(&rsa.exponent)
-    });
-    (rsa, jwk)
-}
-
-fn decrypt_jarm_jwe(
-    private_key: &crate::test_support::TestRsaKey,
-    compact_jwe: &str,
-) -> anyhow::Result<(Value, String)> {
-    let parts = compact_jwe.split('.').collect::<Vec<_>>();
-    anyhow::ensure!(parts.len() == 5, "compact JWE must have five parts");
-    let protected_header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0])?)?;
-    let encrypted_key = URL_SAFE_NO_PAD.decode(parts[1])?;
-    let iv = URL_SAFE_NO_PAD.decode(parts[2])?;
-    let ciphertext = URL_SAFE_NO_PAD.decode(parts[3])?;
-    let tag = URL_SAFE_NO_PAD.decode(parts[4])?;
-    let cek = private_key.decrypt_oaep_sha256(&encrypted_key)?;
-    let plaintext =
-        crate::crypto::aes_256_gcm_decrypt(&cek, &iv, parts[0].as_bytes(), &ciphertext, &tag)?;
-    Ok((protected_header, String::from_utf8(plaintext)?))
-}
-
 #[actix_web::test]
 async fn authorization_get_rejects_duplicate_oauth_parameters_before_client_lookup() {
     let state = Data::new(endpoint_state(false));
@@ -592,12 +498,11 @@ async fn authorization_get_requires_par_before_untrusted_runtime_parameters() {
 #[actix_web::test]
 async fn authorization_request_rejects_disabled_request_object_parameters_before_client_lookup() {
     let state = endpoint_state(false);
-    let dependencies =
+    let mut dependencies =
         crate::http::authorization::test_support::TestAuthorizationDependencies::new(&state);
-    let mut context = dependencies.context();
-    context
-        .modules
-        .accepting
+    dependencies
+        .fixture
+        .enabled_modules
         .remove(&nazo_runtime_modules::ModuleId::RequestObjects);
     let req = actix_web::test::TestRequest::get()
         .uri("/authorize?request=jwt")
@@ -605,7 +510,7 @@ async fn authorization_request_rejects_disabled_request_object_parameters_before
     let mut q = query(&[("request", "jwt")]);
 
     let (status, body) =
-        json_body(authorize_request_with_context(&context, req, &mut q).await).await;
+        json_body(authorize_with_fixture(&dependencies.fixture, req, &mut q).await).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_request");
@@ -625,32 +530,6 @@ async fn authorization_request_rejects_external_request_uri_before_client_lookup
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "invalid_request");
     assert!(body.get("code").is_none());
-}
-
-#[actix_web::test]
-async fn request_object_jwks_failure_is_server_error_without_using_persisted_fallback() {
-    let state = endpoint_state(false);
-    let dependencies =
-        crate::http::authorization::test_support::TestAuthorizationDependencies::new(&state);
-    let context = dependencies.context();
-    let signing_key = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
-    let request_object = signed_request_object("remote-jar-client", &signing_key);
-    let mut outer = query(&[("request", request_object.as_str())]);
-    let mut client = request_object_client_with_remote_jwks();
-
-    let response = apply_request_object_with_context(&context, &mut outer, &mut client)
-        .await
-        .expect_err("unavailable remote JWK source must reject the request object");
-
-    let (status, body) = json_body(response).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"], "server_error");
-    assert_eq!(
-        client.jwks.as_ref().expect("persisted JWKS")["keys"][0]["kid"],
-        "persisted",
-        "failed remote resolution must not fall back to persisted keys"
-    );
-    assert_eq!(outer["request"], request_object);
 }
 
 #[actix_web::test]
@@ -2079,15 +1958,15 @@ async fn authorization_request_redirects_invalid_authorization_details_for_authe
         ("state", "bad-details"),
     ]);
 
-    let dependencies = crate::http::authorization::test_support::TestAuthorizationDependencies::new(
-        &fixture.state,
-    );
-    let mut context = dependencies.context();
-    context
-        .modules
-        .accepting
+    let mut dependencies =
+        crate::http::authorization::test_support::TestAuthorizationDependencies::new(
+            &fixture.state,
+        );
+    dependencies
+        .fixture
+        .enabled_modules
         .insert(nazo_runtime_modules::ModuleId::AuthorizationDetails);
-    let response = authorize_request_with_context(&context, req, &mut q).await;
+    let response = authorize_with_fixture(&dependencies.fixture, req, &mut q).await;
 
     assert_authorization_error_redirect(response, "invalid_request", Some("bad-details"));
 }
@@ -2255,392 +2134,169 @@ async fn signed_request_object_redirect_uri_supersedes_invalid_outer_redirect_ur
 
 #[actix_web::test]
 async fn consume_pushed_authorization_request_enforces_single_use_and_malformed_states() {
-    let Some(fixture) = LiveAuthorizationFixture::new().await else {
+    let Some(mut fixture) =
+        super::prompt_none::PromptNoneFixture::new(super::prompt_none::Fault::None, None).await
+    else {
         return;
     };
-    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::now_v7());
-    fixture
-        .store_pushed_request(
-            &request_uri,
-            "client-a",
-            query(&[
-                ("client_id", "client-a"),
-                ("redirect_uri", "https://client.example/callback"),
-                ("response_type", "code"),
-            ]),
-        )
-        .await;
-
-    assert_eq!(
-        consume_pushed_authorization_request(&fixture.state, &request_uri).await,
-        Ok(())
+    let request_uri = fixture.push().await;
+    let outer = fixture.q.clone();
+    let response = fixture.authorize().await;
+    let location = authorization_location(&response);
+    assert!(
+        location.query_pairs().any(|(key, _)| key == "code"),
+        "the first consumer issues one code"
     );
-    assert_eq!(
-        consume_pushed_authorization_request(&fixture.state, &request_uri).await,
-        Err(PushedAuthorizationRequestConsumeError::Missing)
+    assert!(
+        valkey_get(&fixture.live.state.valkey, par_storage_key(&request_uri))
+            .await
+            .expect("PAR lookup")
+            .is_none()
     );
+    fixture.q = outer.clone();
+    let response = fixture.authorize().await;
+    assert_authorization_error_redirect(response, "invalid_request_uri", None);
 
     let malformed_request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::now_v7());
     fixture
+        .live
         .store_raw_pushed_request(&malformed_request_uri, "{not-json")
         .await;
-    assert_eq!(
-        consume_pushed_authorization_request(&fixture.state, &malformed_request_uri).await,
-        Err(PushedAuthorizationRequestConsumeError::Malformed)
-    );
+    fixture.q = query(&[
+        ("client_id", &fixture.client_id),
+        ("request_uri", &malformed_request_uri),
+    ]);
+    let (status, body) = json_body(fixture.authorize().await).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "server_error");
+    assert!(body.get("code").is_none());
 
-    let broken_state = endpoint_state(false);
-    assert_eq!(
-        consume_pushed_authorization_request(
-            &broken_state,
-            "urn:ietf:params:oauth:request_uri:missing"
-        )
-        .await,
-        Err(PushedAuthorizationRequestConsumeError::ReadFailed)
-    );
+    let broken_state = Data::new(endpoint_state(false));
+    let request = actix_web::test::TestRequest::get().to_http_request();
+    let mut parameters = query(&[("request_uri", "urn:ietf:params:oauth:request_uri:missing")]);
+    let (status, body) =
+        json_body(authorize_request(broken_state, request, &mut parameters).await).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"], "server_error");
+    assert!(body.get("code").is_none());
 }
 
 #[actix_web::test]
 async fn concurrent_pushed_authorization_request_consumption_allows_exactly_one_winner() {
-    let Some(fixture) = LiveAuthorizationFixture::new().await else {
+    let Some(mut fixture) =
+        super::prompt_none::PromptNoneFixture::new(super::prompt_none::Fault::None, None).await
+    else {
         return;
     };
-    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::now_v7());
-    fixture
-        .store_pushed_request(
-            &request_uri,
-            "client-a",
-            query(&[
-                ("client_id", "client-a"),
-                ("redirect_uri", "https://client.example/callback"),
-                ("response_type", "code"),
-            ]),
-        )
-        .await;
-
+    let request_uri = fixture.push().await;
+    let application = fixture.dependencies.application();
+    let sid = SessionId::new(fixture.sid.clone());
+    let facts = AuthorizationRequestFacts {
+        source_ip: "127.0.0.1",
+        session_id: Some(&sid),
+        user_agent: None,
+    };
+    let mut first_parameters = fixture.q.clone();
+    let mut second_parameters = fixture.q.clone();
     let (first, second) = tokio::join!(
-        consume_pushed_authorization_request(&fixture.state, &request_uri),
-        consume_pushed_authorization_request(&fixture.state, &request_uri)
+        application.authorize(&facts, &mut first_parameters),
+        application.authorize(&facts, &mut second_parameters)
     );
-    let results = [first, second];
-
+    let pairs = [first, second]
+        .into_iter()
+        .map(|result| {
+            let AuthorizationOutcome::Redirect { location } =
+                result.expect("PAR outcome should be a redirect")
+            else {
+                panic!("query response expected")
+            };
+            url::Url::parse(&location)
+                .expect("redirect URL")
+                .query_pairs()
+                .into_owned()
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        results.iter().filter(|result| **result == Ok(())).count(),
-        1
-    );
-    assert_eq!(
-        results
+        pairs
             .iter()
-            .filter(|result| **result == Err(PushedAuthorizationRequestConsumeError::Missing))
+            .filter(|result| result.contains_key("code"))
             .count(),
         1
     );
-}
-
-#[actix_web::test]
-async fn authorization_response_redirect_emits_signed_jarm_response() {
-    let mut state = endpoint_state(false);
-    state.keyset = rs256_test_key_manager();
-    let state = Data::new(state);
-
-    let response = authorization_response_redirect_with_protection(
-        &state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback?existing=1",
-            client_id: "client-jarm",
-            response_mode: Some("jwt"),
-            code: Some("code-123"),
-            error: None,
-            state: Some("state-123"),
-            oidc_sid: None,
-            client_policy: None,
-        },
-        AuthorizationResponseProtection::default(),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::FOUND);
-    let location = authorization_location(&response);
-    let pairs = location.query_pairs().collect::<HashMap<_, _>>();
-    assert_eq!(pairs.get("existing").map(|value| value.as_ref()), Some("1"));
-    assert!(pairs.contains_key("response"));
-    assert!(!pairs.contains_key("code"));
-    assert!(!pairs.contains_key("state"));
-    assert!(!pairs.contains_key("iss"));
-
-    let claims = decode_jarm_claims(
-        &state,
+    assert_eq!(
         pairs
-            .get("response")
-            .expect("JARM response parameter should be present"),
-        "client-jarm",
+            .iter()
+            .filter(|result| result.get("error").map(String::as_str) == Some("invalid_request_uri"))
+            .count(),
+        1
     );
-    assert_eq!(claims["iss"], "https://issuer.example");
-    assert_eq!(claims["aud"], "client-jarm");
-    assert_eq!(claims["code"], "code-123");
-    assert_eq!(claims["state"], "state-123");
-}
-
-#[actix_web::test]
-async fn authorization_response_policy_lookup_failure_never_emits_redirect_parameters() {
-    let state = endpoint_state(false);
-
-    let response = authorization_response_redirect(
-        &state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback",
-            client_id: "unavailable-client",
-            response_mode: None,
-            code: Some("must-not-leak"),
-            error: None,
-            state: Some("must-not-leak"),
-            oidc_sid: None,
-            client_policy: None,
-        },
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(response.headers().get(header::LOCATION).is_none());
-}
-
-#[actix_web::test]
-async fn signed_response_with_precomputed_policy_still_requires_an_authoritative_client() {
-    let state = endpoint_state(false);
-
-    let response = authorization_response_redirect(
-        &state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback",
-            client_id: "unavailable-jarm-client",
-            response_mode: Some("jwt"),
-            code: Some("must-not-leak"),
-            error: None,
-            state: Some("must-not-leak"),
-            oidc_sid: None,
-            client_policy: Some(AuthorizationResponseClientPolicy {
-                signed_response_required: true,
-                session_management_allowed: false,
-                ttl_seconds: 60,
-            }),
-        },
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(response.headers().get(header::LOCATION).is_none());
+    assert!(
+        valkey_get(&fixture.live.state.valkey, par_storage_key(&request_uri))
+            .await
+            .expect("PAR lookup")
+            .is_none()
+    );
 }
 
 #[actix_web::test]
 async fn signed_response_with_precomputed_policy_accepts_only_an_active_database_client() {
-    let Some(fixture) = LiveAuthorizationFixture::new().await else {
+    let Some(mut fixture) =
+        super::prompt_none::PromptNoneFixture::new(super::prompt_none::Fault::None, None).await
+    else {
         return;
     };
-    let inactive_client = format!("inactive-jarm-{}", Uuid::now_v7());
     fixture
-        .insert_client(
-            &inactive_client,
-            vec!["https://client.example/callback"],
-            vec!["authorization_code"],
-            false,
-        )
-        .await;
-    let policy = AuthorizationResponseClientPolicy {
-        signed_response_required: true,
-        session_management_allowed: false,
-        ttl_seconds: 60,
-    };
-    let response = authorization_response_redirect(
-        &fixture.state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback",
-            client_id: &inactive_client,
-            response_mode: Some("jwt"),
-            code: Some("must-not-leak"),
-            error: None,
-            state: Some("must-not-leak"),
-            oidc_sid: None,
-            client_policy: Some(policy),
-        },
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        .dependencies
+        .fixture
+        .enabled_modules
+        .insert(nazo_runtime_modules::ModuleId::Jarm);
+    fixture.q.insert("response_mode".into(), "jwt".into());
+    fixture.q.insert("state".into(), "active-state".into());
+    let mut connection = get_conn(&fixture.live.state.diesel_db)
+        .await
+        .expect("database connection");
+    sql_query("UPDATE oauth_clients SET is_active = false WHERE tenant_id = $1 AND client_id = $2")
+        .bind::<SqlUuid, _>(DEFAULT_TENANT_ID)
+        .bind::<Text, _>(&fixture.client_id)
+        .execute(&mut connection)
+        .await
+        .expect("deactivate client");
+    let response = fixture.authorize().await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert!(response.headers().get(header::LOCATION).is_none());
-
-    let active_client = format!("active-jarm-{}", Uuid::now_v7());
-    fixture
-        .insert_client(
-            &active_client,
-            vec!["https://client.example/callback"],
-            vec!["authorization_code"],
-            true,
-        )
-        .await;
-    let response = authorization_response_redirect(
-        &fixture.state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback",
-            client_id: &active_client,
-            response_mode: Some("jwt"),
-            code: Some("active-code"),
-            error: None,
-            state: Some("active-state"),
-            oidc_sid: None,
-            client_policy: Some(policy),
-        },
-    )
-    .await;
+    assert_eq!(
+        response_oauth_error_code(response).await.as_deref(),
+        Some("unauthorized_client")
+    );
+    sql_query("UPDATE oauth_clients SET is_active = true WHERE tenant_id = $1 AND client_id = $2")
+        .bind::<SqlUuid, _>(DEFAULT_TENANT_ID)
+        .bind::<Text, _>(&fixture.client_id)
+        .execute(&mut connection)
+        .await
+        .expect("activate client");
+    let response = fixture.authorize().await;
     assert_eq!(response.status(), StatusCode::FOUND);
     let location = authorization_location(&response);
     let response_jwt = location
         .query_pairs()
         .find_map(|(key, value)| (key == "response").then_some(value.into_owned()))
         .expect("active client must receive a signed JARM response");
-    let claims = decode_jarm_claims(&fixture.state, &response_jwt, &active_client);
-    assert_eq!(claims["code"], "active-code");
+    assert!(!location.query_pairs().any(|(key, _)| key == "code"));
+    let claims = decode_jarm_claims(&fixture.live.state, &response_jwt, &fixture.client_id);
+    let code = claims["code"].as_str().expect("signed authorization code");
+    let raw = valkey_get(&fixture.live.state.valkey, authorization_code_key(code))
+        .await
+        .expect("issued code lookup")
+        .expect("issued code must be stored");
+    let AuthorizationCodeState::Pending { payload } =
+        serde_json::from_str::<AuthorizationCodeState>(&raw).expect("issued code payload")
+    else {
+        panic!("newly issued code must be pending")
+    };
+    assert_eq!(payload.client_id, fixture.client_id);
+    assert_eq!(payload.user_id, fixture.user_id);
     assert_eq!(claims["state"], "active-state");
-}
-
-#[actix_web::test]
-async fn authorization_response_redirect_jarm_profile_signs_without_response_mode() {
-    let mut state = endpoint_state(false);
-    let mut settings = state.settings.as_ref().clone();
-    settings.protocol.authorization_server_profile =
-        AuthorizationServerProfile::Fapi2MessageSigningJarm;
-    state.settings = Arc::new(settings);
-    state.keyset = rs256_test_key_manager();
-    let state = Data::new(state);
-
-    let response = authorization_response_redirect_with_protection(
-        &state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback",
-            client_id: "client-jarm-profile",
-            response_mode: None,
-            code: Some("code-456"),
-            error: None,
-            state: Some("state-456"),
-            oidc_sid: None,
-            client_policy: None,
-        },
-        AuthorizationResponseProtection::default(),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::FOUND);
-    let location = authorization_location(&response);
-    let pairs = location.query_pairs().collect::<HashMap<_, _>>();
-    assert!(pairs.contains_key("response"));
-    assert!(!pairs.contains_key("code"));
-    assert!(!pairs.contains_key("state"));
-    assert!(!pairs.contains_key("iss"));
-
-    let claims = decode_jarm_claims(
-        &state,
-        pairs
-            .get("response")
-            .expect("JARM response parameter should be present"),
-        "client-jarm-profile",
-    );
-    assert_eq!(claims["iss"], "https://issuer.example");
-    assert_eq!(claims["aud"], "client-jarm-profile");
-    assert_eq!(claims["code"], "code-456");
-    assert_eq!(claims["state"], "state-456");
-}
-
-#[actix_web::test]
-async fn authorization_response_redirect_signs_then_encrypts_jarm_for_client_policy() {
-    let mut state = endpoint_state(false);
-    state.keyset = rs256_test_key_manager();
-    let state = Data::new(state);
-    let (private_key, public_jwk) = rsa_jarm_jwe_keypair("jarm-enc");
-    let (wrong_private_key, _) = rsa_jarm_jwe_keypair("wrong-jarm-enc");
-    let jwks = json!({"keys": [public_jwk]});
-
-    let response = authorization_response_redirect_with_protection(
-        &state,
-        AuthorizationResponseRedirect {
-            redirect_uri: "https://client.example/callback?existing=1",
-            client_id: "client-encrypted-jarm",
-            response_mode: Some("jwt"),
-            code: Some("encrypted-code"),
-            error: None,
-            state: Some("encrypted-state"),
-            oidc_sid: None,
-            client_policy: None,
-        },
-        AuthorizationResponseProtection {
-            signing_alg: Some("RS256"),
-            encryption_alg: Some("RSA-OAEP-256"),
-            encryption_enc: Some("A256GCM"),
-            jwks: Some(&jwks),
-        },
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::FOUND);
-    let location = authorization_location(&response);
-    let pairs = location.query_pairs().collect::<HashMap<_, _>>();
-    assert_eq!(pairs.get("existing").map(|value| value.as_ref()), Some("1"));
-    assert!(!pairs.contains_key("code"));
-    assert!(!pairs.contains_key("state"));
-    let encrypted = pairs
-        .get("response")
-        .expect("encrypted JARM response parameter should be present");
-    assert!(
-        decrypt_jarm_jwe(&wrong_private_key, encrypted).is_err(),
-        "an unrelated private key must not decrypt JARM"
-    );
-    let (protected, nested_jwt) =
-        decrypt_jarm_jwe(&private_key, encrypted).expect("matching key should decrypt JARM");
-    assert_eq!(protected["alg"], "RSA-OAEP-256");
-    assert_eq!(protected["enc"], "A256GCM");
-    assert_eq!(protected["kid"], "jarm-enc");
-    assert_eq!(protected["cty"], "JWT");
-    let claims = decode_jarm_claims(&state, &nested_jwt, "client-encrypted-jarm");
-    assert_eq!(claims["code"], "encrypted-code");
-    assert_eq!(claims["state"], "encrypted-state");
-}
-
-#[actix_web::test]
-async fn authorization_response_crypto_failure_never_falls_back_to_plain_query() {
-    let mut state = endpoint_state(false);
-    state.keyset = rs256_test_key_manager();
-    let state = Data::new(state);
-    for protection in [
-        AuthorizationResponseProtection {
-            signing_alg: Some("none"),
-            ..AuthorizationResponseProtection::default()
-        },
-        AuthorizationResponseProtection {
-            encryption_alg: Some("RSA-OAEP-256"),
-            encryption_enc: Some("A256GCM"),
-            jwks: None,
-            ..AuthorizationResponseProtection::default()
-        },
-    ] {
-        let response = authorization_response_redirect_with_protection(
-            &state,
-            AuthorizationResponseRedirect {
-                redirect_uri: "https://client.example/callback",
-                client_id: "client-failed-jarm",
-                response_mode: Some("jwt"),
-                code: Some("must-not-leak"),
-                error: None,
-                state: Some("must-not-leak-state"),
-                oidc_sid: None,
-                client_policy: None,
-            },
-            protection,
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            response.headers().get(header::LOCATION).is_none(),
-            "crypto failure must not emit any redirect containing code or state"
-        );
-    }
 }
 
 #[actix_web::test]

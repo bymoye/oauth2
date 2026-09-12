@@ -8,23 +8,22 @@ use fred::interfaces::ClientLike;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
-use nazo_http_actix::OAuthJsonErrorFields;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
 use crate::http::sessions::SessionHttpConfig;
-use crate::http::sessions::SessionPayload;
 use crate::schema::users;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
 use chrono::Utc;
 use diesel::prelude::*;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 use nazo_identity::ports::AdminUserRepositoryPort;
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::{UserRepository, create_pool, get_conn};
 
 fn user_row() -> PublicAccount {
@@ -111,10 +110,12 @@ fn admin_user_dependencies(
     let session = &state.settings.session;
     let endpoint = &state.settings.endpoint;
     (
-        Data::new(AdminSessionHandles::from_port(
-            Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-            Arc::new(UserRepository::new(state.diesel_db.clone())),
-            state.settings.tenant.context.tenant_id,
+        Data::new(AdminSessionHandles::new(
+            std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
+                Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
+                Arc::new(UserRepository::new(state.diesel_db.clone())),
+                state.settings.tenant.context.tenant_id,
+            )),
             SessionHttpConfig::new(
                 &session.session_cookie_name,
                 &session.csrf_cookie_name,
@@ -161,11 +162,15 @@ async fn invoke_admin_create_user(
     admin_create_user(admin_sessions, accounts, client_ip_config, req, payload).await
 }
 
-fn oauth_error_name(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 struct LiveAdminUsersFixture {
@@ -328,8 +333,8 @@ async fn admin_users_list_response_omits_password_hash_and_tenant_context() {
     assert!(item.get("organization_id").is_none());
 }
 
-#[test]
-fn patch_user_validation_allows_only_supported_roles() {
+#[actix_web::test]
+async fn patch_user_validation_allows_only_supported_roles() {
     let mut patch = empty_patch();
     patch.role = Some("owner".to_owned());
 
@@ -338,16 +343,13 @@ fn patch_user_validation_allows_only_supported_roles() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
 
-#[test]
-fn patch_user_validation_rejects_negative_admin_level() {
+#[actix_web::test]
+async fn patch_user_validation_rejects_negative_admin_level() {
     let mut patch = empty_patch();
     patch.role = Some("admin".to_owned());
     patch.admin_level = Some(-1);
@@ -357,10 +359,7 @@ fn patch_user_validation_rejects_negative_admin_level() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -390,7 +389,7 @@ async fn admin_users_requires_admin_before_database_lookup() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -416,7 +415,7 @@ async fn admin_patch_user_rejects_missing_csrf_before_auth_or_mutation() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -444,7 +443,7 @@ async fn admin_create_user_rejects_missing_csrf_before_hashing_or_mutation() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -514,7 +513,7 @@ async fn admin_patch_user_requires_admin_even_with_valid_csrf() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -573,7 +572,7 @@ async fn admin_patch_user_rejects_peer_self_demotion_and_own_level_grant() {
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            oauth_error_name(&response).as_deref(),
+            oauth_error_name(response).await.as_deref(),
             Some("access_denied")
         );
     }
@@ -662,7 +661,7 @@ async fn admin_patch_user_validates_role_and_admin_level_before_mutation() {
     .await;
     assert_eq!(invalid_role.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&invalid_role).as_deref(),
+        oauth_error_name(invalid_role).await.as_deref(),
         Some("invalid_request")
     );
 
@@ -679,7 +678,7 @@ async fn admin_patch_user_validates_role_and_admin_level_before_mutation() {
     .await;
     assert_eq!(invalid_level.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&invalid_level).as_deref(),
+        oauth_error_name(invalid_level).await.as_deref(),
         Some("invalid_request")
     );
 
@@ -712,7 +711,7 @@ async fn admin_patch_user_rejects_nil_user_id_without_panicking() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -780,7 +779,7 @@ async fn admin_patch_user_rejects_invalid_partial_role_level_without_mutation() 
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
     let persisted = fixture.load_user(user.id).await;
@@ -839,7 +838,7 @@ async fn admin_patch_user_updates_role_level_and_active_state_and_reports_missin
 
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        oauth_error_name(&missing).as_deref(),
+        oauth_error_name(missing).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -885,7 +884,7 @@ async fn admin_patch_user_reports_not_found_for_each_requested_field_update() {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            oauth_error_name(&response).as_deref(),
+            oauth_error_name(response).await.as_deref(),
             Some("invalid_request")
         );
     }

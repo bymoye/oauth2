@@ -4,7 +4,6 @@
 //! `require_admin_with_recent_mfa_*` 语义，固定 5 分钟新鲜度上限）；提交端点
 //! 消费一次性审批令牌，令牌校验与注册表变更在同一个数据库事务内原子完成。
 //! 明文审批令牌只在签发响应中出现一次，永不写入日志或审计载荷。
-use crate::adapters::audit::audit_fields;
 use crate::controller_registry::{
     ControllerKeyWarning, ControllerRegistryService, ControllerRegistryServiceError,
     IdentityChange, RevokeRequest, RotateRequest, SlotChangeRequest, expiry_warning,
@@ -21,6 +20,7 @@ use actix_web::web::{Data, Json, Query};
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
 use nazo_http_actix::{csrf_error, has_valid_csrf_token_for_cookies, json_response, oauth_error};
+use nazo_oauth_server::ports::audit::audit_fields;
 use nazo_persistence::control_plane::{
     ControllerIdentityAction, ControllerSlotStatus, IdentityApprovalError,
     MAX_ACTIVE_CONTROLLER_SLOTS, StoredControllerSlot,

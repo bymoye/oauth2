@@ -1,3 +1,7 @@
+use nazo_oauth_server::contracts::userinfo::{
+    PreparedUserinfo, UserinfoError, UserinfoFuture, UserinfoOperations, UserinfoPreparationFuture,
+    UserinfoRequestFacts,
+};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
@@ -18,10 +22,8 @@ use nazo_auth::{
     RequestRateLimitError, RequestRateLimitFuture, RequestRateLimitPort,
 };
 use nazo_http_actix::IpCidr;
-use nazo_http_actix::{
-    AccessTokenAuthScheme, ClientIpConfig, ClientIpHeaderMode, UserinfoEndpoint, UserinfoError,
-    UserinfoFuture, UserinfoOperations,
-};
+use nazo_http_actix::{ClientIpConfig, ClientIpHeaderMode, UserinfoEndpoint};
+use nazo_oauth_server::contracts::userinfo::AccessTokenAuthScheme;
 use serde_json::Value;
 use serde_json::json;
 
@@ -138,19 +140,19 @@ async fn framework_boundary_transport_readiness_fails_closed_when_dependencies_a
 async fn framework_boundary_transport_well_known_endpoints_keep_contracts() {
     assert_eq!(
         http::well_known::live().await.into_inner(),
-        Value::from(serde_json::json!({"status": "live"}))
+        serde_json::json!({"status": "live"})
     );
     assert_eq!(
         http::well_known::startup().await.into_inner(),
-        Value::from(serde_json::json!({"status": "started"}))
+        serde_json::json!({"status": "started"})
     );
     assert_eq!(
         http::well_known::captcha_config().await.into_inner(),
-        Value::from(serde_json::json!({
+        serde_json::json!({
             "turnstile_enabled": false,
             "turnstile_site_key": Value::Null,
             "registration_enabled": true
-        }))
+        })
     );
 }
 
@@ -160,15 +162,6 @@ fn framework_boundary_transport_views_helpers_maintain_http_projection_semantics
     query.insert("page".to_owned(), "3".to_owned());
     query.insert("page_size".to_owned(), "50".to_owned());
     assert_eq!(http::views::pagination(&query), (3, 50, 100));
-
-    let query = vec![("state", "abc"), ("nonce", ""), ("scope", "openid profile")];
-    assert_eq!(
-        http::views::append_query(
-            "https://issuer.example/authorize?client_id=client-1",
-            &query
-        ),
-        "https://issuer.example/authorize?client_id=client-1&state=abc&scope=openid+profile"
-    );
 
     let mut headers = actix_web::http::header::HeaderMap::new();
     let fetch = actix_web::http::header::HeaderName::from_static("sec-fetch-site");
@@ -210,17 +203,16 @@ impl RequestRateLimitPort for RecordingRateLimiter {
 
 #[actix_web::test]
 async fn framework_boundary_transport_rate_limit_exact_wire_and_store_order() {
-    let store = RecordingRateLimiter {
+    let store = Arc::new(RecordingRateLimiter {
         outcome: Ok(3),
         calls: Arc::new(Mutex::new(Vec::new())),
-    };
+    });
     let req = TestRequest::default()
         .peer_addr("203.0.113.77:443".parse().unwrap())
         .to_http_request();
-    let response = http::rate_limit::enforce_auth_rate_limit(
-        &store,
+    let response = http::rate_limit::enforce_auth_request_limit(
+        &nazo_oauth_server::rate_limit::AuthRequestLimiter::new(store.clone(), 41, 2),
         &req,
-        http::rate_limit::AuthRateLimitConfig::new(41, 2),
         &ClientIpConfig::new(&[], ClientIpHeaderMode::None),
     )
     .await
@@ -253,17 +245,16 @@ async fn framework_boundary_transport_rate_limit_exact_wire_and_store_order() {
 
 #[actix_web::test]
 async fn framework_boundary_transport_rate_limit_store_failure_exact_wire_and_order() {
-    let store = RecordingRateLimiter {
+    let store = Arc::new(RecordingRateLimiter {
         outcome: Err(RequestRateLimitError),
         calls: Arc::new(Mutex::new(Vec::new())),
-    };
+    });
     let req = TestRequest::default()
         .peer_addr("198.51.100.9:443".parse().unwrap())
         .to_http_request();
-    let response = http::rate_limit::enforce_auth_rate_limit(
-        &store,
+    let response = http::rate_limit::enforce_auth_request_limit(
+        &nazo_oauth_server::rate_limit::AuthRequestLimiter::new(store.clone(), 60, 10),
         &req,
-        http::rate_limit::AuthRateLimitConfig::new(60, 10),
         &ClientIpConfig::new(&[], ClientIpHeaderMode::None),
     )
     .await
@@ -299,7 +290,7 @@ async fn framework_boundary_transport_duplicate_dpop_header_has_exact_error_wire
         .expect_err("duplicate DPoP proof headers must be rejected");
     let response = nazo_http_actix::dpop_error_response(
         error,
-        nazo_http_actix::DpopErrorContext::TokenEndpoint,
+        nazo_oauth_server::contracts::request_facts::DpopErrorContext::TokenEndpoint,
     );
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -339,26 +330,35 @@ struct RecordingUserinfo {
 }
 
 impl UserinfoOperations for RecordingUserinfo {
-    fn userinfo<'a>(
+    fn prepare<'a>(
         &'a self,
-        _request: &'a HttpRequest,
         scheme: AccessTokenAuthScheme,
         token: String,
-    ) -> UserinfoFuture<'a> {
+    ) -> UserinfoPreparationFuture<'a> {
         Box::pin(async move {
             self.calls.lock().unwrap().push((scheme, token));
             Err(self.result.clone())
         })
+    }
+    fn userinfo<'a>(
+        &'a self,
+        _prepared: PreparedUserinfo,
+        _facts: UserinfoRequestFacts<'a>,
+    ) -> UserinfoFuture<'a> {
+        panic!("rejected preparation must not reach binding")
     }
 }
 
 #[actix_web::test]
 async fn framework_boundary_transport_userinfo_rejects_conflicting_auth_sources_before_port() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let endpoint = Data::new(UserinfoEndpoint::new(Arc::new(RecordingUserinfo {
-        calls: calls.clone(),
-        result: UserinfoError::InvalidAccessToken,
-    })));
+    let endpoint = Data::new(UserinfoEndpoint::new(
+        Arc::new(RecordingUserinfo {
+            calls: calls.clone(),
+            result: UserinfoError::InvalidAccessToken,
+        }),
+        Arc::new(NoFapiMtls),
+    ));
     let req = TestRequest::post()
         .insert_header((header::AUTHORIZATION, "Bearer token-in-header"))
         .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
@@ -390,10 +390,13 @@ async fn framework_boundary_transport_userinfo_rejects_conflicting_auth_sources_
 #[actix_web::test]
 async fn framework_boundary_transport_userinfo_missing_token_challenge_skips_port() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let endpoint = Data::new(UserinfoEndpoint::new(Arc::new(RecordingUserinfo {
-        calls: calls.clone(),
-        result: UserinfoError::InvalidAccessToken,
-    })));
+    let endpoint = Data::new(UserinfoEndpoint::new(
+        Arc::new(RecordingUserinfo {
+            calls: calls.clone(),
+            result: UserinfoError::InvalidAccessToken,
+        }),
+        Arc::new(NoFapiMtls),
+    ));
     let req = TestRequest::default().to_http_request();
     let response = nazo_http_actix::userinfo(endpoint, req, Bytes::new()).await;
     assert!(calls.lock().unwrap().is_empty());
@@ -415,10 +418,13 @@ async fn framework_boundary_transport_userinfo_missing_token_challenge_skips_por
 #[actix_web::test]
 async fn framework_boundary_transport_userinfo_invalid_token_challenge_follows_port() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let endpoint = Data::new(UserinfoEndpoint::new(Arc::new(RecordingUserinfo {
-        calls: calls.clone(),
-        result: UserinfoError::InvalidAccessToken,
-    })));
+    let endpoint = Data::new(UserinfoEndpoint::new(
+        Arc::new(RecordingUserinfo {
+            calls: calls.clone(),
+            result: UserinfoError::InvalidAccessToken,
+        }),
+        Arc::new(NoFapiMtls),
+    ));
     let req = TestRequest::default()
         .insert_header((header::AUTHORIZATION, "Bearer invalid-access-token"))
         .to_http_request();
@@ -468,16 +474,16 @@ fn framework_boundary_transport_direct_tls_does_not_fallback_to_certificate_head
 
 struct NoFapiAuthorizer;
 
-impl nazo_http_actix::FapiResourceAuthorizer for NoFapiAuthorizer {
+impl nazo_oauth_server::contracts::fapi_resource::FapiResourceAuthorizer for NoFapiAuthorizer {
     fn authorize<'a>(
         &'a self,
         _request: nazo_resource_server::ProtectedResourceAuthorizationRequest<'a>,
         _context: nazo_resource_server::ProtectedResourceAuthorizationContext<'a>,
-    ) -> nazo_http_actix::FapiFuture<
+    ) -> nazo_oauth_server::contracts::fapi_resource::FapiFuture<
         'a,
         Result<
             nazo_resource_server::ProtectedResourceAuthorizationResult,
-            nazo_http_actix::FapiAuthorizationError,
+            nazo_oauth_server::contracts::fapi_resource::FapiAuthorizationError,
         >,
     > {
         panic!("authorization must not run without access token")
@@ -486,7 +492,7 @@ impl nazo_http_actix::FapiResourceAuthorizer for NoFapiAuthorizer {
 
 struct NoFapiMtls;
 
-impl nazo_http_actix::FapiMtlsThumbprintResolver for NoFapiMtls {
+impl nazo_http_actix::mtls::MtlsThumbprintExtractor for NoFapiMtls {
     fn resolve(&self, _request: &HttpRequest) -> Option<String> {
         panic!("certificate extraction must not run without access token")
     }
@@ -494,7 +500,7 @@ impl nazo_http_actix::FapiMtlsThumbprintResolver for NoFapiMtls {
 
 struct NoFapiSignatures;
 
-impl nazo_http_actix::FapiHttpMessageSignatures for NoFapiSignatures {
+impl nazo_oauth_server::contracts::fapi_resource::FapiHttpMessageSignatures for NoFapiSignatures {
     fn enabled(&self) -> bool {
         false
     }
@@ -503,15 +509,17 @@ impl nazo_http_actix::FapiHttpMessageSignatures for NoFapiSignatures {
         _tenant_id: &'a str,
         _client_id: &'a str,
         _input: &'a nazo_http_signatures::VerifiedInput,
-    ) -> nazo_http_actix::FapiFuture<'a, Result<(), nazo_http_actix::FapiSignatureVerificationError>>
-    {
+    ) -> nazo_oauth_server::contracts::fapi_resource::FapiFuture<
+        'a,
+        Result<(), nazo_oauth_server::contracts::fapi_resource::FapiSignatureVerificationError>,
+    > {
         panic!("signature verification must be disabled")
     }
     fn response_signature(
         &self,
     ) -> Result<
-        Arc<dyn nazo_http_actix::FapiResponseSignature>,
-        nazo_http_actix::FapiSignatureOperationError,
+        Arc<dyn nazo_oauth_server::contracts::fapi_resource::FapiResponseSignature>,
+        nazo_oauth_server::contracts::fapi_resource::FapiSignatureOperationError,
     > {
         panic!("signature presentation must be disabled")
     }
@@ -554,7 +562,9 @@ struct FailingFapiResponseSigner {
     calls: Arc<Mutex<Vec<&'static str>>>,
 }
 
-impl nazo_http_actix::FapiHttpMessageSignatures for FailingFapiResponseSigner {
+impl nazo_oauth_server::contracts::fapi_resource::FapiHttpMessageSignatures
+    for FailingFapiResponseSigner
+{
     fn enabled(&self) -> bool {
         self.calls.lock().unwrap().push("enabled");
         true
@@ -565,19 +575,21 @@ impl nazo_http_actix::FapiHttpMessageSignatures for FailingFapiResponseSigner {
         _tenant_id: &'a str,
         _client_id: &'a str,
         _input: &'a nazo_http_signatures::VerifiedInput,
-    ) -> nazo_http_actix::FapiFuture<'a, Result<(), nazo_http_actix::FapiSignatureVerificationError>>
-    {
+    ) -> nazo_oauth_server::contracts::fapi_resource::FapiFuture<
+        'a,
+        Result<(), nazo_oauth_server::contracts::fapi_resource::FapiSignatureVerificationError>,
+    > {
         panic!("missing token must stop before signature verification")
     }
 
     fn response_signature(
         &self,
     ) -> Result<
-        Arc<dyn nazo_http_actix::FapiResponseSignature>,
-        nazo_http_actix::FapiSignatureOperationError,
+        Arc<dyn nazo_oauth_server::contracts::fapi_resource::FapiResponseSignature>,
+        nazo_oauth_server::contracts::fapi_resource::FapiSignatureOperationError,
     > {
         self.calls.lock().unwrap().push("response_signature");
-        Err(nazo_http_actix::FapiSignatureOperationError::Unavailable)
+        Err(nazo_oauth_server::contracts::fapi_resource::FapiSignatureOperationError::Unavailable)
     }
 }
 
@@ -614,7 +626,7 @@ struct RecordingFapiSigner {
     bases: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-impl nazo_http_actix::FapiResponseSignature for RecordingFapiSigner {
+impl nazo_oauth_server::contracts::fapi_resource::FapiResponseSignature for RecordingFapiSigner {
     fn kid(&self) -> &str {
         "response-key"
     }
@@ -624,9 +636,9 @@ impl nazo_http_actix::FapiResponseSignature for RecordingFapiSigner {
     fn sign<'a>(
         &'a self,
         signature_base: &'a [u8],
-    ) -> nazo_http_actix::FapiFuture<
+    ) -> nazo_oauth_server::contracts::fapi_resource::FapiFuture<
         'a,
-        Result<Vec<u8>, nazo_http_actix::FapiSignatureOperationError>,
+        Result<Vec<u8>, nazo_oauth_server::contracts::fapi_resource::FapiSignatureOperationError>,
     > {
         self.bases.lock().unwrap().push(signature_base.to_vec());
         Box::pin(async { Ok(vec![7; 64]) })
@@ -638,7 +650,9 @@ struct RecordingFapiSignatures {
     signer: Arc<RecordingFapiSigner>,
 }
 
-impl nazo_http_actix::FapiHttpMessageSignatures for RecordingFapiSignatures {
+impl nazo_oauth_server::contracts::fapi_resource::FapiHttpMessageSignatures
+    for RecordingFapiSignatures
+{
     fn enabled(&self) -> bool {
         self.calls.lock().unwrap().push("enabled");
         true
@@ -648,15 +662,17 @@ impl nazo_http_actix::FapiHttpMessageSignatures for RecordingFapiSignatures {
         _tenant_id: &'a str,
         _client_id: &'a str,
         _input: &'a nazo_http_signatures::VerifiedInput,
-    ) -> nazo_http_actix::FapiFuture<'a, Result<(), nazo_http_actix::FapiSignatureVerificationError>>
-    {
+    ) -> nazo_oauth_server::contracts::fapi_resource::FapiFuture<
+        'a,
+        Result<(), nazo_oauth_server::contracts::fapi_resource::FapiSignatureVerificationError>,
+    > {
         panic!("no token must skip request signature verification")
     }
     fn response_signature(
         &self,
     ) -> Result<
-        Arc<dyn nazo_http_actix::FapiResponseSignature>,
-        nazo_http_actix::FapiSignatureOperationError,
+        Arc<dyn nazo_oauth_server::contracts::fapi_resource::FapiResponseSignature>,
+        nazo_oauth_server::contracts::fapi_resource::FapiSignatureOperationError,
     > {
         self.calls.lock().unwrap().push("response_signature");
         Ok(self.signer.clone())
@@ -698,18 +714,20 @@ async fn framework_boundary_transport_fapi_signed_error_preserves_body_and_conte
     );
     assert!(response.headers().contains_key("signature-input"));
     assert!(response.headers().contains_key("signature"));
-    let signature_base = bases.lock().unwrap();
-    assert_eq!(signature_base.len(), 1);
-    assert!(
-        signature_base[0]
-            .windows(b"content-digest".len())
-            .any(|window| window == b"content-digest")
-    );
-    assert!(
-        signature_base[0]
-            .windows(b"@status".len())
-            .any(|window| window == b"@status")
-    );
+    {
+        let signature_base = bases.lock().unwrap();
+        assert_eq!(signature_base.len(), 1);
+        assert!(
+            signature_base[0]
+                .windows(b"content-digest".len())
+                .any(|window| window == b"content-digest")
+        );
+        assert!(
+            signature_base[0]
+                .windows(b"@status".len())
+                .any(|window| window == b"@status")
+        );
+    }
     assert_eq!(ready_body_bytes(response).await, expected_body);
 }
 
@@ -791,12 +809,13 @@ async fn framework_boundary_transport_dpop_nonce_then_replay_store_order() {
         .uri("/token")
         .insert_header(("dpop", proof_without_nonce))
         .to_http_request();
-    let first = http::dpop::validate_dpop_proof_with_store(
+    let first = nazo_oauth_server::security::dpop::validate_dpop_proof(
         &store,
+        crate::http::authorization::test_support::test_security_audit(),
         "https://issuer.example",
         "https://mtls.example",
         DpopNoncePolicy::Required,
-        &req,
+        http::dpop::dpop_request_facts(&req),
         None,
         None,
     )
@@ -818,12 +837,13 @@ async fn framework_boundary_transport_dpop_nonce_then_replay_store_order() {
         .insert_header(("dpop", proof))
         .to_http_request();
     assert!(
-        http::dpop::validate_dpop_proof_with_store(
+        nazo_oauth_server::security::dpop::validate_dpop_proof(
             &store,
+            crate::http::authorization::test_support::test_security_audit(),
             "https://issuer.example",
             "https://mtls.example",
             DpopNoncePolicy::Required,
-            &req,
+            http::dpop::dpop_request_facts(&req),
             None,
             None
         )
@@ -832,12 +852,13 @@ async fn framework_boundary_transport_dpop_nonce_then_replay_store_order() {
         .is_some()
     );
     assert!(matches!(
-        http::dpop::validate_dpop_proof_with_store(
+        nazo_oauth_server::security::dpop::validate_dpop_proof(
             &store,
+            crate::http::authorization::test_support::test_security_audit(),
             "https://issuer.example",
             "https://mtls.example",
             DpopNoncePolicy::Required,
-            &req,
+            http::dpop::dpop_request_facts(&req),
             None,
             None
         )
@@ -862,12 +883,13 @@ async fn framework_boundary_transport_dpop_ath_and_htu_fail_before_state_port() 
         .insert_header(("dpop", wrong_htu))
         .to_http_request();
     assert!(matches!(
-        http::dpop::validate_dpop_proof_with_store(
+        nazo_oauth_server::security::dpop::validate_dpop_proof(
             &store,
+            crate::http::authorization::test_support::test_security_audit(),
             "https://issuer.example",
             "https://mtls.example",
             DpopNoncePolicy::Optional,
-            &req,
+            http::dpop::dpop_request_facts(&req),
             None,
             None
         )
@@ -881,12 +903,13 @@ async fn framework_boundary_transport_dpop_ath_and_htu_fail_before_state_port() 
         .insert_header(("dpop", missing_ath))
         .to_http_request();
     assert!(matches!(
-        http::dpop::validate_dpop_proof_with_store(
+        nazo_oauth_server::security::dpop::validate_dpop_proof(
             &store,
+            crate::http::authorization::test_support::test_security_audit(),
             "https://issuer.example",
             "https://mtls.example",
             DpopNoncePolicy::Optional,
-            &req,
+            http::dpop::dpop_request_facts(&req),
             Some("access-token"),
             None
         )
@@ -1032,12 +1055,14 @@ impl nazo_auth::SectorIdentifierResolverPort for RegistrationSecurity {
     }
 }
 
-impl nazo_http_actix::RemoteJwksResolverPort for RegistrationSecurity {
+impl nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksResolverPort
+    for RegistrationSecurity
+{
     fn resolve<'a>(
         &'a self,
         _uri: &'a str,
         _expected_kid: Option<&'a str>,
-    ) -> nazo_http_actix::RemoteJwksFuture<'a> {
+    ) -> nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksFuture<'a> {
         Box::pin(async { Ok(json!({"keys": []})) })
     }
 }
@@ -1088,7 +1113,9 @@ impl nazo_auth::ClientSecretDigesterPort for RegistrationSecurity {
     }
 }
 
-impl nazo_http_actix::DynamicRegistrationRequestGuard for RegistrationSecurity {
+impl nazo_oauth_server::contracts::dynamic_client_registration::DynamicRegistrationRequestGuard
+    for RegistrationSecurity
+{
     fn accepts_new_requests(&self) -> bool {
         true
     }
@@ -1098,11 +1125,11 @@ impl nazo_http_actix::DynamicRegistrationRequestGuard for RegistrationSecurity {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<(), nazo_http_actix::DynamicRegistrationRateLimitError>,
+                    Output = Result<(), nazo_oauth_server::contracts::dynamic_client_registration::DynamicRegistrationRateLimitError>,
                 > + Send
                 + 'a,
         >,
-    > {
+    >{
         Box::pin(async { Ok(()) })
     }
     fn audit(&self, _event: &'static str, _client: &nazo_auth::OAuthClient, _source_ip: &str) {}
@@ -1112,16 +1139,16 @@ fn cas_registration_endpoint(
     store: CasRegistrationStore,
     security: RegistrationSecurity,
 ) -> nazo_http_actix::DynamicRegistrationEndpoint {
-    nazo_http_actix::DynamicRegistrationEndpoint::new(
-        nazo_http_actix::DynamicRegistrationEndpointConfig {
+    let application = Arc::new(nazo_oauth_server::domain::dynamic_registration::DynamicRegistrationApplication::new(
+        nazo_oauth_server::domain::dynamic_registration::DynamicRegistrationConfig {
             tenant: nazo_identity::TenantContext::default_system(),
             issuer: "https://issuer.example".to_owned(),
             default_audience: "https://api.example".to_owned(),
             pairwise_subject_secret: None,
             client_secret_pepper: "pepper".to_owned(),
             initial_access_token: Some("initial-token".to_owned()),
-            client_ip_header_mode: ClientIpHeaderMode::None,
-            trusted_proxy_cidrs: Vec::new(),
+            rate_limit_window_seconds: 60,
+            rate_limit_max_requests: 100,
             id_token_signing_algs: vec!["RS256", "PS256"],
             response_signing_algs: vec!["RS256", "PS256"],
             request_object_encryption_algs: vec!["RSA-OAEP-256"],
@@ -1129,13 +1156,17 @@ fn cas_registration_endpoint(
         },
         Arc::new(store),
         Arc::new(security.clone()),
-        nazo_http_actix::DynamicRegistrationSecurityServices::new(
+        nazo_oauth_server::contracts::dynamic_client_registration::DynamicRegistrationSecurityServices::new(
             Arc::new(security.clone()),
             Arc::new(security.clone()),
             Arc::new(security.clone()),
             Arc::new(security.clone()),
         ),
         Arc::new(security),
+    ));
+    nazo_http_actix::DynamicRegistrationEndpoint::new(
+        application,
+        nazo_http_actix::ClientIpConfig::new(&[], ClientIpHeaderMode::None),
     )
 }
 
@@ -1316,8 +1347,6 @@ async fn framework_boundary_transport_dcr_put_stale_cas_preserves_registration()
     );
 }
 mod real_userinfo_contract {
-    use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
-    use crate::domain::{ServerUserinfoOperations, UserinfoConfig, UserinfoHandles};
     use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
     use actix_web::{
         HttpRequest, HttpResponse,
@@ -1331,7 +1360,13 @@ mod real_userinfo_contract {
     };
     use diesel_async::RunQueryDsl;
     use nazo_auth::*;
+    use nazo_identity::DEFAULT_ORGANIZATION_ID;
+    use nazo_identity::DEFAULT_REALM_ID;
+    use nazo_identity::DEFAULT_TENANT_ID;
     use nazo_identity::SubjectClaims;
+    use nazo_oauth_server::domain::userinfo::{
+        ServerUserinfoOperations, UserinfoConfig, UserinfoHandles,
+    };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -1446,7 +1481,7 @@ mod real_userinfo_contract {
         let token_state: Arc<dyn TokenStateStorePort> = Arc::new(
             nazo_valkey::TokenIssuanceStateAdapter::new(&state.valkey_connection()),
         );
-        let service = crate::http::token::ServerTokenService::new(
+        let service = nazo_oauth_server::services::ServerTokenService::new(
             ObservedRepository {
                 inner: nazo_postgres::TokenIssuanceRepository::new(state.diesel_db.clone()),
                 calls,
@@ -1456,16 +1491,25 @@ mod real_userinfo_contract {
         );
         let handles = UserinfoHandles::new(
             Arc::new(NoDpopState),
+            crate::http::authorization::test_support::test_security_audit_arc(),
             state.keyset.clone(),
-            UserinfoConfig::from(state.settings.as_ref()),
+            UserinfoConfig::new(
+                state.settings.endpoint.issuer.as_str(),
+                state.settings.protocol.default_audience.as_str(),
+                state.settings.endpoint.mtls_endpoint_base_url.as_str(),
+                state.settings.protocol.dpop_nonce_policy,
+            ),
             Arc::new(
-                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
                     .unwrap(),
             ),
         );
-        Data::new(nazo_http_actix::UserinfoEndpoint::new(Arc::new(
-            ServerUserinfoOperations::new(Arc::new(service), handles),
-        )))
+        Data::new(nazo_http_actix::UserinfoEndpoint::new(
+            Arc::new(ServerUserinfoOperations::new(Arc::new(service), handles)),
+            Arc::new(crate::http::mtls::ServerMtlsThumbprintExtractor::new(
+                state.settings.endpoint.trusted_proxy_cidrs.clone(),
+            )),
+        ))
     }
 
     fn request(token: &str, dpop: &str) -> HttpRequest {
@@ -1686,6 +1730,7 @@ mod fapi_signed_contract {
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
     use nazo_http_actix::*;
     use nazo_http_signatures::*;
+    use nazo_oauth_server::contracts::fapi_resource::*;
     use nazo_resource_server::*;
     use std::sync::{Arc, Mutex};
 
@@ -1704,7 +1749,7 @@ mod fapi_signed_contract {
         calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    impl FapiMtlsThumbprintResolver for Ports {
+    impl nazo_http_actix::mtls::MtlsThumbprintExtractor for Ports {
         fn resolve(&self, _: &HttpRequest) -> Option<String> {
             self.calls.lock().unwrap().push("mtls");
             None
@@ -2015,14 +2060,6 @@ mod fapi_signed_contract {
 }
 
 mod ciba_device_contract {
-    use crate::domain::ClientRow;
-    use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
-    use crate::http::token::ciba::{
-        CIBA_GRANT_TYPE, CibaHttpConfig, CibaTokenContext, CibaTokenHandles, ServerCibaService,
-        token_ciba,
-    };
-    use crate::http::token::issue::{TokenIssuanceConfig, TokenIssuanceContext};
-    use crate::http::token::{ServerTokenService, TokenForm};
     use crate::test_support::{
         ClientSigningFixture, TestInfrastructure, client_signing_fixture, valkey::valkey_set_ex,
     };
@@ -2038,6 +2075,17 @@ mod ciba_device_contract {
     };
     use diesel_async::RunQueryDsl;
     use nazo_auth::{CibaAuthenticationContext, CibaRequestState, CibaStatus};
+    use nazo_identity::DEFAULT_ORGANIZATION_ID;
+    use nazo_identity::DEFAULT_REALM_ID;
+    use nazo_identity::DEFAULT_TENANT_ID;
+    use nazo_oauth_server::contracts::token_forms::TokenForm;
+    use nazo_oauth_server::domain::rows::ClientRow;
+    use nazo_oauth_server::services::ServerCibaService;
+    use nazo_oauth_server::services::ServerTokenService;
+    use nazo_oauth_server::token::ciba::{
+        CIBA_GRANT_TYPE, CibaTokenContext, CibaTokenHandles, token_ciba,
+    };
+    use nazo_oauth_server::token::issue::TokenIssuanceContext;
     use nazo_postgres::get_conn;
     use nazo_valkey::CibaStore;
     use serde_json::{Value, json};
@@ -2247,7 +2295,7 @@ mod ciba_device_contract {
     }
 
     async fn store_device_session(state: &TestInfrastructure, session_id: &str, user_id: Uuid) {
-        let payload = crate::http::sessions::SessionPayload {
+        let payload = nazo_oauth_server::sessions::SessionPayload {
             user_id,
             auth_time: Utc::now().timestamp(),
             amr: vec!["pwd".to_owned()],
@@ -2276,7 +2324,7 @@ mod ciba_device_contract {
             Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
             state.keyset.clone(),
         );
-        let config = TokenIssuanceConfig::from(state.settings.as_ref());
+        let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
         let modules = state.active_module_snapshot();
         let authorization =
             crate::http::token::issue::test_support::test_authorization_service(state);
@@ -2284,31 +2332,50 @@ mod ciba_device_contract {
             config: &config,
             modules: &modules,
             authorization: &authorization,
+            security_audit: crate::http::authorization::test_support::test_security_audit(),
             remote_client_documents: crate::test_support::test_remote_client_documents(),
         };
         let handles = CibaTokenHandles::new(
-            Data::new(ServerCibaService::new(Arc::new(CibaStore::new(
+            Arc::new(ServerCibaService::new(Arc::new(CibaStore::new(
                 &connection,
             )))),
-            Data::from(
-                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone()))
-                    as Arc<dyn nazo_persistence::CibaAccountStore>,
-            ),
-            Data::new(CibaHttpConfig::from(state.settings.as_ref())),
+            Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
+            Arc::new(crate::http::token::ciba::ciba_config(
+                state.settings.as_ref(),
+            )),
         );
-        token_ciba(
-            CibaTokenContext {
-                token_service: &token_service,
-                issuance: &issuance,
-                handles: &handles,
-                request: &req,
-            },
-            client,
-            &ciba_token_form(id),
-            None,
-            "private_key_jwt",
+        let client_ip = nazo_http_actix::ClientIpConfig::new(
+            &state.settings.endpoint.trusted_proxy_cidrs,
+            state.settings.endpoint.client_ip_header_mode,
+        );
+        let facts = crate::http::token::dispatch::token_request_facts(&req, &client_ip);
+        present_token_result(
+            token_ciba(
+                CibaTokenContext {
+                    token_service: &token_service,
+                    issuance: &issuance,
+                    handles: &handles,
+                    request: &facts,
+                },
+                client,
+                &ciba_token_form(id),
+                None,
+                "private_key_jwt",
+            )
+            .await,
         )
-        .await
+    }
+
+    fn present_token_result(
+        result: Result<
+            nazo_oauth_server::contracts::token_endpoint::TokenEndpointSuccess,
+            nazo_oauth_server::contracts::oauth_error::OAuthEndpointError,
+        >,
+    ) -> HttpResponse {
+        match result {
+            Ok(success) => nazo_http_actix::token_endpoint_success_response(success),
+            Err(error) => nazo_http_actix::oauth_endpoint_error_response(error),
+        }
     }
 
     #[derive(Debug)]
@@ -2456,10 +2523,10 @@ mod ciba_device_contract {
 
     #[actix_web::test]
     async fn real_device_decision_csrf_session_preserve_state_then_deny_wire() {
-        use crate::http::token::device::{
-            DeviceDecisionForm, DeviceDecisionHandles, ServerDeviceGrantService, device_decision,
-        };
+        use crate::http::token::device::{DeviceDecisionForm, device_decision};
         use crate::http::token::device_config::DeviceHttpConfig;
+        use nazo_oauth_server::services::ServerDeviceGrantService;
+        use nazo_oauth_server::token::device::DeviceDecisionHandles;
         let state = super::live_transport_state().await;
         let user = Uuid::now_v7();
         insert_ciba_user(&state, user).await;
@@ -2490,17 +2557,37 @@ mod ciba_device_contract {
             state.settings.as_ref(),
         )
         .expect("runtime");
+        let sessions =
+            Data::new(crate::http::sessions::test_support::profile_session_handles(&state));
+        let config = Data::new(DeviceHttpConfig::from(state.settings.as_ref()));
+        let rate_limit = &state.settings.identity.rate_limit;
         let handles = Data::new(DeviceDecisionHandles::new(
-            Data::new(crate::http::token::issue::test_support::test_authorization_service(&state)),
-            Data::new(service),
-            Data::from(Arc::new(nazo_postgres::AuthorizationFlowRepository::new(
+            Arc::new(crate::http::token::issue::test_support::test_authorization_service(&state)),
+            Arc::new(service),
+            Arc::new(nazo_postgres::AuthorizationFlowRepository::new(
                 state.diesel_db.clone(),
                 DEFAULT_TENANT_ID,
-            ))
-                as Arc<dyn nazo_auth::DeviceGrantRepositoryPort>),
-            Data::new(crate::http::sessions::test_support::profile_session_handles(&state)),
-            Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
-            Data::from(runtime),
+            )),
+            Arc::new(
+                crate::http::token::device_config::device_config_from_settings(
+                    state.settings.as_ref(),
+                ),
+            ),
+            runtime.snapshot_store(),
+            Arc::new(
+                crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                    .expect("empty resolver should build"),
+            ),
+            Arc::new(
+                nazo_oauth_server::rate_limit::TokenManagementRequestLimiter::new(
+                    Arc::new(nazo_valkey::RateLimitStore::new(&state.valkey_connection())),
+                    rate_limit.window_seconds,
+                    rate_limit.token_management_max_requests,
+                ),
+            ),
+            Arc::new(crate::adapters::audit::TenantSecurityAudit::new(
+                state.settings.tenant.context.tenant_id,
+            )),
         ));
         let check_state = ServerDeviceGrantService::new(Arc::new(nazo_valkey::DeviceStore::new(
             &state.valkey_connection(),
@@ -2533,9 +2620,17 @@ mod ciba_device_contract {
                 json!({"user_code":code,"decision":"deny","csrf_token":csrf}),
             )
             .expect("device form");
-            let response =
-                wire(device_decision(handles.clone(), request.to_http_request(), Form(form)).await)
-                    .await;
+            let response = wire(
+                device_decision(
+                    handles.clone(),
+                    sessions.clone(),
+                    config.clone(),
+                    request.to_http_request(),
+                    Form(form),
+                )
+                .await,
+            )
+            .await;
             assert_eq!(response.status, expected_status, "{response:?}");
             if expected_status == 400 {
                 assert_eq!(response.headers, json_headers(false, false));
@@ -2614,8 +2709,8 @@ mod ciba_device_contract {
     }
     #[actix_web::test]
     async fn real_persisted_idempotent_issuance_raw_bytes_and_header_difference() {
-        use crate::http::token::issue::issue_token_response;
         use nazo_auth::{TokenIssuanceMode, TokenRepositoryPort};
+        use nazo_oauth_server::token::issue::issue_token_response;
         let (state, client) = ciba_fixture().await;
         let user = Uuid::now_v7();
         insert_ciba_user(&state, user).await;
@@ -2626,7 +2721,7 @@ mod ciba_device_contract {
             Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
             state.keyset.clone(),
         );
-        let config = TokenIssuanceConfig::from(state.settings.as_ref());
+        let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
         let modules = state.active_module_snapshot();
         let authorization =
             crate::http::token::issue::test_support::test_authorization_service(&state);
@@ -2634,11 +2729,12 @@ mod ciba_device_contract {
             config: &config,
             modules: &modules,
             authorization: &authorization,
+            security_audit: crate::http::authorization::test_support::test_security_audit(),
             remote_client_documents: crate::test_support::test_remote_client_documents(),
         };
         let grant = format!("golden-idempotent-{}", Uuid::now_v7());
         let auth_time = Utc::now().timestamp();
-        let issue = || crate::domain::TokenIssue {
+        let issue = || nazo_oauth_server::domain::oauth::TokenIssue {
             user_id: Some(user),
             subject: user.to_string(),
             scopes: vec!["openid".into()],
@@ -2655,7 +2751,8 @@ mod ciba_device_contract {
             id_token_claim_requests: Vec::new(),
             refresh_id_token_sid: None,
             include_refresh: false,
-            refresh_token_policy: crate::domain::RefreshTokenPolicy::PreserveExisting,
+            refresh_token_policy:
+                nazo_oauth_server::domain::oauth::RefreshTokenPolicy::PreserveExisting,
             dpop_jkt: None,
             refresh_token_dpop_jkt: None,
             mtls_x5t_s256: Some(ciba_test_mtls_certificate().thumbprint.clone()),
@@ -2667,7 +2764,7 @@ mod ciba_device_contract {
             issued_token_type: None,
             native_sso: None,
         };
-        let first = wire(
+        let first = wire(present_token_result(
             issue_token_response(
                 &context,
                 &service,
@@ -2678,7 +2775,7 @@ mod ciba_device_contract {
                 issue(),
             )
             .await,
-        )
+        ))
         .await;
         assert_eq!(first.status, 200, "{first:?}");
         assert_eq!(first.headers, json_headers(true, true));
@@ -2694,7 +2791,7 @@ mod ciba_device_contract {
                 .expect("durable response bytes"),
             first.body.as_slice()
         );
-        let replay = wire(
+        let replay = wire(present_token_result(
             issue_token_response(
                 &context,
                 &service,
@@ -2703,7 +2800,7 @@ mod ciba_device_contract {
                 issue(),
             )
             .await,
-        )
+        ))
         .await;
         assert_eq!(replay.status, 200, "{replay:?}");
         assert_eq!(replay.headers, json_headers(true, false));
@@ -2736,10 +2833,7 @@ mod ciba_device_contract {
 
 mod authorization_contract {
     use super::live_transport_state;
-    use crate::http::authorization::request::{
-        AuthorizationResponseRedirect, authorization_response_redirect_with_context,
-    };
-    use crate::http::authorization::{AuthorizationEndpoint, AuthorizationHttpConfig};
+    use crate::http::authorization::AuthorizationEndpoint;
     use crate::test_support::TestInfrastructure;
     use actix_web::{
         body::to_bytes,
@@ -2748,42 +2842,19 @@ mod authorization_contract {
         web::{Bytes, Data},
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use diesel::sql_query;
+    use diesel::sql_types::{Text, Uuid as SqlUuid};
+    use diesel_async::RunQueryDsl;
     use nazo_valkey::test_support::KeysInterface;
     use serde_json::{Value, json};
-    use std::sync::Arc;
 
     const CALLBACK: &str = "https://client.example/callback";
 
     fn endpoint(state: &TestInfrastructure) -> Data<AuthorizationEndpoint> {
-        let session = &state.settings.session;
-        Data::new(AuthorizationEndpoint::new(
-            Arc::new(crate::http::token::issue::test_support::test_authorization_service(state)),
-            Arc::new(AuthorizationHttpConfig::from(state.settings.as_ref())),
-            Arc::new(crate::http::sessions::AdminSessionHandles::from_port(
-                Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
-                state.settings.tenant.context.tenant_id,
-                crate::http::sessions::SessionHttpConfig::new(
-                    &session.session_cookie_name,
-                    &session.csrf_cookie_name,
-                    session.cookie_secure,
-                ),
-            )),
-            crate::runtime_modules::test_support::runtime_module_registry_for_test(
-                state.diesel_db.clone(),
-                &state.settings,
-            )
-            .expect("runtime module registry"),
-            Arc::new(
-                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
-                    .expect("resolver"),
-            ),
-            state.keyset.clone(),
-            state.settings.tenant.context.tenant_id.as_uuid(),
-            None,
-        ))
+        let dependencies =
+            crate::http::authorization::test_support::TestAuthorizationDependencies::new(state);
+        Data::new(dependencies.endpoint())
     }
-
     async fn client(
         state: &TestInfrastructure,
         jwks: Option<Value>,
@@ -2796,7 +2867,7 @@ mod authorization_contract {
             "jwks": jwks
         })).expect("registration request");
         let resolver =
-            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+            crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
                 .expect("resolver");
         let prepared = nazo_auth::prepare_client_registration(
             request,
@@ -2821,6 +2892,86 @@ mod authorization_contract {
         .await
         .expect("persist client");
         (client, secret)
+    }
+
+    async fn authorized_response(
+        state: &TestInfrastructure,
+        client: &nazo_auth::OAuthClient,
+        response_mode: &str,
+        state_value: &str,
+    ) -> actix_web::HttpResponse {
+        let user_id = uuid::Uuid::now_v7();
+        let sid = format!("t00-auth-{user_id}");
+        let now = chrono::Utc::now().timestamp();
+        let mut connection = nazo_postgres::get_conn(&state.diesel_db)
+            .await
+            .expect("authorization fixture DB connection");
+        sql_query(
+            "INSERT INTO users (id, tenant_id, realm_id, organization_id, username, email, \
+             password_hash, is_active, mfa_enabled, email_verified, role, admin_level) \
+             VALUES ($1, $2, $3, $4, $5, $6, 't00-auth-fixture', TRUE, FALSE, TRUE, 'user', 0)",
+        )
+        .bind::<SqlUuid, _>(user_id)
+        .bind::<SqlUuid, _>(nazo_identity::DEFAULT_TENANT_ID)
+        .bind::<SqlUuid, _>(nazo_identity::DEFAULT_REALM_ID)
+        .bind::<SqlUuid, _>(nazo_identity::DEFAULT_ORGANIZATION_ID)
+        .bind::<Text, _>(format!("t00-auth-{user_id}"))
+        .bind::<Text, _>(format!("t00-auth-{user_id}@example.test"))
+        .execute(&mut connection)
+        .await
+        .expect("authorization fixture user insert");
+        sql_query(
+            "INSERT INTO user_client_grants (tenant_id, user_id, client_id, first_authorized_at, \
+             last_authorized_at, last_scopes, last_authorization_details, authorization_count) \
+             VALUES ($1, $2, $3, now(), now(), '[\"openid\"]'::jsonb, '[]'::jsonb, 1)",
+        )
+        .bind::<SqlUuid, _>(nazo_identity::DEFAULT_TENANT_ID)
+        .bind::<SqlUuid, _>(user_id)
+        .bind::<SqlUuid, _>(client.id)
+        .execute(&mut connection)
+        .await
+        .expect("authorization fixture grant insert");
+        drop(connection);
+        let payload = nazo_oauth_server::sessions::SessionPayload {
+            user_id,
+            auth_time: now,
+            amr: vec!["pwd".to_owned()],
+            pending_mfa: false,
+            oidc_sid: Some(format!("oidc-{sid}")),
+        };
+        crate::test_support::valkey::valkey_set_ex(
+            &state.valkey,
+            nazo_valkey::test_support::state_storage_key(format!("oauth:session:{sid}")),
+            serde_json::to_string(&payload).expect("session serializes"),
+            state.settings.session.session_ttl_seconds,
+        )
+        .await
+        .expect("authorization fixture session insert");
+        let challenge = "A".repeat(43);
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("client_id", client.client_id.as_str()),
+                ("response_type", "code"),
+                ("redirect_uri", CALLBACK),
+                ("scope", "openid"),
+                ("state", state_value),
+                ("code_challenge", challenge.as_str()),
+                ("code_challenge_method", "S256"),
+                ("prompt", "none"),
+                ("response_mode", response_mode),
+            ])
+            .finish();
+        crate::http::authorization::request::authorize_get(
+            endpoint(state),
+            TestRequest::get()
+                .uri(&format!("/oauth/authorize?{query}"))
+                .cookie(actix_web::cookie::Cookie::new(
+                    state.settings.session.session_cookie_name.clone(),
+                    sid,
+                ))
+                .to_http_request(),
+        )
+        .await
     }
 
     #[actix_web::test]
@@ -2899,7 +3050,7 @@ mod authorization_contract {
         let state = live_transport_state().await;
         let rate_key = nazo_valkey::test_support::state_storage_key(format!(
             "oauth:rate:token_management:{}",
-            crate::adapters::security::blake3_hex("198.51.100.202")
+            nazo_oauth_server::crypto::blake3_hex("198.51.100.202")
         ));
         let previous: Option<u64> = state.valkey.get(&rate_key).await.unwrap();
         let response = crate::http::authorization::par::par(
@@ -2985,23 +3136,8 @@ mod authorization_contract {
     async fn t00_jarm_signature_and_all_claims_are_bound_to_database_client() {
         let state = live_transport_state().await;
         let (client, _) = client(&state, None).await;
-        let dependencies =
-            crate::http::authorization::test_support::TestAuthorizationDependencies::new(&state);
         let before = chrono::Utc::now().timestamp();
-        let response = authorization_response_redirect_with_context(
-            &dependencies.context(),
-            AuthorizationResponseRedirect {
-                redirect_uri: CALLBACK,
-                client_id: &client.client_id,
-                response_mode: Some("jwt"),
-                code: Some("golden-code"),
-                error: None,
-                state: Some("golden-state"),
-                oidc_sid: None,
-                client_policy: None,
-            },
-        )
-        .await;
+        let response = authorized_response(&state, &client, "jwt", "golden-state").await;
         assert_eq!(response.status(), StatusCode::FOUND);
         let location = url::Url::parse(
             response
@@ -3041,6 +3177,8 @@ mod authorization_contract {
         )
         .expect("real JARM signature and claims");
         let claims = decoded.claims;
+        let code = claims["code"].as_str().expect("real authorization code");
+        assert!(!code.is_empty());
         let issued = claims["iat"].as_i64().unwrap();
         assert!(issued >= before && issued <= chrono::Utc::now().timestamp());
         let jti = claims["jti"].as_str().unwrap();
@@ -3049,7 +3187,7 @@ mod authorization_contract {
             claims,
             json!({"iss": "https://issuer.example", "aud": client.client_id,
             "iat": issued, "nbf": issued, "exp": issued + state.settings.protocol.auth_code_ttl_seconds as i64,
-            "jti": jti, "code": "golden-code", "state": "golden-state"})
+            "jti": jti, "code": code, "state": "golden-state"})
         );
         assert!(to_bytes(response.into_body()).await.unwrap().is_empty());
     }
@@ -3058,22 +3196,7 @@ mod authorization_contract {
     async fn t00_form_post_exact_document_and_security_headers_bind_observed_nonce() {
         let state = live_transport_state().await;
         let (client, _) = client(&state, None).await;
-        let dependencies =
-            crate::http::authorization::test_support::TestAuthorizationDependencies::new(&state);
-        let response = authorization_response_redirect_with_context(
-            &dependencies.context(),
-            AuthorizationResponseRedirect {
-                redirect_uri: CALLBACK,
-                client_id: &client.client_id,
-                response_mode: Some("form_post"),
-                code: Some("code<&\"'"),
-                error: None,
-                state: Some("state<&\"'"),
-                oidc_sid: None,
-                client_policy: None,
-            },
-        )
-        .await;
+        let response = authorized_response(&state, &client, "form_post", "state<&\"'").await;
         assert_eq!(response.status(), StatusCode::OK);
         for (name, value) in [
             ("content-type", "text/html; charset=utf-8"),
@@ -3095,22 +3218,39 @@ mod authorization_contract {
         let nonce = csp.strip_prefix("default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action https://client.example; script-src 'nonce-")
             .and_then(|tail| tail.strip_suffix('\'')).expect("exact CSP structure");
         assert!(URL_SAFE_NO_PAD.decode(nonce).unwrap().len() >= 32);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        let document = std::str::from_utf8(&body).expect("form_post is UTF-8");
+        let code = document
+            .split("name=\"code\" value=\"")
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("real authorization code input");
+        assert!(!code.is_empty());
         let expected = format!(
-            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Continue</title></head><body><form method=\"post\" action=\"https://client.example/callback\">\n<input type=\"hidden\" name=\"code\" value=\"code&lt;&amp;&quot;&#x27;\">\n<input type=\"hidden\" name=\"state\" value=\"state&lt;&amp;&quot;&#x27;\">\n<input type=\"hidden\" name=\"iss\" value=\"https://issuer.example\">\n<noscript><button type=\"submit\">Continue</button></noscript></form><script nonce=\"{nonce}\">document.forms[0].submit();</script></body></html>"
+            "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Continue</title></head><body><form method=\"post\" action=\"https://client.example/callback\">\n<input type=\"hidden\" name=\"code\" value=\"{code}\">\n<input type=\"hidden\" name=\"state\" value=\"state&lt;&amp;&quot;&#x27;\">\n<input type=\"hidden\" name=\"iss\" value=\"https://issuer.example\">\n<noscript><button type=\"submit\">Continue</button></noscript></form><script nonce=\"{nonce}\">document.forms[0].submit();</script></body></html>"
         );
-        assert_eq!(
-            to_bytes(response.into_body()).await.unwrap().as_ref(),
-            expected.as_bytes()
+        assert_eq!(body.as_ref(), expected.as_bytes());
+
+        let escaped = nazo_http_actix::form_post_authorization_response(
+            CALLBACK,
+            &[
+                ("code".to_owned(), "code<&\"'".to_owned()),
+                ("state".to_owned(), "state<&\"'".to_owned()),
+                ("iss".to_owned(), "https://issuer.example".to_owned()),
+            ],
+            None,
+            nonce,
         );
+        let escaped_body = to_bytes(escaped.into_body()).await.unwrap();
+        let escaped_expected = expected.replace(
+            &format!("name=\"code\" value=\"{code}\""),
+            "name=\"code\" value=\"code&lt;&amp;&quot;&#x27;\"",
+        );
+        assert_eq!(escaped_body.as_ref(), escaped_expected.as_bytes());
     }
 }
 mod mtls_real_boundary {
-    use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
-    use crate::http::token::client_auth::{
-        ClientAuthConfig, ClientAuthRequestFacts, TokenManagementClientAuthError,
-        authenticate_client_with_dependencies,
-    };
-    use crate::{domain::ServerFapiMtlsResolver, http::mtls};
+    use crate::http::mtls::{self, ServerMtlsThumbprintExtractor};
     use actix_web::{App, HttpRequest, HttpResponse, HttpServer, web::Data};
     use base64::{
         Engine as _,
@@ -3121,7 +3261,15 @@ mod mtls_real_boundary {
         sql_types::{Text, Uuid as SqlUuid},
     };
     use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
-    use nazo_http_actix::{FapiMtlsThumbprintResolver, IpCidr};
+    use nazo_http_actix::IpCidr;
+    use nazo_http_actix::mtls::MtlsThumbprintExtractor;
+    use nazo_identity::DEFAULT_ORGANIZATION_ID;
+    use nazo_identity::DEFAULT_REALM_ID;
+    use nazo_identity::DEFAULT_TENANT_ID;
+    use nazo_oauth_server::token::client_auth::{
+        ClientAuthConfig, ClientAuthRequestFacts, TokenManagementClientAuthError,
+        authenticate_client_with_dependencies,
+    };
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose,
         IsCa, KeyPair, KeyUsagePurpose,
@@ -3189,7 +3337,7 @@ mod mtls_real_boundary {
                 .route(
                     "/identity",
                     actix_web::web::get().to(|request: HttpRequest| async move {
-                        let resolver = ServerFapiMtlsResolver::new(Vec::new());
+                        let resolver = ServerMtlsThumbprintExtractor::new(Vec::new());
                         HttpResponse::Ok().body(
                             resolver
                                 .resolve(&request)
@@ -3266,7 +3414,7 @@ mod mtls_real_boundary {
         let state = super::live_transport_state().await;
         let material = material();
         let trusted = vec![IpCidr::parse("192.0.2.0/24").unwrap()];
-        let resolver = ServerFapiMtlsResolver::new(trusted.clone());
+        let resolver = ServerMtlsThumbprintExtractor::new(trusted.clone());
         let certificate_header = format!(":{}:", STANDARD.encode(material.leaf.der()));
         let make_request = |peer: &str| {
             actix_web::test::TestRequest::post()
@@ -3323,7 +3471,7 @@ mod mtls_real_boundary {
             .unwrap()
             .unwrap();
         let valkey = state.valkey_connection();
-        let service = crate::http::authorization::ServerAuthorizationService::new(
+        let service = nazo_oauth_server::services::ServerAuthorizationService::new(
             nazo_postgres::AuthorizationFlowRepository::new(
                 state.diesel_db.clone(),
                 DEFAULT_TENANT_ID,
@@ -3335,8 +3483,9 @@ mod mtls_real_boundary {
             &state.settings.endpoint.issuer,
             &state.settings.protocol.client_secret_pepper,
             crate::test_support::test_remote_client_documents(),
+            crate::http::authorization::test_support::test_security_audit(),
         );
-        let credentials = crate::adapters::security::ClientCredentials {
+        let credentials = nazo_auth::PresentedClientCredentials {
             client_id: Some(name),
             client_secret: None,
             client_assertion: None,

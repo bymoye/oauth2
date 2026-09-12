@@ -20,7 +20,6 @@ use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
 use nazo_digital_credentials::{CredentialFormat, VcIssuerTrustPolicy};
-use nazo_http_actix::OAuthJsonErrorFields;
 use nazo_key_management::{
     KeyManager, KeySettings, LocalKeyRegistration, Openid4vcMaterial, Openid4vcPublicMaterial,
 };
@@ -30,25 +29,26 @@ use rcgen::{
 };
 use serde_json::{Value, json};
 
-use crate::{
-    config::ConfigSource,
-    domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID},
-    domain::{
-        CredentialDatasetAdminService, Openid4vcCredentialCrypto, Openid4vcProofValidator,
-        PutCredentialDatasetRequest, ServerCredentialIssuerOperations,
-    },
-    http::{
-        authorization::ServerAuthorizationService,
-        sessions::{AdminSessionHandles, SessionHttpConfig, SessionPayload},
-        token::ServerTokenService,
-    },
-    runtime_modules::test_support::runtime_module_registry_with_modules_for_test,
-    settings::Settings,
-    test_support::{
-        DatabaseUserFixture, TestInfrastructure, initialize_audit_dependencies,
-        valkey::valkey_set_ex,
-    },
-};
+use crate::config::ConfigSource;
+use crate::http::sessions::AdminSessionHandles;
+use crate::http::sessions::SessionHttpConfig;
+use crate::runtime_modules::test_support::runtime_module_registry_with_modules_for_test;
+use crate::settings::Settings;
+use crate::test_support::DatabaseUserFixture;
+use crate::test_support::TestInfrastructure;
+use crate::test_support::initialize_audit_dependencies;
+use crate::test_support::valkey::valkey_set_ex;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::openid4vc::Openid4vcCredentialCrypto;
+use nazo_oauth_server::domain::openid4vc::Openid4vcProofValidator;
+use nazo_oauth_server::domain::openid4vc_endpoints::CredentialDatasetAdminService;
+use nazo_oauth_server::domain::openid4vc_endpoints::PutCredentialDatasetRequest;
+use nazo_oauth_server::domain::openid4vc_endpoints::ServerCredentialIssuerOperations;
+use nazo_oauth_server::services::ServerAuthorizationService;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::sessions::SessionPayload;
 
 use nazo_postgres::{create_pool, get_conn};
 
@@ -149,7 +149,8 @@ impl LiveOpenid4vcAdminFixture {
         let crypto = Openid4vcCredentialCrypto::new_with_policies(
             key_manager.clone(),
             VcIssuerTrustPolicy::san_bound(),
-            crate::settings::Openid4vcRevocationPolicy::Disabled,
+            nazo_oauth_server::policy::Openid4vcRevocationPolicy::Disabled,
+            Arc::new(crate::adapters::mdoc_signer::TokioMdocDocumentSigner),
         )
         .expect("credential crypto should validate the generated chain");
 
@@ -203,7 +204,8 @@ impl LiveOpenid4vcAdminFixture {
                 [0x51; 32],
                 token_service,
                 authorization,
-                runtime,
+                runtime.snapshot_store(),
+                Arc::new(crate::bootstrap::RegistrationSecretHasher),
                 crypto.clone(),
                 proof_validator,
                 None,
@@ -281,14 +283,16 @@ impl LiveOpenid4vcAdminFixture {
 
     fn sessions(&self) -> Data<AdminSessionHandles> {
         let session = &self.state.settings.session;
-        Data::new(AdminSessionHandles::from_port(
-            Arc::new(nazo_valkey::SessionStore::new(
-                &self.state.valkey_connection(),
+        Data::new(AdminSessionHandles::new(
+            std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
+                Arc::new(nazo_valkey::SessionStore::new(
+                    &self.state.valkey_connection(),
+                )),
+                Arc::new(nazo_postgres::UserRepository::new(
+                    self.state.diesel_db.clone(),
+                )),
+                self.state.settings.tenant.context.tenant_id,
             )),
-            Arc::new(nazo_postgres::UserRepository::new(
-                self.state.diesel_db.clone(),
-            )),
-            self.state.settings.tenant.context.tenant_id,
             SessionHttpConfig::new(
                 &session.session_cookie_name,
                 &session.csrf_cookie_name,
@@ -378,7 +382,8 @@ impl LiveOpenid4vcAdminFixture {
             [0x51; 32],
             token_service,
             authorization,
-            runtime,
+            runtime.snapshot_store(),
+            Arc::new(crate::bootstrap::RegistrationSecretHasher),
             self.crypto.clone(),
             proof_validator,
             None,
@@ -394,8 +399,6 @@ impl LiveOpenid4vcAdminFixture {
 
 async fn credential_key_material() -> (KeyManager, String, String, String) {
     let settings = KeySettings {
-        external_command: Vec::new(),
-        external_timeout: StdDuration::from_secs(1),
         rotation_interval: chrono::Duration::days(1),
         prepublish_window: chrono::Duration::hours(1),
         verification_grace: chrono::Duration::hours(1),
@@ -463,10 +466,7 @@ async fn admin_dataset_mutations_fail_closed_on_csrf_and_recent_mfa() {
     .await;
     assert_eq!(missing_csrf.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        missing_csrf
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(missing_csrf).await.as_deref(),
         Some("invalid_request")
     );
 
@@ -490,10 +490,7 @@ async fn admin_dataset_mutations_fail_closed_on_csrf_and_recent_mfa() {
     .await;
     assert_eq!(no_mfa.status(), StatusCode::PRECONDITION_REQUIRED);
     assert_eq!(
-        no_mfa
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(no_mfa).await.as_deref(),
         Some("mfa_step_up_required")
     );
 
@@ -517,10 +514,7 @@ async fn admin_dataset_mutations_fail_closed_on_csrf_and_recent_mfa() {
     .await;
     assert_eq!(access_denied.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        access_denied
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(access_denied).await.as_deref(),
         Some("access_denied")
     );
 
@@ -684,4 +678,15 @@ async fn admin_dataset_handlers_round_trip_and_map_domain_errors() {
         .await
         .expect_err("disabled issuer must fail closed before persistence");
     assert_eq!(disabled_error.status, 503);
+}
+
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }

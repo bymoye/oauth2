@@ -1,4 +1,27 @@
-use crate::adapters::security::blake3_hex;
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
+use actix_web::http::StatusCode;
+use chrono::Utc;
+use nazo_oauth_server::contracts::token_forms::TokenForm;
+use nazo_oauth_server::crypto::blake3_hex;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
+use nazo_oauth_server::token::native_sso::DEVICE_SSO_SCOPE;
+use nazo_oauth_server::token::native_sso::NATIVE_SSO_DEVICE_SECRET_TYPE;
+use nazo_oauth_server::token::native_sso::NATIVE_SSO_ID_TOKEN_TYPE;
+use nazo_oauth_server::token::native_sso::decode_native_sso_id_token_with_service;
+use nazo_oauth_server::token::native_sso::native_sso_client_authorized;
+use nazo_oauth_server::token::native_sso::native_sso_device_secret_hash;
+use nazo_oauth_server::token::native_sso::native_sso_issue_binding;
+use nazo_oauth_server::token::native_sso::native_sso_profile_requested;
+use nazo_oauth_server::token::native_sso::native_sso_requested;
+use nazo_oauth_server::token::native_sso::native_sso_requested_scopes;
+use nazo_oauth_server::token::native_sso::native_sso_subject_for_client;
+use serde_json::Value;
+use serde_json::json;
+use uuid::Uuid;
 
 pub(crate) fn native_sso_device_secret_key(device_secret: &str) -> String {
     format!(
@@ -7,11 +30,9 @@ pub(crate) fn native_sso_device_secret_key(device_secret: &str) -> String {
     )
 }
 
-use super::*;
 use crate::config::ConfigSource;
 use crate::settings::Settings;
 use crate::test_support::TestInfrastructure;
-use nazo_http_actix::OAuthJsonErrorFields;
 use nazo_postgres::create_pool;
 
 use std::sync::Arc;
@@ -111,9 +132,9 @@ fn token_form() -> TokenForm {
 fn native_sso_client(scopes: Value) -> ClientRow {
     client_row! {
         id: Uuid::now_v7(),
-        tenant_id: crate::domain::tenancy::DEFAULT_TENANT_ID,
-        realm_id: crate::domain::tenancy::DEFAULT_REALM_ID,
-        organization_id: crate::domain::tenancy::DEFAULT_ORGANIZATION_ID,
+        tenant_id: nazo_identity::DEFAULT_TENANT_ID,
+        realm_id: nazo_identity::DEFAULT_REALM_ID,
+        organization_id: nazo_identity::DEFAULT_ORGANIZATION_ID,
         client_id: "native-client".to_owned(),
         client_name: "Native client".to_owned(),
         client_type: "confidential".to_owned(),
@@ -158,13 +179,14 @@ fn native_sso_client(scopes: Value) -> ClientRow {
 #[actix_web::test]
 async fn native_sso_issue_binding_enforces_client_sender_policy() {
     let state = native_sso_state_with_signing_key();
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = crate::http::token::issue::test_support::test_authorization_service(&state);
     let issuance = TokenIssuanceContext {
         config: &config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let request = actix_web::test::TestRequest::post()
@@ -173,42 +195,53 @@ async fn native_sso_issue_binding_enforces_client_sender_policy() {
 
     let client = native_sso_client(json!(["openid"]));
     assert_eq!(
-        native_sso_issue_binding(&issuance, &request, &client)
-            .await
-            .expect("a client without sender constraints may issue an unbound token"),
+        native_sso_issue_binding(
+            &issuance,
+            &crate::http::token::issue::test_support::token_request_facts(
+                &request,
+                state.settings.as_ref()
+            ),
+            &client
+        )
+        .await
+        .map_err(nazo_http_actix::oauth_endpoint_error_response)
+        .expect("a client without sender constraints may issue an unbound token"),
         (None, None)
     );
 
     let mut dpop_client = native_sso_client(json!(["openid"]));
     dpop_client.require_dpop_bound_tokens = true;
-    let response = native_sso_issue_binding(&issuance, &request, &dpop_client)
-        .await
-        .expect_err("a DPoP-required client must present proof");
+    let response = native_sso_issue_binding(
+        &issuance,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
+        &dpop_client,
+    )
+    .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
+    .expect_err("a DPoP-required client must present proof");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let mut mtls_client = native_sso_client(json!(["openid"]));
     mtls_client.require_mtls_bound_tokens = true;
-    let response = native_sso_issue_binding(&issuance, &request, &mtls_client)
-        .await
-        .expect_err("an mTLS-required client must present a verified certificate");
+    let response = native_sso_issue_binding(
+        &issuance,
+        &crate::http::token::issue::test_support::token_request_facts(
+            &request,
+            state.settings.as_ref(),
+        ),
+        &mtls_client,
+    )
+    .await
+    .map_err(nazo_http_actix::oauth_endpoint_error_response)
+    .expect_err("an mTLS-required client must present a verified certificate");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
-}
-
-#[test]
-fn native_sso_device_secret_hash_is_stable_and_non_raw() {
-    let first = native_sso_device_secret_hash("secret");
-    let second = native_sso_device_secret_hash("secret");
-
-    assert_eq!(first, second);
-    assert_ne!(first, "secret");
-    assert!(!first.contains('='));
 }
 
 #[test]
@@ -270,64 +303,9 @@ fn native_sso_scope_and_client_admission_are_fail_closed() {
 }
 
 #[test]
-fn native_sso_id_token_audience_requires_the_source_client() {
-    let base = NativeSsoIdTokenClaims {
-        iss: "https://issuer.example".to_owned(),
-        sub: "subject-1".to_owned(),
-        aud: json!("source-client"),
-        ds_hash: "hash".to_owned(),
-        sid: "sid-1".to_owned(),
-        auth_time: 1_700_000_000,
-        amr: vec!["pwd".to_owned()],
-    };
-    assert!(native_sso_id_token_audience_contains(
-        &base,
-        "source-client"
-    ));
-    assert!(!native_sso_id_token_audience_contains(
-        &base,
-        "other-client"
-    ));
-
-    let array = NativeSsoIdTokenClaims {
-        aud: json!(["other-client", "source-client"]),
-        ..base
-    };
-    assert!(native_sso_id_token_audience_contains(
-        &array,
-        "source-client"
-    ));
-    assert!(!native_sso_id_token_audience_contains(
-        &array,
-        "missing-client"
-    ));
-
-    let invalid = NativeSsoIdTokenClaims {
-        aud: json!(42),
-        ..array
-    };
-    assert!(!native_sso_id_token_audience_contains(
-        &invalid,
-        "source-client"
-    ));
-}
-
-#[test]
-fn new_native_sso_token_binding_requires_session_id() {
-    assert!(new_native_sso_token_binding(None).is_none());
-
-    let binding = new_native_sso_token_binding(Some("sid-1")).expect("sid should bind native SSO");
-    assert_eq!(binding.sid, "sid-1");
-    assert_eq!(
-        binding.ds_hash,
-        native_sso_device_secret_hash(&binding.device_secret)
-    );
-}
-
-#[test]
 fn native_sso_subject_policy_uses_client_specific_subject_mapping() {
     let state = native_sso_state_with_signing_key();
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let client = native_sso_client(json!(["openid", "offline_access", "device_sso"]));
     let subject = native_sso_subject_for_client(&config, Uuid::now_v7(), &client)
         .expect("configured public subject policy should map the user");

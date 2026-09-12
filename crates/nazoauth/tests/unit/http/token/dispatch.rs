@@ -1,11 +1,23 @@
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
+use nazo_oauth_server::crypto::blake3_hex;
+use nazo_oauth_server::domain::oauth::AuthorizationCodeState;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::ciba::CibaTokenHandles;
+use nazo_oauth_server::token::dispatch::{
+    Openid4vcTokenHandles, TokenCoreHandles, TokenEndpointHandles,
+};
 use nazo_valkey::test_support::authorization_code_storage_key as authorization_code_key;
 
 #[actix_web::test]
 async fn token_management_refreshes_only_requested_encryption_keys() {
-    use nazo_http_actix::{
-        TokenClientAuthForm, TokenIntrospectionRepresentation, TokenManagementError,
-        TokenManagementOperations, TokenManagementRequestFacts, TokenOnlyForm,
-        token_client_auth_transport_facts,
+    use nazo_http_actix::{TokenClientAuthForm, token_client_auth_transport_facts};
+    use nazo_oauth_server::contracts::token_forms::TokenOnlyForm;
+    use nazo_oauth_server::contracts::token_management::{
+        TokenIntrospectionRepresentation, TokenManagementError, TokenManagementOperations,
+        TokenManagementRequestFacts,
     };
     let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
         return;
@@ -27,16 +39,19 @@ async fn token_management_refreshes_only_requested_encryption_keys() {
         true,
     )
     .await;
-    let operations = crate::domain::ServerTokenManagementOperations::new(
-        token_service(&state).into_inner(),
-        authorization_service(&state).into_inner(),
-        Arc::new(crate::http::authorization::AuthorizationHttpConfig::from(
-            state.settings.as_ref(),
-        )),
-        Arc::new(
-            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[]).unwrap(),
-        ),
-    );
+    let operations =
+        nazo_oauth_server::domain::token_management::ServerTokenManagementOperations::new(
+            token_service(&state).into_inner(),
+            authorization_service(&state).into_inner(),
+            Arc::new(crate::http::authorization::authorization_config(
+                state.settings.as_ref(),
+            )),
+            Arc::new(
+                crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                    .unwrap(),
+            ),
+            crate::http::authorization::test_support::test_security_audit_arc(),
+        );
     let mut connection = get_conn(&state.diesel_db).await.unwrap();
     sql_query("UPDATE oauth_clients SET jwks_uri = 'https://invalid.example/jwks.json', jwks = '{\"keys\":[]}'::jsonb, introspection_encrypted_response_alg = 'RSA-OAEP-256', introspection_encrypted_response_enc = 'A256GCM' WHERE tenant_id = $1 AND client_id = $2")
         .bind::<SqlUuid, _>(DEFAULT_TENANT_ID).bind::<Text, _>(&client_id)
@@ -111,22 +126,20 @@ async fn token_management_refreshes_only_requested_encryption_keys() {
     );
 }
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
-use crate::domain::CodePayload;
 use crate::test_support::TestInfrastructure;
+use nazo_oauth_server::domain::oauth::CodePayload;
 
 use crate::settings::{Settings, TransportMode};
 
 use base64::Engine;
 
 use chrono::{Duration, Utc};
-
-use nazo_http_actix::OAuthJsonErrorFields;
 
 use serde_json::{Value, json};
 
@@ -149,7 +162,7 @@ pub(crate) async fn token(
         req,
         body,
         Arc::new(
-            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+            crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
                 .expect("empty remote document policy is valid"),
         ),
     )
@@ -160,7 +173,7 @@ async fn token_with_remote_documents(
     state: Data<TestInfrastructure>,
     req: HttpRequest,
     body: Bytes,
-    resolver: Arc<crate::domain::remote_client_documents::RemoteClientDocumentResolver>,
+    resolver: Arc<crate::adapters::remote_client_documents::RemoteClientDocumentResolver>,
 ) -> HttpResponse {
     let service = Data::new(ServerTokenService::new(
         crate::test_support::token_issuance_repository(state.diesel_db.clone()),
@@ -175,39 +188,49 @@ async fn token_with_remote_documents(
         Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
     ));
-    let ciba_service = Data::new(super::super::ciba::ServerCibaService::new(Arc::new(
-        nazo_valkey::CibaStore::new(&connection),
-    )));
+    let ciba_service = Data::new(nazo_oauth_server::services::ServerCibaService::new(
+        Arc::new(nazo_valkey::CibaStore::new(&connection)),
+    ));
     let ciba_users: Data<dyn nazo_persistence::CibaAccountStore> = Data::from(Arc::new(
         nazo_postgres::UserRepository::new(state.diesel_db.clone()),
     )
         as Arc<dyn nazo_persistence::CibaAccountStore>);
-    let ciba_config = Data::new(super::super::ciba::CibaHttpConfig::from(
+    let ciba_config = Arc::new(crate::http::token::ciba::ciba_config(
         state.settings.as_ref(),
     ));
-    let issuance_config = Data::new(TokenIssuanceConfig::from(state.settings.as_ref()));
-    let device_service = Data::new(super::super::device::ServerDeviceGrantService::new(
+    let issuance_config = Data::new(crate::http::token::issue::token_issuance_config(
+        state.settings.as_ref(),
+    ));
+    let device_service = Data::new(nazo_oauth_server::services::ServerDeviceGrantService::new(
         Arc::new(nazo_valkey::DeviceStore::new(&connection)),
     ));
-    let runtime_modules = Data::from(
-        crate::runtime_modules::test_support::runtime_module_registry_for_test(
-            state.diesel_db.clone(),
-            state.settings.as_ref(),
-        )
-        .expect("test runtime module registry should be valid"),
-    );
+    let runtime_modules = (crate::runtime_modules::test_support::runtime_module_registry_for_test(
+        state.diesel_db.clone(),
+        state.settings.as_ref(),
+    )
+    .expect("test runtime module registry should be valid"))
+    .snapshot_store();
     token_with_service(
         Data::new(TokenEndpointHandles::new(
             TokenCoreHandles {
-                token_service: service,
-                authorization_service,
-                device_service,
+                token_service: service.into_inner(),
+                authorization_service: authorization_service.into_inner(),
+                device_service: device_service.into_inner(),
+                security_audit: crate::http::authorization::test_support::test_security_audit_arc(),
             },
-            CibaTokenHandles::new(ciba_service, ciba_users, ciba_config),
-            issuance_config,
+            CibaTokenHandles::new(
+                ciba_service.into_inner(),
+                ciba_users.into_inner(),
+                ciba_config,
+            ),
+            issuance_config.into_inner(),
             runtime_modules,
             resolver,
             Openid4vcTokenHandles::default(),
+        )),
+        Data::new(nazo_http_actix::ClientIpConfig::new(
+            &state.settings.endpoint.trusted_proxy_cidrs,
+            state.settings.endpoint.client_ip_header_mode,
         )),
         req,
         body,
@@ -219,11 +242,18 @@ pub(crate) fn validate_token_request_profile(
     client: &ClientRow,
     auth_method: &str,
 ) -> Result<(), HttpResponse> {
-    super::validate_token_request_profile(client, auth_method)
+    nazo_oauth_server::token::dispatch::validate_token_request_profile(client, auth_method)
+        .map_err(nazo_http_actix::oauth_endpoint_error_response)
 }
 
-use super::*;
+use crate::http::token::dispatch::token_with_service;
 use crate::test_support::hash_client_secret_fixture as hash_client_secret;
+use actix_web::{
+    HttpRequest, HttpResponse,
+    http::{StatusCode, header},
+    web::{Bytes, Data},
+};
+use nazo_auth::CLIENT_ASSERTION_TYPE_JWT_BEARER;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -239,13 +269,13 @@ use fred::prelude::{
 use crate::config::ConfigSource;
 use nazo_postgres::{create_pool, get_conn};
 
-use crate::http::authorization::ServerAuthorizationService;
-use crate::http::sessions::SessionPayload;
 use crate::http::sessions::test_support::admin_session_handles;
-use crate::settings::AuthorizationServerProfile;
 use crate::test_support::valkey::valkey_del;
 use crate::test_support::valkey::valkey_set_ex;
 use nazo_http_actix::{IpCidr, UserinfoEndpoint};
+use nazo_oauth_server::policy::AuthorizationServerProfile;
+use nazo_oauth_server::services::ServerAuthorizationService;
+use nazo_oauth_server::sessions::SessionPayload;
 
 fn authorization_service(state: &TestInfrastructure) -> Data<ServerAuthorizationService> {
     let connection = state.valkey_connection();
@@ -273,12 +303,17 @@ async fn userinfo(state: Data<TestInfrastructure>, req: HttpRequest, body: Bytes
         Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let endpoint = Data::new(UserinfoEndpoint::new(Arc::new(
-        crate::domain::ServerUserinfoOperations::new(
-            Arc::new(token_service),
-            crate::domain::UserinfoHandles::from_test_infrastructure(state.get_ref()),
+    let endpoint = Data::new(UserinfoEndpoint::new(
+        Arc::new(
+            nazo_oauth_server::domain::userinfo::ServerUserinfoOperations::new(
+                Arc::new(token_service),
+                crate::domain::userinfo::userinfo_handles_from_test_infrastructure(state.get_ref()),
+            ),
         ),
-    )));
+        Arc::new(crate::http::mtls::ServerMtlsThumbprintExtractor::new(
+            state.settings.endpoint.trusted_proxy_cidrs.clone(),
+        )),
+    ));
     nazo_http_actix::userinfo(endpoint, req, body).await
 }
 
@@ -317,30 +352,6 @@ fn mtls_code_payload() -> CodePayload {
     }
 }
 
-fn settings(profile: AuthorizationServerProfile) -> Settings {
-    let mut settings =
-        Settings::from_config(&crate::config::ConfigSource::default()).expect("settings");
-    settings.protocol.authorization_server_profile = profile;
-    settings
-}
-
-fn unavailable_token_valkey() -> fred::prelude::Client {
-    let mut builder = ValkeyBuilder::from_config(
-        ValkeyConfig::from_url("redis://127.0.0.1:1").expect("unavailable Valkey URL should parse"),
-    );
-    builder.with_performance_config(|performance: &mut PerformanceConfig| {
-        performance.default_command_timeout = StdDuration::from_millis(200);
-    });
-    builder.with_connection_config(|connection: &mut ConnectionConfig| {
-        connection.connection_timeout = StdDuration::from_millis(200);
-        connection.internal_command_timeout = StdDuration::from_millis(200);
-        connection.max_command_attempts = 1;
-    });
-    builder
-        .build()
-        .expect("unavailable valkey client construction should not connect")
-}
-
 fn fixture_secret(label: &str) -> String {
     format!("token-dispatch-fixture-secret-{label}")
 }
@@ -369,20 +380,6 @@ fn parseable_invalid_client_assertion(client_id: &str) -> String {
         .to_string(),
     );
     format!("{header}.{payload}.signature")
-}
-
-fn unavailable_valkey_token_state(profile: AuthorizationServerProfile) -> TestInfrastructure {
-    TestInfrastructure {
-        diesel_db: create_pool(
-            "postgres://nazo_token_dispatch_invalid:nazo_token_dispatch_invalid@127.0.0.1:1/nazo"
-                .to_owned(),
-            1,
-        )
-        .expect("pool construction should not connect"),
-        valkey: unavailable_token_valkey(),
-        settings: Arc::new(settings(profile)),
-        keyset: crate::test_support::test_key_manager(),
-    }
 }
 
 async fn live_token_state(profile: AuthorizationServerProfile) -> Option<Data<TestInfrastructure>> {
@@ -688,12 +685,17 @@ async fn assert_token_error(
     www_authenticate: bool,
 ) {
     assert_eq!(response.status(), status);
-    assert_eq!(oauth_error_code(&response), error);
     assert_eq!(
         response.headers().contains_key(header::WWW_AUTHENTICATE),
         www_authenticate
     );
     let (actual_status, body) = token_json_body(response).await;
+    assert_eq!(
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        error
+    );
     assert_eq!(actual_status, status);
     assert_eq!(body["error"], error);
     assert!(body.get("access_token").is_none());
@@ -788,7 +790,7 @@ async fn valid_browser_session_cookie_cannot_authenticate_oauth_protocol_endpoin
 
     let userinfo_response = userinfo(state.clone(), request("/userinfo"), Bytes::new()).await;
     assert_eq!(userinfo_response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&userinfo_response), "invalid_token");
+    assert_eq!(oauth_error_code(userinfo_response).await, "invalid_token");
 
     let _ = valkey_del(&state.valkey, &session_key).await;
     let mut conn = get_conn(&state.diesel_db)
@@ -1062,101 +1064,6 @@ async fn token_endpoint_reports_mtls_bound_code_before_generic_client_auth_failu
         false,
     )
     .await;
-}
-
-#[actix_web::test]
-async fn missing_client_authorization_code_holder_check_fails_closed_when_valkey_is_unavailable() {
-    let state = unavailable_valkey_token_state(AuthorizationServerProfile::Oauth2Baseline);
-    let form = TokenForm {
-        grant_type: "authorization_code".to_owned(),
-        code: Some("code-unavailable".to_owned()),
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: Some("verifier".to_owned()),
-        refresh_token: None,
-        device_secret: None,
-        scope: None,
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    let service = authorization_service(&state);
-    let token_service = token_service(&state);
-    let response = missing_client_authorization_code_holder_error(
-        token_service.get_ref(),
-        service.get_ref(),
-        &form,
-    )
-    .await
-    .expect("authorization code state lookup failures must not be ignored");
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
-}
-
-#[actix_web::test]
-async fn missing_client_authorization_code_holder_check_fails_closed_when_client_lookup_errors() {
-    let Some(state) =
-        live_valkey_invalid_db_token_state(AuthorizationServerProfile::Oauth2Baseline).await
-    else {
-        return;
-    };
-    let code = format!("code-{}", Uuid::now_v7());
-    store_authorization_code_state(
-        &state,
-        &code,
-        &AuthorizationCodeState::Pending {
-            payload: code_payload(None),
-        },
-    )
-    .await;
-    let form = TokenForm {
-        grant_type: "authorization_code".to_owned(),
-        code: Some(code),
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: Some("verifier".to_owned()),
-        refresh_token: None,
-        device_secret: None,
-        scope: None,
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    let service = authorization_service(&state);
-    let token_service = token_service(&state);
-    let response = missing_client_authorization_code_holder_error(
-        token_service.get_ref(),
-        service.get_ref(),
-        &form,
-    )
-    .await
-    .expect("client lookup failures must not degrade to invalid_client");
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
 }
 
 #[actix_web::test]
@@ -1550,112 +1457,8 @@ async fn token_endpoint_returns_unsupported_grant_only_after_client_authenticati
 }
 
 #[actix_web::test]
-async fn missing_client_authorization_code_holder_error_returns_none_when_code_missing() {
-    let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
-        return;
-    };
-    let form = TokenForm {
-        grant_type: "authorization_code".to_owned(),
-        code: Some("missing-code".to_owned()),
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: Some("verifier".to_owned()),
-        refresh_token: None,
-        device_secret: None,
-        scope: None,
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    assert!(
-        missing_client_authorization_code_holder_error(
-            token_service(&state).get_ref(),
-            authorization_service(&state).get_ref(),
-            &form,
-        )
-        .await
-        .is_none()
-    );
-}
-
-#[actix_web::test]
-async fn missing_client_authorization_code_holder_error_returns_none_when_client_is_not_sender_bound()
- {
-    let Some(state) = live_token_state(AuthorizationServerProfile::Oauth2Baseline).await else {
-        return;
-    };
-    let client_id = format!("holder-unbound-client-{}", Uuid::now_v7());
-    insert_token_client(
-        &state,
-        &client_id,
-        "confidential",
-        "client_secret_post",
-        Some(fixture_secret_hash(
-            &state,
-            &fixture_secret("holder-unbound"),
-        )),
-        vec!["authorization_code"],
-        false,
-        false,
-        true,
-    )
-    .await;
-
-    let code = format!("code-{}", Uuid::now_v7());
-    let mut payload = code_payload(None);
-    payload.client_id = client_id;
-    store_authorization_code_state(&state, &code, &AuthorizationCodeState::Pending { payload })
-        .await;
-
-    let form = TokenForm {
-        grant_type: "authorization_code".to_owned(),
-        code: Some(code),
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: Some("verifier".to_owned()),
-        refresh_token: None,
-        device_secret: None,
-        scope: None,
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    assert!(
-        missing_client_authorization_code_holder_error(
-            token_service(&state).get_ref(),
-            authorization_service(&state).get_ref(),
-            &form,
-        )
-        .await
-        .is_none()
-    );
-}
-
-#[actix_web::test]
 async fn token_endpoint_private_key_jwt_without_kid_obeys_jwks_uri() {
-    use crate::domain::remote_client_documents::tests::{resolver_for, tls_server_sequence};
+    use crate::adapters::remote_client_documents::tests::{resolver_for, tls_server_sequence};
     use crate::test_support::{ClientSigningFixture, client_signing_fixture};
 
     let state = live_token_state(AuthorizationServerProfile::Oauth2Baseline)
@@ -1910,7 +1713,7 @@ async fn token_endpoint_rejects_client_auth_if_token_rate_limit_is_exceeded() {
 
     let response = token(state, req, body).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(oauth_error_code(&response), "temporarily_unavailable");
+    assert_eq!(oauth_error_code(response).await, "temporarily_unavailable");
 }
 
 #[actix_web::test]
@@ -2121,25 +1924,18 @@ fn non_dpop_or_non_pending_authorization_code_is_not_holder_bound() {
     );
 }
 
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
-#[test]
-fn pre_authorized_token_dpop_nonce_error_returns_nonce_challenge_header() {
-    let response = pre_authorized_token_error(nazo_openid4vc_http_actix::CredentialHttpError {
-        status: 400,
-        error: "use_dpop_nonce",
-        description: "Credential issuer requires nonce in DPoP proof.",
-        dpop_nonce: Some("issuer-nonce-1".to_owned()),
-    });
+#[actix_web::test]
+async fn pre_authorized_token_dpop_nonce_error_returns_nonce_challenge_header() {
+    let response = nazo_http_actix::pre_authorized_token_error_response(
+        nazo_openid4vci::application::CredentialHttpError {
+            status: 400,
+            error: "use_dpop_nonce",
+            description: "Credential issuer requires nonce in DPoP proof.",
+            dpop_nonce: Some("issuer-nonce-1".to_owned()),
+        },
+    );
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "use_dpop_nonce");
     assert_eq!(
         response
             .headers()
@@ -2152,157 +1948,7 @@ fn pre_authorized_token_dpop_nonce_error_returns_nonce_challenge_header() {
             r#"DPoP error="use_dpop_nonce""#
         ))
     );
-}
-
-#[test]
-fn missing_client_dpop_authorization_code_holder_uses_invalid_grant() {
-    let response = authorization_code_holder_missing_client_error(true, false)
-        .expect("dpop holder binding should return an error");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
-}
-
-#[test]
-fn missing_client_mtls_authorization_code_holder_uses_invalid_request() {
-    for (dpop_bound, mtls_bound) in [(false, true), (true, true)] {
-        let response = authorization_code_holder_missing_client_error(dpop_bound, mtls_bound)
-            .expect("mtls holder binding should return an error");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(oauth_error_code(&response), "invalid_request");
-    }
-}
-
-#[test]
-fn missing_client_unbound_authorization_code_does_not_mask_client_auth_failure() {
-    assert!(
-        authorization_code_holder_missing_client_error(false, false).is_none(),
-        "authorization codes without sender binding should proceed to normal client authentication"
-    );
-}
-
-#[test]
-fn missing_client_client_credentials_without_dpop_uses_invalid_request() {
-    let form = TokenForm {
-        grant_type: "client_credentials".to_owned(),
-        code: None,
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: None,
-        refresh_token: None,
-        device_secret: None,
-        scope: Some("accounts".to_owned()),
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-    let response = client_credentials_holder_missing_client_error(&form, false)
-        .expect("missing DPoP proof should be reported before generic client auth");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-}
-
-#[test]
-fn missing_client_holder_check_ignores_non_client_credentials_grants() {
-    let form = TokenForm {
-        grant_type: "refresh_token".to_owned(),
-        code: None,
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: None,
-        refresh_token: Some("refresh-token".to_owned()),
-        device_secret: None,
-        scope: None,
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    assert!(client_credentials_holder_missing_client_error(&form, false).is_none());
-}
-
-#[test]
-fn missing_client_client_credentials_with_dpop_stays_client_auth_failure() {
-    let form = TokenForm {
-        grant_type: "client_credentials".to_owned(),
-        code: None,
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: None,
-        refresh_token: None,
-        device_secret: None,
-        scope: Some("accounts".to_owned()),
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    assert!(client_credentials_holder_missing_client_error(&form, true).is_none());
-}
-
-#[test]
-fn missing_client_mtls_client_credentials_uses_invalid_request() {
-    let form = TokenForm {
-        grant_type: "client_credentials".to_owned(),
-        code: None,
-        device_code: None,
-        auth_req_id: None,
-        redirect_uri: None,
-        code_verifier: None,
-        refresh_token: None,
-        device_secret: None,
-        scope: Some("accounts".to_owned()),
-        client_id: None,
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-        assertion: None,
-        requested_token_type: None,
-        subject_token: None,
-        subject_token_type: None,
-        actor_token: None,
-        actor_token_type: None,
-        audiences: Vec::new(),
-        has_audience_param: false,
-    };
-
-    let response = client_credentials_holder_missing_client_error(&form, false)
-        .expect("missing holder-of-key proof should be reported before generic client auth");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
+    assert_eq!(oauth_error_code(response).await, "use_dpop_nonce");
 }
 
 #[test]
@@ -2314,49 +1960,8 @@ fn baseline_client_policy_does_not_restrict_token_client_auth() {
     assert!(validate_token_request_profile(&client, "client_secret_basic").is_ok());
 }
 
-#[test]
-fn disabled_client_is_rejected_before_grant_dispatch() {
-    let mut client = client();
-    client.is_active = false;
-
-    let response = validate_token_client_enabled(&client, "authorization_code")
-        .expect_err("disabled clients must not use token grants");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
-}
-
-#[test]
-fn active_client_with_registered_grant_is_allowed_to_dispatch() {
-    let client = client();
-
-    assert!(validate_token_client_enabled(&client, "authorization_code").is_ok());
-}
-
-#[test]
-fn ciba_dispatch_requires_the_client_registered_grant() {
-    let client = client();
-
-    let response = validate_token_client_enabled(&client, CIBA_GRANT_TYPE)
-        .expect_err("client without the CIBA grant must fail before CIBA execution");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
-}
-
-#[test]
-fn missing_grant_registration_is_rejected_before_grant_dispatch() {
-    let client = client();
-
-    let response = validate_token_client_enabled(&client, "client_credentials")
-        .expect_err("client must be registered for the requested grant");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
-}
-
-#[test]
-fn fapi2_client_policy_requires_confidential_client_auth_and_sender_constraint() {
+#[actix_web::test]
+async fn fapi2_client_policy_requires_confidential_client_auth_and_sender_constraint() {
     let mut valid_client = client();
     valid_client.security_policy = nazo_auth::ClientSecurityPolicy::fapi2();
 
@@ -2365,7 +1970,7 @@ fn fapi2_client_policy_requires_confidential_client_auth_and_sender_constraint()
     let weak_auth = validate_token_request_profile(&valid_client, "client_secret_basic")
         .expect_err("client_secret_basic is not a FAPI2 client auth method");
     assert_eq!(weak_auth.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&weak_auth), "invalid_client");
+    assert_eq!(oauth_error_code(weak_auth).await, "invalid_client");
 
     let mut bearer_client = client();
     bearer_client.security_policy = nazo_auth::ClientSecurityPolicy::fapi2();
@@ -2373,7 +1978,7 @@ fn fapi2_client_policy_requires_confidential_client_auth_and_sender_constraint()
     let bearer = validate_token_request_profile(&bearer_client, "private_key_jwt")
         .expect_err("FAPI2 requires sender-constrained tokens");
     assert_eq!(bearer.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&bearer), "invalid_request");
+    assert_eq!(oauth_error_code(bearer).await, "invalid_request");
 
     let mut public_client = client();
     public_client.security_policy = nazo_auth::ClientSecurityPolicy::fapi2();
@@ -2381,7 +1986,7 @@ fn fapi2_client_policy_requires_confidential_client_auth_and_sender_constraint()
     let public = validate_token_request_profile(&public_client, "none")
         .expect_err("FAPI2 rejects public clients");
     assert_eq!(public.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&public), "unauthorized_client");
+    assert_eq!(oauth_error_code(public).await, "unauthorized_client");
 }
 
 #[test]
@@ -2412,30 +2017,5 @@ fn fapi2_client_policy_accepts_self_signed_mtls_confidential_sender_constrained_
     );
 }
 
-#[test]
-fn attested_client_id_must_match_optional_token_request_client_id_hint() {
-    assert!(attestation_client_id_matches_form_hint(
-        None,
-        "attested-client"
-    ));
-    assert!(attestation_client_id_matches_form_hint(
-        Some("attested-client"),
-        "attested-client"
-    ));
-    assert!(!attestation_client_id_matches_form_hint(
-        Some("other-client"),
-        "attested-client"
-    ));
-}
-
-#[test]
-fn grant_dispatch_rejects_unregistered_grant_without_panicking() {
-    let mut client = client();
-    client.grant_types = vec!["authorization_code".to_owned()];
-
-    let response = validate_token_client_enabled(&client, "refresh_token")
-        .expect_err("unregistered grant_types must fail closed");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
-}
+#[path = "dispatch/pre_authorized.rs"]
+mod pre_authorized_parser_tests;

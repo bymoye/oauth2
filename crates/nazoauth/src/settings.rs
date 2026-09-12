@@ -39,11 +39,12 @@ pub(crate) use federation::{
     FederationSettings, OidcFederationSettings, SamlGatewaySettings, SocialProviderKind,
     SocialProviderSettings,
 };
-pub(crate) use passkey::PasskeySettings;
-pub(crate) use profile::{
-    AuthorizationServerProfile, CibaSecurityProfile, DpopNoncePolicy, RequestObjectJtiPolicy,
-    SubjectType,
+use nazo_auth::DpopNoncePolicy;
+use nazo_oauth_server::policy::{
+    AuthorizationServerProfile, CibaSecurityProfile, Openid4vcRevocationPolicy,
+    RequestObjectJtiPolicy, SubjectType,
 };
+pub(crate) use passkey::PasskeySettings;
 pub(crate) use rate_limit::RateLimitSettings;
 
 /// OAuth service runtime parameters.
@@ -223,36 +224,23 @@ pub(crate) struct Openid4vcSettings {
     pub(crate) revocation_policy: Openid4vcRevocationPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Openid4vcRevocationPolicy {
-    Disabled,
-    Optional,
-    Required,
-}
-
-impl Openid4vcRevocationPolicy {
-    fn from_config(config: &ConfigSource) -> anyhow::Result<Self> {
-        match config
-            .string("OPENID4VC_REVOCATION_POLICY", "disabled")
-            .as_str()
-        {
-            "disabled" => Ok(Self::Disabled),
-            "optional" => Ok(Self::Optional),
-            "required" => Ok(Self::Required),
-            value => bail!(
-                "OPENID4VC_REVOCATION_POLICY must be disabled, optional, or required; got {value}"
-            ),
-        }
-    }
-}
-
 impl Settings {
+    pub(crate) fn external_key_signer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn nazo_key_management::ExternalKeySigner>> {
+        if self.keys.signing_external_command.is_empty() {
+            return None;
+        }
+        Some(std::sync::Arc::new(
+            crate::adapters::external_signer::CommandExternalKeySigner::new(
+                self.keys.signing_external_command.clone(),
+                std::time::Duration::from_millis(self.keys.signing_external_timeout_ms),
+            ),
+        ))
+    }
+
     pub(crate) fn key_settings(&self) -> nazo_key_management::KeySettings {
         nazo_key_management::KeySettings {
-            external_command: self.keys.signing_external_command.clone(),
-            external_timeout: std::time::Duration::from_millis(
-                self.keys.signing_external_timeout_ms,
-            ),
             rotation_interval: chrono::Duration::seconds(
                 self.keys.signing_key_rotation_interval_seconds,
             ),
@@ -578,12 +566,6 @@ pub(crate) fn key_settings_from_config(
     let access_token_ttl_seconds = bounded_access_token_ttl_seconds(config)?;
     let id_token_ttl_seconds = bounded_id_token_ttl_seconds(config)?;
     Ok(nazo_key_management::KeySettings {
-        external_command: parse_signing_external_command(
-            config.optional_string("SIGNING_EXTERNAL_COMMAND"),
-        ),
-        external_timeout: std::time::Duration::from_millis(
-            config.parse("SIGNING_EXTERNAL_TIMEOUT_MS", 2_000)?,
-        ),
         rotation_interval: chrono::Duration::seconds(rotation_interval_seconds),
         prepublish_window: chrono::Duration::seconds(prepublish_seconds),
         verification_grace: chrono::Duration::seconds(

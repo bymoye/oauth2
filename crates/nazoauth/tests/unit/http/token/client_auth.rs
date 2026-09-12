@@ -1,10 +1,10 @@
 use crate::test_support::TestInfrastructure;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 use crate::settings::Settings;
 
@@ -22,10 +22,10 @@ pub(crate) async fn verify_confidential_client(
 ) -> Result<Option<ValidatedClientAssertion>, TokenManagementClientAuthError> {
     let mut client = client.clone();
     let connection = state.valkey_connection();
-    let service = crate::http::authorization::ServerAuthorizationService::new(
+    let service = nazo_oauth_server::services::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(
             state.diesel_db.clone(),
-            crate::domain::tenancy::DEFAULT_TENANT_ID,
+            nazo_identity::DEFAULT_TENANT_ID,
         ),
         std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
@@ -36,6 +36,7 @@ pub(crate) async fn verify_confidential_client(
             &state.settings.endpoint.issuer,
             &state.settings.protocol.client_secret_pepper,
             crate::test_support::test_remote_client_documents(),
+            test_security_audit(),
         ),
         request,
         &mut client,
@@ -56,14 +57,14 @@ async fn verify_confidential_client_with_resolver(
     request: &ClientAuthRequestFacts,
     client: &ClientRow,
     credentials: &ClientCredentials,
-    resolver: &dyn nazo_http_actix::RemoteJwksResolverPort,
+    resolver: &dyn nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksResolverPort,
 ) -> Result<Option<ValidatedClientAssertion>, TokenManagementClientAuthError> {
     let mut client = client.clone();
     let connection = state.valkey_connection();
-    let service = crate::http::authorization::ServerAuthorizationService::new(
+    let service = nazo_oauth_server::services::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(
             state.diesel_db.clone(),
-            crate::domain::tenancy::DEFAULT_TENANT_ID,
+            nazo_identity::DEFAULT_TENANT_ID,
         ),
         std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
@@ -74,6 +75,7 @@ async fn verify_confidential_client_with_resolver(
             &state.settings.endpoint.issuer,
             &state.settings.protocol.client_secret_pepper,
             resolver,
+            test_security_audit(),
         ),
         request,
         &mut client,
@@ -98,20 +100,40 @@ pub(crate) async fn consume_token_client_assertion(
         return Ok(());
     };
     let connection = state.valkey_connection();
-    let service = crate::http::authorization::ServerAuthorizationService::new(
+    let service = nazo_oauth_server::services::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(
             state.diesel_db.clone(),
-            crate::domain::tenancy::DEFAULT_TENANT_ID,
+            nazo_identity::DEFAULT_TENANT_ID,
         ),
         std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    consume_token_client_assertion_with_authorization_service(&service, client, Some(assertion))
-        .await
+    consume_token_client_assertion_with_authorization_service(
+        &service,
+        client,
+        Some(assertion),
+        test_security_audit(),
+    )
+    .await
 }
 
-use super::*;
+use crate::http::authorization::test_support::test_security_audit;
 use crate::test_support::hash_client_secret_fixture as hash_client_secret;
+use nazo_auth::{
+    ClientAuthenticationContext, PresentedClientCredentials as ClientCredentials,
+    ValidatedClientAssertion,
+};
+use nazo_oauth_server::{
+    contracts::token_client_auth::ClientCertificateFacts,
+    crypto::{blake3_hex, client_secret_digest},
+    domain::rows::ClientRow,
+    token::client_auth::{
+        ClientAuthConfig, ClientAuthRequestFacts, TokenManagementClientAuthError,
+        authenticate_client_with_dependencies, authenticate_introspection_client_with_dependencies,
+        authenticate_revocation_client_with_dependencies,
+        consume_token_client_assertion_with_authorization_service,
+    },
+};
 use std::sync::Arc;
 
 use crate::config::ConfigSource;
@@ -125,18 +147,6 @@ use fred::prelude::{
 };
 use nazo_http_actix::IpCidr;
 use std::time::Duration as StdDuration;
-
-#[test]
-fn dummy_client_secret_salt_is_deterministic_but_not_global() {
-    assert_eq!(
-        dummy_client_secret_salt(Some("unknown-client")),
-        dummy_client_secret_salt(Some("unknown-client"))
-    );
-    assert_ne!(
-        dummy_client_secret_salt(Some("unknown-client-a")),
-        dummy_client_secret_salt(Some("unknown-client-b"))
-    );
-}
 
 fn token_management_state() -> TestInfrastructure {
     token_management_state_with_settings(
@@ -334,18 +344,6 @@ fn public_revocation_client_accepts_only_none_without_secret_material() {
     );
 }
 
-#[test]
-fn client_assertion_failures_keep_typed_security_classification() {
-    assert!(matches!(
-        token_management_client_assertion_error(ClientAssertionError::ReplayDetected),
-        TokenManagementClientAuthError::InvalidClient
-    ));
-    assert!(matches!(
-        token_management_client_assertion_error(ClientAssertionError::StoreUnavailable),
-        TokenManagementClientAuthError::StoreUnavailable
-    ));
-}
-
 #[actix_web::test]
 async fn token_client_assertion_store_failure_fails_token_grant_as_server_error() {
     let mut state = token_management_state();
@@ -411,22 +409,6 @@ fn confidential_client_secret_auth_accepts_correct_and_rejects_wrong_secret_by_d
         client_secret_digest(&wrong_secret, &settings.protocol.client_secret_pepper, salt),
         hash
     );
-    assert!(matches!(
-        client_secret_auth_result::<nazo_identity::ports::RepositoryError>(Ok(true)),
-        Ok(true)
-    ));
-    assert!(matches!(
-        client_secret_auth_result::<nazo_identity::ports::RepositoryError>(Ok(false)),
-        Ok(false)
-    ));
-}
-
-#[test]
-fn confidential_client_secret_auth_fails_closed_when_store_is_unavailable() {
-    assert!(matches!(
-        client_secret_auth_result(Err(nazo_identity::ports::RepositoryError::Unavailable)),
-        Err(TokenManagementClientAuthError::StoreUnavailable)
-    ));
 }
 
 #[actix_web::test]
@@ -659,10 +641,7 @@ async fn self_signed_mtls_refreshes_registered_jwks_and_fails_closed_on_resolver
 
     let error = verify_confidential_client_with_resolver(
         &state,
-        &ClientAuthRequestFacts::new(
-            "/token",
-            Some(crate::http::mtls::MtlsClientCertificate::default()),
-        ),
+        &ClientAuthRequestFacts::new("/token", Some(ClientCertificateFacts::default())),
         &client,
         &client_credentials("self_signed_tls_client_auth"),
         &resolver,
@@ -680,10 +659,10 @@ async fn self_signed_mtls_refreshes_registered_jwks_and_fails_closed_on_resolver
 async fn introspection_and_revocation_wrappers_preserve_public_client_policy() {
     let state = token_management_state();
     let connection = state.valkey_connection();
-    let service = crate::http::authorization::ServerAuthorizationService::new(
+    let service = nazo_oauth_server::services::ServerAuthorizationService::new(
         nazo_postgres::AuthorizationFlowRepository::new(
             state.diesel_db.clone(),
-            crate::domain::tenancy::DEFAULT_TENANT_ID,
+            nazo_identity::DEFAULT_TENANT_ID,
         ),
         std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
         state.keyset.clone(),
@@ -693,6 +672,7 @@ async fn introspection_and_revocation_wrappers_preserve_public_client_policy() {
         &state.settings.endpoint.issuer,
         &state.settings.protocol.client_secret_pepper,
         &resolver,
+        test_security_audit(),
     );
     let request = ClientAuthRequestFacts::new("/introspect", None);
     let mut public_client = confidential_client_with_secret(&fixture_secret("public-wrapper"));
@@ -783,7 +763,7 @@ async fn pki_client_auth_requires_both_registered_identity_and_available_trust()
     client.token_endpoint_auth_method = "tls_client_auth".to_owned();
     client.tls_client_auth_subject_dn = Some("CN=registered-client".to_owned());
     let credentials = client_credentials("tls_client_auth");
-    let mut certificate = crate::http::mtls::MtlsClientCertificate {
+    let mut certificate = ClientCertificateFacts {
         subject_dn: Some("CN=registered-client".to_owned()),
         deployment_trusted_chain: true,
         ..Default::default()
@@ -840,7 +820,7 @@ async fn pki_client_auth_rejects_matching_subject_without_an_active_client_ancho
     let mut client = confidential_client_with_secret(&fixture_secret("unused"));
     client.token_endpoint_auth_method = "tls_client_auth".to_owned();
     client.tls_client_auth_subject_dn = Some("CN=registered-client".to_owned());
-    let certificate = crate::http::mtls::MtlsClientCertificate {
+    let certificate = ClientCertificateFacts {
         subject_dn: client.tls_client_auth_subject_dn.clone(),
         ..Default::default()
     };

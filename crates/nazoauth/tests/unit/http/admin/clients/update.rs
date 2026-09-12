@@ -1,14 +1,9 @@
 use super::admin_patch_client;
-use crate::domain::ClientRow;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
 use crate::http::admin::clients::test_support::{
     CreateClientRequest, InsertClientError, PreparedClientRegistration, admin_client_config,
     admin_client_service, admin_session_handles, insert_prepared_client,
     prepare_client_insert_with_secret_pepper, prepare_client_patch,
 };
-use crate::http::sessions::SessionPayload;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
@@ -24,12 +19,16 @@ use fred::interfaces::ClientLike;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::sessions::SessionPayload;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
 use nazo_auth::PatchClientRequest;
-use nazo_http_actix::OAuthJsonErrorFields;
 use nazo_postgres::{create_pool, get_conn};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -83,11 +82,15 @@ fn test_state() -> TestInfrastructure {
     }
 }
 
-fn oauth_error_name(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn create_client_request(client_name: &str) -> CreateClientRequest {
@@ -793,7 +796,7 @@ async fn admin_patch_client_rejects_missing_csrf_before_admin_lookup() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -836,7 +839,10 @@ async fn admin_patch_client_fails_closed_when_admin_session_lookup_is_unavailabl
     .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_name(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_name(response).await.as_deref(),
+        Some("server_error")
+    );
 }
 
 #[actix_web::test]

@@ -1,10 +1,10 @@
 //! CSRF token 刷新端点。
-use crate::adapters::security::random_urlsafe_token;
 use crate::http::sessions::SessionProfileHandles;
 use actix_web::web::Data;
 use actix_web::{HttpRequest, HttpResponse};
 use nazo_http_actix::json_response;
 use nazo_http_actix::{make_cookie, with_cookie_headers};
+use nazo_oauth_server::crypto::random_urlsafe_token;
 
 use serde_json::json;
 // 只有已登录用户可以刷新 token，避免匿名请求制造无意义状态。

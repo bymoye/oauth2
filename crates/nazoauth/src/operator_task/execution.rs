@@ -33,8 +33,8 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::{OperatorPersistence, control_journal::SideEffectError};
-use crate::adapters::security::constant_time_eq;
 use nazo_identity::{TenantBoundaryDefinition, TenantProvisioningRequest};
+use nazo_oauth_server::crypto::constant_time_eq;
 use nazo_operator_protocol::{
     ControlOperationPayload, ControlResultData, ControlTenantDirectoryBinding,
     TenantResourceIdentity, TenantResourceSelector,

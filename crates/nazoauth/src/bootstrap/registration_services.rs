@@ -1,4 +1,3 @@
-use crate::adapters::email::SmtpVerificationEmailDelivery;
 use crate::adapters::security::PasswordHashingError;
 use crate::adapters::security::PasswordVerificationError;
 use crate::adapters::security::hash_password_blocking_limited;
@@ -49,9 +48,3 @@ impl nazo_identity::ports::SecretHashPort for RegistrationSecretHasher {
         })
     }
 }
-
-pub(crate) type LocalRegistrationService = nazo_identity::RegistrationService<
-    std::sync::Arc<dyn nazo_identity::ports::EmailVerificationStorePort>,
-    RegistrationSecretHasher,
-    SmtpVerificationEmailDelivery,
->;

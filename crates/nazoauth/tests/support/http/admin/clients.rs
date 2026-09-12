@@ -1,7 +1,6 @@
 use super::{
     AdminClientConfig, ServerAdminClientCrypto, ServerAdminClientService, admin_client_policy,
 };
-use crate::adapters::security::random_urlsafe_token;
 use crate::settings::Settings;
 use crate::test_support::hash_client_secret_fixture as hash_client_secret;
 use nazo_auth::AdminClientCryptoPort;
@@ -9,12 +8,13 @@ use nazo_key_management::{
     client_jwks_contains_signing_key, client_jwks_matching_encryption_key_count,
     validate_client_jwks, validate_self_signed_mtls_jwks,
 };
+use nazo_oauth_server::crypto::random_urlsafe_token;
 use serde_json::Value;
 use std::sync::Arc;
 
 fn sector_identifier_resolver()
--> crate::domain::remote_client_documents::RemoteClientDocumentResolver {
-    crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+-> crate::adapters::remote_client_documents::RemoteClientDocumentResolver {
+    crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
         .expect("empty sector-identifier policy should be valid")
 }
 
@@ -28,10 +28,12 @@ pub(crate) fn admin_session_handles(
     settings: &Settings,
 ) -> actix_web::web::Data<crate::http::sessions::AdminSessionHandles> {
     let session = &settings.session;
-    actix_web::web::Data::new(crate::http::sessions::AdminSessionHandles::from_port(
-        Arc::new(nazo_valkey::SessionStore::new(&valkey)),
-        Arc::new(nazo_postgres::UserRepository::new(database)),
-        settings.tenant.context.tenant_id,
+    actix_web::web::Data::new(crate::http::sessions::AdminSessionHandles::new(
+        std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
+            Arc::new(nazo_valkey::SessionStore::new(&valkey)),
+            Arc::new(nazo_postgres::UserRepository::new(database)),
+            settings.tenant.context.tenant_id,
+        )),
         crate::http::sessions::SessionHttpConfig::new(
             &session.session_cookie_name,
             &session.csrf_cookie_name,

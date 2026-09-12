@@ -1,5 +1,5 @@
 //! JSON view 组装函数。
-use crate::domain::ClientRow;
+use nazo_oauth_server::domain::rows::ClientRow;
 
 use actix_web::http::header::HeaderMap;
 
@@ -203,21 +203,6 @@ pub(crate) fn pagination(q: &HashMap<String, String>) -> (i32, i32, i32) {
         .min(100);
     let offset = (page - 1) * page_size;
     (page, page_size, offset)
-}
-
-pub(crate) fn append_query(base: &str, pairs: &[(&str, &str)]) -> String {
-    let Ok(mut url) = url::Url::parse(base) else {
-        return base.to_owned();
-    };
-    {
-        let mut qp = url.query_pairs_mut();
-        for (k, v) in pairs {
-            if !v.is_empty() {
-                qp.append_pair(k, v);
-            }
-        }
-    }
-    url.to_string()
 }
 
 #[cfg(test)]

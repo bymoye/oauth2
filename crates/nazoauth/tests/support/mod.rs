@@ -1,3 +1,6 @@
+#[path = "../unit/http/token/response_body.rs"]
+pub(crate) mod token_response_body;
+
 pub(crate) mod valkey;
 
 #[path = "client_auth_keys.rs"]
@@ -53,22 +56,26 @@ pub(crate) fn persisted_runtime_modules_fixture() -> BTreeSet<nazo_runtime_modul
 /// tenant-scoped resolver; tests use this concrete value instead of creating
 /// a temporary reference in each `TokenIssuanceContext`.
 pub(crate) fn test_remote_client_documents()
--> &'static crate::domain::remote_client_documents::RemoteClientDocumentResolver {
+-> &'static crate::adapters::remote_client_documents::RemoteClientDocumentResolver {
     static RESOLVER: OnceLock<
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver,
+        crate::adapters::remote_client_documents::RemoteClientDocumentResolver,
     > = OnceLock::new();
     RESOLVER.get_or_init(|| {
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+        crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
             .expect("empty remote client document resolver should build")
     })
 }
 
-pub(crate) fn test_remote_client_documents_data()
--> actix_web::web::Data<dyn nazo_http_actix::RemoteJwksResolverPort> {
+pub(crate) fn test_remote_client_documents_data() -> actix_web::web::Data<
+    dyn nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksResolverPort,
+> {
     actix_web::web::Data::from(Arc::new(
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+        crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
             .expect("empty remote client document resolver should build"),
-    ) as Arc<dyn nazo_http_actix::RemoteJwksResolverPort>)
+    )
+        as Arc<
+            dyn nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksResolverPort,
+        >)
 }
 
 pub(crate) struct Rfc9440CertificateFixture {
@@ -244,32 +251,36 @@ pub(crate) fn avatar_profiles(
 
 pub(crate) fn access_request_profiles(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::bootstrap::ClientAccessProfileService> {
-    actix_web::web::Data::new(crate::bootstrap::ClientAccessProfileService::new(
-        nazo_postgres::AccessRequestRepository::new(state.diesel_db.clone()),
-        std::sync::Arc::new(nazo_valkey::DeliveryStore::new(&state.valkey_connection())),
-        &state.settings.protocol.client_secret_pepper,
-    ))
+) -> actix_web::web::Data<nazo_oauth_server::services::ClientAccessProfileService> {
+    actix_web::web::Data::new(
+        nazo_oauth_server::services::ClientAccessProfileService::new(
+            nazo_postgres::AccessRequestRepository::new(state.diesel_db.clone()),
+            std::sync::Arc::new(nazo_valkey::DeliveryStore::new(&state.valkey_connection())),
+            &state.settings.protocol.client_secret_pepper,
+        ),
+    )
 }
 
 pub(crate) fn delivery_profiles(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::bootstrap::ClientAccessProfileService> {
+) -> actix_web::web::Data<nazo_oauth_server::services::ClientAccessProfileService> {
     access_request_profiles(state)
 }
 
 pub(crate) fn registration_service(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::bootstrap::LocalRegistrationService> {
+) -> actix_web::web::Data<nazo_oauth_server::services::LocalRegistrationService> {
     let identity = &state.settings.identity;
-    actix_web::web::Data::new(crate::bootstrap::LocalRegistrationService::new(
+    actix_web::web::Data::new(nazo_oauth_server::services::LocalRegistrationService::new(
         nazo_postgres::UserRepository::new(state.diesel_db.clone()),
         std::sync::Arc::new(nazo_valkey::AuthenticationStore::new(
             &state.valkey_connection(),
         )),
-        crate::bootstrap::RegistrationSecretHasher,
-        crate::adapters::email::SmtpVerificationEmailDelivery::from_delivery(
-            &identity.email.delivery,
+        std::sync::Arc::new(crate::bootstrap::RegistrationSecretHasher),
+        std::sync::Arc::new(
+            crate::adapters::email::SmtpVerificationEmailDelivery::from_delivery(
+                &identity.email.delivery,
+            ),
         ),
         state.settings.tenant.context,
         nazo_identity::RegistrationServiceConfig {
@@ -283,10 +294,10 @@ pub(crate) fn registration_service(
 
 pub(crate) fn passkey_service(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::bootstrap::LocalPasskeyService> {
+) -> actix_web::web::Data<nazo_oauth_server::services::LocalPasskeyService> {
     let passkey = &state.settings.identity.passkey;
     let session = &state.settings.session;
-    actix_web::web::Data::new(crate::bootstrap::LocalPasskeyService::new(
+    actix_web::web::Data::new(nazo_oauth_server::services::LocalPasskeyService::new(
         nazo_postgres::UserRepository::new(state.diesel_db.clone()),
         nazo_postgres::PasskeyRepository::new(state.diesel_db.clone()),
         std::sync::Arc::new(nazo_valkey::AuthenticationStore::new(
@@ -294,7 +305,11 @@ pub(crate) fn passkey_service(
         )),
         nazo_postgres::MfaRepository::new(state.diesel_db.clone()),
         std::sync::Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-        crate::bootstrap::TracingPasskeyAudit,
+        std::sync::Arc::new(crate::bootstrap::TracingPasskeyAudit::new(
+            std::sync::Arc::new(crate::adapters::audit::TenantSecurityAudit::new(
+                state.settings.tenant.context.tenant_id,
+            )),
+        )),
         nazo_identity::PasskeyServiceConfig {
             tenant_id: state.settings.tenant.context.tenant_id,
             rp_id: passkey.rp_id.to_owned(),
@@ -303,7 +318,7 @@ pub(crate) fn passkey_service(
             require_user_verification: passkey.require_user_verification,
             require_user_handle: passkey.require_user_handle,
             strict_base64: passkey.strict_base64,
-            ceremony_ttl_seconds: crate::bootstrap::PASSKEY_CEREMONY_TTL_SECONDS,
+            ceremony_ttl_seconds: nazo_oauth_server::services::PASSKEY_CEREMONY_TTL_SECONDS,
             session_ttl_seconds: session.session_ttl_seconds,
         },
     ))
@@ -311,15 +326,19 @@ pub(crate) fn passkey_service(
 
 pub(crate) fn federation_service(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::bootstrap::LocalFederationService> {
-    actix_web::web::Data::new(crate::bootstrap::LocalFederationService::new(
+) -> actix_web::web::Data<nazo_oauth_server::services::LocalFederationService> {
+    actix_web::web::Data::new(nazo_oauth_server::services::LocalFederationService::new(
         nazo_postgres::FederationRepository::new(state.diesel_db.clone()),
         std::sync::Arc::new(nazo_valkey::AuthenticationStore::new(
             &state.valkey_connection(),
         )),
-        crate::bootstrap::FederationBootstrapPasswordHasher,
+        std::sync::Arc::new(crate::bootstrap::FederationBootstrapPasswordHasher),
         std::sync::Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-        crate::bootstrap::TracingFederationAudit,
+        std::sync::Arc::new(crate::bootstrap::TracingFederationAudit::new(
+            std::sync::Arc::new(crate::adapters::audit::TenantSecurityAudit::new(
+                state.settings.tenant.context.tenant_id,
+            )),
+        )),
         nazo_identity::FederationServiceConfig {
             tenant: state.settings.tenant.context,
             state_ttl_seconds: crate::http::auth::federation::FEDERATION_STATE_TTL_SECONDS,
@@ -346,13 +365,12 @@ pub(crate) fn federation_http_config(
 
 pub(crate) fn auth_request_limiter(
     state: &TestInfrastructure,
-) -> actix_web::web::Data<crate::http::rate_limit::AuthRequestLimiter> {
+) -> actix_web::web::Data<nazo_oauth_server::rate_limit::AuthRequestLimiter> {
     let rate_limit = &state.settings.identity.rate_limit;
-    actix_web::web::Data::new(crate::http::rate_limit::AuthRequestLimiter::new(
+    actix_web::web::Data::new(nazo_oauth_server::rate_limit::AuthRequestLimiter::new(
         std::sync::Arc::new(nazo_valkey::RateLimitStore::new(&state.valkey_connection())),
         rate_limit.window_seconds,
         rate_limit.auth_max_requests,
-        client_ip_config(state).get_ref().clone(),
     ))
 }
 

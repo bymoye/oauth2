@@ -9,21 +9,15 @@ use fred::interfaces::{ClientLike, KeysInterface};
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
-use nazo_http_actix::OAuthJsonErrorFields;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use crate::adapters::remote_client_documents::RemoteClientDocumentResolver;
 use crate::config::ConfigSource;
-use crate::domain::ClientRow;
-use crate::domain::remote_client_documents::RemoteClientDocumentResolver;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
 use crate::http::admin::clients::{
     ServerAdminClientCrypto, ServerAdminClientService, admin_client_policy,
 };
 use crate::http::sessions::SessionHttpConfig;
-use crate::http::sessions::SessionPayload;
 use crate::schema::oauth_clients;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
@@ -31,6 +25,11 @@ use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
 use chrono::Utc;
 use diesel::prelude::*;
 use nazo_identity::AccessRequestStatus;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::{AccessRequestRepository, create_pool, get_conn};
 
 async fn profile_access_requests_from_state(
@@ -132,10 +131,12 @@ fn admin_access_request_dependencies(
     let storage = &state.settings.storage;
     let endpoint = &state.settings.endpoint;
     TestAdminAccessRequestDependencies {
-        admin_sessions: Data::new(AdminSessionHandles::from_port(
-            Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-            Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
-            state.settings.tenant.context.tenant_id,
+        admin_sessions: Data::new(AdminSessionHandles::new(
+            std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
+                Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
+                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
+                state.settings.tenant.context.tenant_id,
+            )),
             SessionHttpConfig::new(
                 &session.session_cookie_name,
                 &session.csrf_cookie_name,
@@ -314,11 +315,15 @@ fn delivery_tokens_are_deterministic_and_request_scoped() {
     );
 }
 
-fn oauth_error_name(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn database_url_with_search_path(schema: &str) -> Option<String> {
@@ -750,15 +755,15 @@ fn parse_access_request_status_accepts_only_protocol_state_codes() {
     }
 }
 
-#[test]
-fn parse_access_request_status_rejects_malformed_and_unknown_states_fail_closed() {
+#[actix_web::test]
+async fn parse_access_request_status_rejects_malformed_and_unknown_states_fail_closed() {
     for raw in ["-1", "3", "approved", "1.0"] {
         let response = parse_access_request_status(&query_with_status(raw))
             .expect_err("invalid status must not reach database filtering");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            oauth_error_name(&response).as_deref(),
+            oauth_error_name(response).await.as_deref(),
             Some("invalid_request")
         );
     }
@@ -820,7 +825,7 @@ async fn access_request_list_requires_admin_before_query_validation_or_database_
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -836,7 +841,7 @@ async fn access_request_list_without_status_requires_admin_before_database_looku
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -895,24 +900,24 @@ async fn admin_access_request_list_validates_status_after_admin_auth_and_returns
     assert_eq!(body["error"], "invalid_request");
 }
 
-#[test]
-fn duplicate_access_request_approval_uses_conflict_without_secret_material() {
+#[actix_web::test]
+async fn duplicate_access_request_approval_uses_conflict_without_secret_material() {
     let response = access_request_already_approved_response();
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
 
-#[test]
-fn duplicate_access_request_rejection_uses_conflict_without_secret_material() {
+#[actix_web::test]
+async fn duplicate_access_request_rejection_uses_conflict_without_secret_material() {
     let response = access_request_already_rejected_response();
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -938,7 +943,7 @@ async fn approve_access_request_rejects_missing_csrf_before_admin_or_database_lo
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -960,7 +965,7 @@ async fn approve_access_request_requires_admin_before_access_request_lookup() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -1277,7 +1282,7 @@ async fn reject_access_request_rejects_missing_csrf_before_admin_or_database_loo
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -1301,7 +1306,7 @@ async fn reject_access_request_requires_admin_before_access_request_update() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }

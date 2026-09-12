@@ -918,7 +918,7 @@ async fn direct_tls_new_handshakes_switch_server_identity_without_reloading_clie
             "/probe",
             web::get().to(|request: actix_web::HttpRequest| async move {
                 if request
-                    .conn_data::<crate::http::mtls::MtlsClientCertificate>()
+                    .conn_data::<nazo_oauth_server::contracts::token_client_auth::ClientCertificateFacts>()
                     .is_some_and(|certificate| certificate.deployment_trusted_chain)
                 {
                     "trusted"

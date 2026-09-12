@@ -16,7 +16,7 @@ pub(crate) struct AccessDeliveryRequest {
 
 pub(crate) async fn access_delivery(
     sessions: Data<SessionProfileHandles>,
-    service: Data<crate::bootstrap::ClientAccessProfileService>,
+    service: Data<nazo_oauth_server::services::ClientAccessProfileService>,
     req: HttpRequest,
     Json(payload): Json<AccessDeliveryRequest>,
 ) -> HttpResponse {

@@ -1,10 +1,16 @@
+use nazo_oauth_server as app;
+#[path = "../../../../../authorization-server/tests/support/authorization.rs"]
+mod authorization_fixture;
 use super::*;
 use actix_web::body::to_bytes;
 use actix_web::http::header;
+use nazo_oauth_server::domain::rows::ClientRow;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 fn presentation_client(active: bool) -> ClientRow {
     let mut client = client_row! {
@@ -66,7 +72,12 @@ async fn response_json(response: HttpResponse) -> Value {
 #[actix_web::test]
 async fn active_client_exposes_only_registered_display_metadata_without_caching() {
     let client = presentation_client(true);
-    let response = client_presentation_response(Some(&client));
+    let response = client_presentation_response(Ok(ClientPresentation {
+        client_name: client.client_name.clone(),
+        logo_uri: client.presentation.logo_uri.clone(),
+        policy_uri: client.presentation.policy_uri.clone(),
+        tos_uri: client.presentation.tos_uri.clone(),
+    }));
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers().get(header::CACHE_CONTROL).unwrap(),
@@ -90,15 +101,46 @@ async fn active_client_exposes_only_registered_display_metadata_without_caching(
 
 #[actix_web::test]
 async fn missing_and_inactive_clients_have_the_same_non_enumerating_shape() {
-    let inactive = presentation_client(false);
-    for client in [None, Some(&inactive)] {
-        let response = client_presentation_response(client);
+    let mut responses = Vec::new();
+    for client in [None, Some(authorization_fixture::client(false))] {
+        let fixture = authorization_fixture::Fixture::new(Ok(client), Ok(None));
+        let endpoint = AuthorizationEndpoint::new(
+            std::sync::Arc::new(fixture.make_application()),
+            nazo_http_actix::ClientIpConfig::new(&[], nazo_http_actix::ClientIpHeaderMode::None),
+            crate::http::sessions::SessionHttpConfig::new("session", "csrf", false),
+        );
+        let request = actix_web::test::TestRequest::get()
+            .uri("/authorize/client?client_id=client-1")
+            .to_http_request();
+        let response = authorize_client_presentation(Data::new(endpoint), request).await;
+        assert_eq!(fixture.ports.calls(), ["client"]);
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            response_json(response).await,
-            json!({ "error": "not_found" })
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
         );
+        let status = response.status();
+        let mut headers: Vec<_> = response
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        headers.sort();
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"not_found"}"#);
+        responses.push((status, headers, body));
     }
+    assert_eq!(responses[0], responses[1]);
+}
+
+#[actix_web::test]
+async fn unavailable_client_lookup_has_only_error_json() {
+    let response = client_presentation_response(Err(ClientPresentationError::Unavailable));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json(response).await,
+        json!({ "error": "server_error" })
+    );
 }
 
 #[test]

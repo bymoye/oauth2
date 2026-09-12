@@ -14,20 +14,17 @@ use nazo_http_actix::{
     csrf_error, empty_response_no_store, has_valid_csrf_token_for_cookies, json_response_no_store,
     json_response_status_no_store,
 };
-use nazo_openid4vc_http_actix::CredentialHttpError;
+use nazo_openid4vci::application::CredentialHttpError;
 use uuid::Uuid;
 
-use crate::{
-    adapters::audit::audit_fields,
-    domain::{CredentialDatasetAdminService, PutCredentialDatasetRequest},
-    http::{
-        admin::{persist_required_audit_or_unavailable, require_durable_audit_or_unavailable},
-        sessions::{
-            AdminSessionHandles, require_admin_or_forbidden_with_handles,
-            require_admin_with_recent_mfa_or_forbidden_with_handles,
-        },
-    },
-};
+use crate::http::admin::persist_required_audit_or_unavailable;
+use crate::http::admin::require_durable_audit_or_unavailable;
+use crate::http::sessions::AdminSessionHandles;
+use crate::http::sessions::require_admin_or_forbidden_with_handles;
+use crate::http::sessions::require_admin_with_recent_mfa_or_forbidden_with_handles;
+use nazo_oauth_server::domain::openid4vc_endpoints::CredentialDatasetAdminService;
+use nazo_oauth_server::domain::openid4vc_endpoints::PutCredentialDatasetRequest;
+use nazo_oauth_server::ports::audit::audit_fields;
 
 pub(crate) async fn admin_put_credential_dataset(
     sessions: Data<AdminSessionHandles>,

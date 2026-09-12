@@ -1,6 +1,7 @@
 use super::*;
-use nazo_http_actix::OAuthJsonErrorFields;
-use std::sync::{Arc, Mutex};
+use nazo_oauth_server::sessions::SessionPayload;
+use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::config::ConfigSource;
 use crate::settings::Settings;
@@ -60,74 +61,6 @@ fn session_state() -> TestInfrastructure {
     }
 }
 
-struct ErrorSessionStore {
-    load_error: RepositoryError,
-    deleted: Arc<Mutex<Vec<SessionId>>>,
-}
-
-impl SessionStorePort for ErrorSessionStore {
-    fn load<'a>(
-        &'a self,
-        _session_id: &'a SessionId,
-    ) -> nazo_identity::ports::RepositoryFuture<'a, Option<nazo_identity::SessionSnapshot>> {
-        let error = self.load_error.clone();
-        Box::pin(async move { Err(error) })
-    }
-
-    fn delete<'a>(
-        &'a self,
-        session_id: &'a SessionId,
-    ) -> nazo_identity::ports::RepositoryFuture<'a, bool> {
-        self.deleted.lock().unwrap().push(session_id.clone());
-        Box::pin(async { Ok(true) })
-    }
-
-    fn rotate<'a>(
-        &'a self,
-        _old_session_id: &'a SessionId,
-        _expected: &'a nazo_identity::SessionSnapshot,
-        _new_session_id: &'a SessionId,
-        _replacement: &'a nazo_identity::session::SessionRecord,
-        _ttl_seconds: u64,
-    ) -> nazo_identity::ports::RepositoryFuture<'a, nazo_identity::SessionRotationOutcome> {
-        Box::pin(async {
-            Err(RepositoryError::Unexpected(
-                "rotation is not used by session lookup tests".to_owned(),
-            ))
-        })
-    }
-
-    fn compare_and_set<'a>(
-        &'a self,
-        _session_id: &'a SessionId,
-        _expected: &'a nazo_identity::SessionSnapshot,
-        _replacement: &'a nazo_identity::session::SessionRecord,
-    ) -> nazo_identity::ports::RepositoryFuture<'a, nazo_identity::SessionUpdateOutcome> {
-        Box::pin(async {
-            Err(RepositoryError::Unexpected(
-                "compare-and-set is not used by session lookup tests".to_owned(),
-            ))
-        })
-    }
-}
-
-fn admin_sessions_with_store(
-    state: &TestInfrastructure,
-    sessions: Arc<dyn SessionStorePort>,
-) -> AdminSessionHandles {
-    let config = &state.settings.session;
-    AdminSessionHandles::from_port(
-        sessions,
-        Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
-        state.settings.tenant.context.tenant_id,
-        SessionHttpConfig::new(
-            &config.session_cookie_name,
-            &config.csrf_cookie_name,
-            config.cookie_secure,
-        ),
-    )
-}
-
 async fn live_session_state() -> Option<TestInfrastructure> {
     let valkey_url = std::env::var("VALKEY_URL").ok()?;
     let mut state = session_state();
@@ -167,136 +100,39 @@ async fn store_raw_session(state: &TestInfrastructure, sid: &str, raw: &str) {
     .expect("raw session payload should store");
 }
 
-#[test]
-fn session_payload_requires_authentication_metadata_and_oidc_sid() {
-    let valid = valid_payload();
-
-    assert!(valid_session_payload(&valid, 1_001));
-    assert!(!valid_session_payload(
-        &SessionPayload {
-            oidc_sid: None,
-            ..valid.clone()
-        },
-        1_001
-    ));
-    assert!(!valid_session_payload(
-        &SessionPayload {
-            oidc_sid: Some(" ".to_owned()),
-            ..valid.clone()
-        },
-        1_001
-    ));
-    assert!(!valid_session_payload(
-        &SessionPayload {
-            auth_time: 0,
-            ..valid.clone()
-        },
-        1_001
-    ));
-    assert!(!valid_session_payload(
-        &SessionPayload {
-            auth_time: 2_000,
-            ..valid.clone()
-        },
-        1_001
-    ));
-    assert!(!valid_session_payload(
-        &SessionPayload {
-            amr: Vec::new(),
-            ..valid
-        },
-        1_001
-    ));
+async fn oauth_error_code(response: actix_web::HttpResponse) -> String {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .expect("OAuth response body should include an error code")
 }
 
-#[test]
-fn session_payload_allows_only_small_clock_skew_for_auth_time() {
-    let mut payload = valid_payload();
-
-    payload.auth_time = 1_030;
-    assert!(valid_session_payload(&payload, 1_000));
-
-    payload.auth_time = 1_031;
-    assert!(!valid_session_payload(&payload, 1_000));
-}
-
-#[test]
-fn session_payload_preserves_pending_mfa_as_metadata_not_validity() {
-    let mut payload = valid_payload();
-    payload.pending_mfa = true;
-
-    assert!(valid_session_payload(&payload, 1_001));
-}
-
-#[test]
-fn session_payload_requires_non_blank_oidc_sid_after_trimming() {
-    for sid in ["", " ", "\t\n"] {
-        let mut payload = valid_payload();
-        payload.oidc_sid = Some(sid.to_owned());
-
-        assert!(
-            !valid_session_payload(&payload, 1_001),
-            "blank sid {sid:?} must not produce an OIDC session"
-        );
-    }
-}
-
-#[test]
-fn recent_admin_mfa_requires_a_fresh_interactive_factor() {
-    let fresh = vec!["password".to_owned(), "otp".to_owned(), "mfa".to_owned()];
-    assert!(recent_mfa_authentication(1_000, &fresh, 1_300));
-
-    let old = vec!["password".to_owned(), "otp".to_owned(), "mfa".to_owned()];
-    assert!(!recent_mfa_authentication(1_000, &old, 1_301));
-
-    let no_factor = vec!["password".to_owned(), "mfa".to_owned()];
-    assert!(!recent_mfa_authentication(1_000, &no_factor, 1_001));
-
-    let remembered = vec![
-        "password".to_owned(),
-        "remembered_mfa".to_owned(),
-        "mfa".to_owned(),
-    ];
-    assert!(!recent_mfa_authentication(1_000, &remembered, 1_001));
-
-    let stepped_up_after_remembered = vec![
-        "password".to_owned(),
-        "remembered_mfa".to_owned(),
-        "otp".to_owned(),
-        "mfa".to_owned(),
-    ];
-    assert!(recent_mfa_authentication(
-        1_000,
-        &stepped_up_after_remembered,
-        1_001
-    ));
-
-    let future = vec![
-        "password".to_owned(),
-        "recovery_code".to_owned(),
-        "mfa".to_owned(),
-    ];
-    assert!(!recent_mfa_authentication(1_100, &future, 1_000));
-}
-
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
-#[test]
-fn session_lookup_failures_are_server_errors_without_auth_material() {
+#[actix_web::test]
+async fn session_lookup_failures_are_server_errors_without_auth_material() {
     let response = session_lookup_error_response(anyhow::anyhow!("database unavailable"));
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     assert!(
         response.headers().get(header::WWW_AUTHENTICATE).is_none(),
         "backend session failures must not be exposed as client credentials challenges"
     );
+    assert_eq!(oauth_error_code(response).await, "server_error");
+}
+
+#[actix_web::test]
+async fn administrator_policy_errors_preserve_http_status_and_oauth_code() {
+    let denied = admin_session_error_response(AdminSessionError::AccessDenied);
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(oauth_error_code(denied).await, "access_denied");
+
+    let step_up = admin_session_error_response(AdminSessionError::MfaStepUpRequired);
+    assert_eq!(step_up.status(), StatusCode::PRECONDITION_REQUIRED);
+    assert_eq!(oauth_error_code(step_up).await, "mfa_step_up_required");
 }
 
 #[actix_web::test]
@@ -330,51 +166,6 @@ async fn missing_session_key_is_anonymous_even_when_cookie_is_present() {
             .expect("missing session key should not be a backend failure")
             .is_none()
     );
-}
-
-#[actix_web::test]
-async fn corrupt_session_snapshot_is_deleted_and_treated_as_anonymous_through_port() {
-    let state = session_state();
-    let sid = "corrupt-session";
-    let deleted = Arc::new(Mutex::new(Vec::new()));
-    let sessions = admin_sessions_with_store(
-        &state,
-        Arc::new(ErrorSessionStore {
-            load_error: RepositoryError::Consistency("malformed session".to_owned()),
-            deleted: Arc::clone(&deleted),
-        }),
-    );
-
-    let current = sessions
-        .current_session(&session_request(&state, sid))
-        .await
-        .expect("corrupt session should be invalidated rather than fail open");
-
-    assert!(current.is_none());
-    assert_eq!(deleted.lock().unwrap().as_slice(), &[SessionId::new(sid)]);
-}
-
-#[actix_web::test]
-async fn unavailable_session_store_fails_closed_without_deleting_state() {
-    let state = session_state();
-    let deleted = Arc::new(Mutex::new(Vec::new()));
-    let sessions = admin_sessions_with_store(
-        &state,
-        Arc::new(ErrorSessionStore {
-            load_error: RepositoryError::Unavailable,
-            deleted: Arc::clone(&deleted),
-        }),
-    );
-
-    assert!(
-        sessions
-            .current_session(&session_request(&state, "unavailable-session"))
-            .await
-            .is_err(),
-        "infrastructure errors must not become anonymous sessions"
-    );
-
-    assert!(deleted.lock().unwrap().is_empty());
 }
 
 #[actix_web::test]
@@ -479,12 +270,12 @@ async fn missing_session_cookie_requires_login_or_admin_denial_without_storage_l
         .await
         .expect_err("anonymous user must be challenged to log in");
     assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&login), "login_required");
     assert!(
         login.headers().get(header::SET_COOKIE).is_some(),
         "login-required response must clear stale session cookies"
     );
     assert!(login.headers().get(header::WWW_AUTHENTICATE).is_none());
+    assert_eq!(oauth_error_code(login).await, "login_required");
 
     let forbidden = require_admin_or_forbidden_with_handles(&sessions, &req)
         .await
@@ -509,8 +300,8 @@ async fn admin_gate_propagates_session_lookup_failures_as_server_errors() {
         .expect_err("backend session lookup failure must not become access_denied");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+    assert_eq!(oauth_error_code(response).await, "server_error");
 }
 
 #[actix_web::test]
@@ -548,8 +339,8 @@ async fn profile_and_admin_session_boundaries_preserve_cookie_and_backend_semant
         Err(response) => response,
     };
     assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&login), "login_required");
     assert!(login.headers().get(header::SET_COOKIE).is_some());
+    assert_eq!(oauth_error_code(login).await, "login_required");
 
     let admin_login = match admins.current_session_or_login_required(&anonymous).await {
         Ok(_) => panic!("admin session guard must require login without a cookie"),
@@ -581,15 +372,23 @@ async fn profile_and_admin_session_boundaries_preserve_cookie_and_backend_semant
         profile_backend_error.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    assert_eq!(oauth_error_code(&profile_backend_error), "server_error");
+    assert_eq!(
+        oauth_error_code(profile_backend_error).await,
+        "server_error"
+    );
 
-    let session_by_id_error = match profiles.current_session_by_id("unavailable-session").await {
+    let session_by_id_error = match profiles
+        .resolver
+        .current_session_by_id("unavailable-session")
+        .await
+    {
         Ok(_) => panic!("session-by-id backend failure must be surfaced"),
         Err(error) => error,
     };
     assert!(!session_by_id_error.to_string().is_empty());
 
     let delete_error = profiles
+        .resolver
         .delete_session("unavailable-session")
         .await
         .expect_err("session deletion backend failure must be surfaced");

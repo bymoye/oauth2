@@ -8,17 +8,19 @@ use diesel::{
 };
 use diesel_async::RunQueryDsl;
 use ed25519_dalek::{Signer, SigningKey};
-use nazo_http_actix::{FapiHttpMessageSignatures, FapiSignatureVerificationError};
 use nazo_http_signatures::{
     RequestInput, RequestPolicy, VerificationPolicy, parse_request_for_verification,
     prepare_request,
+};
+use nazo_oauth_server::contracts::fapi_resource::{
+    FapiHttpMessageSignatures, FapiSignatureVerificationError,
 };
 use nazo_postgres::{DbPool, create_pool, get_conn};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::production::{ServerFapiHttpMessageSignatures, same_key_generation};
 use crate::{config::ConfigSource, settings::Settings};
+use nazo_oauth_server::domain::resource_server::ServerFapiHttpMessageSignatures;
 use nazo_oauth_server::ports::fapi_replay::{
     FapiHttpSignatureReplayConsumption, FapiHttpSignatureReplayStore,
     FapiHttpSignatureReplayStoreError,
@@ -115,22 +117,6 @@ async fn insert_signature_client(pool: &DbPool, tenant_id: Uuid, client_id: &str
     .expect("signature test client should insert");
 }
 
-#[test]
-fn verifier_cache_hits_only_the_same_live_snapshot_generation() {
-    let original_manager = crate::test_support::test_key_manager();
-    let original = original_manager.snapshot();
-    let same_generation = original_manager.snapshot();
-    assert!(same_key_generation(&original, &same_generation));
-
-    // Test managers intentionally reuse the same public kid. Distinct
-    // key material must still be treated as a rotation and miss.
-    let rotated = crate::test_support::test_key_manager().snapshot();
-    assert_eq!(original.active_kid, rotated.active_kid);
-    assert!(!Arc::ptr_eq(&original, &rotated));
-    assert_ne!(original.jwks(), rotated.jwks());
-    assert!(!same_key_generation(&original, &rotated));
-}
-
 #[tokio::test]
 async fn production_signature_verifier_binds_replay_to_the_scoped_client_tenant() {
     let (Ok(database_url), Ok(valkey_url)) =
@@ -184,7 +170,7 @@ async fn production_signature_verifier_binds_replay_to_the_scoped_client_tenant(
             nazo_valkey::ReplayStore::new(&replay_connection),
         )),
         crate::test_support::test_key_manager(),
-        runtime_modules,
+        runtime_modules.snapshot_store(),
         60,
     );
 

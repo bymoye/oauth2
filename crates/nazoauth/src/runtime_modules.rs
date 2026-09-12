@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::web;
-use nazo_http_actix::{
+use nazo_oauth_server::contracts::runtime_modules::{
     RuntimeModuleAdminError, RuntimeModuleAdminFuture, RuntimeModuleAdministration,
 };
 use nazo_runtime_modules::{

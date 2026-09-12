@@ -2,7 +2,8 @@
 //! 用户只能查看和解绑自己的 provider subject 绑定，不能修改 provider 配置。
 use nazo_http_actix::{empty_response_no_store, json_response_no_store, oauth_error};
 
-use crate::adapters::audit::{audit_event, audit_fields};
+use crate::adapters::audit::audit_event;
+use nazo_oauth_server::ports::audit::audit_fields;
 
 use crate::http::sessions::SessionProfileHandles;
 use actix_web::http::StatusCode;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 pub(crate) async fn my_federation_links(
     sessions: Data<SessionProfileHandles>,
-    federation: Data<crate::bootstrap::FederationProfileService>,
+    federation: Data<nazo_oauth_server::services::FederationProfileService>,
     req: HttpRequest,
 ) -> HttpResponse {
     let user = match sessions.current_user_or_login_required(&req).await {
@@ -43,7 +44,7 @@ pub(crate) async fn my_federation_links(
 
 pub(crate) async fn unlink_my_federation_link(
     sessions: Data<SessionProfileHandles>,
-    federation: Data<crate::bootstrap::FederationProfileService>,
+    federation: Data<nazo_oauth_server::services::FederationProfileService>,
     req: HttpRequest,
     path: Path<Uuid>,
 ) -> HttpResponse {

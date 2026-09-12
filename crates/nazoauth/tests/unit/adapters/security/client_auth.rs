@@ -1,5 +1,5 @@
 use super::*;
-use base64::engine::general_purpose::STANDARD;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 #[test]
 fn basic_client_credentials_scheme_is_case_insensitive() {

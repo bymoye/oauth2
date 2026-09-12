@@ -33,7 +33,7 @@ macro_rules! client_row {
         sector_identifier_host: $sector_host:expr $(,)?
     ) => {{
         let _: Option<String> = $client_secret_hash;
-        $crate::domain::ClientRow {
+        nazo_oauth_server::domain::rows::ClientRow {
             id: $id,
             tenant_id: $tenant_id,
             realm_id: $realm_id,

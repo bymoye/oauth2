@@ -54,7 +54,7 @@ pub(in crate::bootstrap) struct TenantRuntime {
 #[derive(Default)]
 struct TenantRuntimeLifecycle {
     runtime_module_reconciler: Option<JoinHandle<()>>,
-    key_lifecycle: Option<JoinHandle<()>>,
+    key_lifecycle: Option<crate::jobs::key_lifecycle::KeyLifecycleTask>,
     ciba_ping_worker: Option<JoinHandle<()>>,
 }
 
@@ -128,7 +128,6 @@ impl TenantRuntime {
 
         // Construct the only fallible worker before starting the key worker.
         // If it rejects configuration, no candidate has started a lifecycle.
-        #[cfg(not(test))]
         let ciba_ping_worker = background::spawn_ciba_ping_worker(
             assembly
                 .startup
@@ -138,12 +137,13 @@ impl TenantRuntime {
             &assembly.startup.settings,
             assembly.startup.runtime_modules.get_ref(),
         )?;
-        #[cfg(test)]
-        let ciba_ping_worker = None;
 
         let runtime_module_reconciler =
             RuntimeModules::spawn_reconciler(assembly.startup.runtime_modules.clone());
-        let key_lifecycle = background::spawn_key_lifecycle(assembly.startup.keyset.clone());
+        let key_lifecycle = background::spawn_key_lifecycle(
+            assembly.startup.keyset.clone(),
+            assembly.startup.settings.key_settings().prepublish_window,
+        );
         lifecycle.runtime_module_reconciler = Some(runtime_module_reconciler);
         lifecycle.key_lifecycle = Some(key_lifecycle);
         lifecycle.ciba_ping_worker = ciba_ping_worker;
@@ -154,9 +154,6 @@ impl TenantRuntime {
         // Remove this graph from the index before calling this method. The key
         // manager first receives its cooperative stop signal; its task is not
         // aborted while it may be writing key material.
-        if let Some(assembly) = self.assembly.as_ref() {
-            assembly.startup.keyset.stop_lifecycle();
-        }
         let (runtime_module_reconciler, key_lifecycle, ciba_ping_worker) = {
             let mut lifecycle = self
                 .lifecycle
@@ -168,27 +165,30 @@ impl TenantRuntime {
                 lifecycle.ciba_ping_worker.take(),
             )
         };
-        if let Some(worker) = runtime_module_reconciler {
-            worker.abort();
-            if let Err(error) = worker.await
-                && !error.is_cancelled()
-            {
-                tracing::warn!(%error, "tenant runtime-module reconciler stopped unexpectedly");
+        let stop_key = async {
+            if let Some(worker) = key_lifecycle {
+                worker.stop().await;
             }
-        }
-        if let Some(worker) = ciba_ping_worker {
-            worker.abort();
-            if let Err(error) = worker.await
-                && !error.is_cancelled()
-            {
-                tracing::warn!(%error, "tenant CIBA ping worker stopped unexpectedly");
+        };
+        let stop_workers = async {
+            if let Some(worker) = runtime_module_reconciler {
+                worker.abort();
+                if let Err(error) = worker.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, "tenant runtime-module reconciler stopped unexpectedly");
+                }
             }
-        }
-        if let Some(worker) = key_lifecycle
-            && let Err(error) = worker.await
-        {
-            tracing::warn!(%error, "tenant key lifecycle stopped unexpectedly");
-        }
+            if let Some(worker) = ciba_ping_worker {
+                worker.abort();
+                if let Err(error) = worker.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, "tenant CIBA ping worker stopped unexpectedly");
+                }
+            }
+        };
+        tokio::join!(biased; stop_key, stop_workers);
     }
 }
 
@@ -333,6 +333,7 @@ async fn build_service_runtime(
     let wrapping_keys = crate::settings::signing_key_wrapping_key_ring(&process.config)?;
     let keyset = nazo_key_management::KeyManager::load_or_create_database(
         settings.key_settings(),
+        settings.external_key_signer(),
         settings.tenant.context.tenant_id.as_uuid(),
         process
             .persistence
@@ -361,7 +362,7 @@ async fn build_service_runtime(
             keyset.clone(),
         ));
     let remote_client_documents = Arc::new(
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(
+        crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(
             &settings.modules.remote_client_document_private_origins,
         )
         .map_err(anyhow::Error::msg)?,

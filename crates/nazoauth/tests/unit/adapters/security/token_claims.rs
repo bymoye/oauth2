@@ -6,8 +6,8 @@ fn signing_adapters_do_not_define_or_call_claim_forwarders() {
         .join("tests/support/adapters/security/tokens.rs");
     let source = std::fs::read_to_string(&server_tokens)
         .expect("test signing adapter source must exist relative to its manifest");
-    let oidc_logout =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/domain/oidc_logout.rs");
+    let oidc_logout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../authorization-server/src/domain/oidc_logout.rs");
     let oidc_logout_source = std::fs::read_to_string(&oidc_logout)
         .expect("OIDC logout domain service must exist relative to the server manifest");
     let key_management_tokens =

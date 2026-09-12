@@ -10,11 +10,10 @@ use nazo_http_actix::{
 };
 use serde::Deserialize;
 
-use crate::{
-    adapters::audit::{audit_event, audit_fields},
-    bootstrap::MtlsTrustAnchorService,
-    http::sessions::SessionProfileHandles,
-};
+use crate::adapters::audit::audit_event;
+use crate::http::sessions::SessionProfileHandles;
+use nazo_oauth_server::ports::audit::audit_fields;
+use nazo_oauth_server::services::MtlsTrustAnchorService;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

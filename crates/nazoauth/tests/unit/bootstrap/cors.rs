@@ -2,18 +2,24 @@ use super::*;
 use actix_web::http::header;
 use actix_web::{App, HttpResponse, http::StatusCode, test, web};
 use chrono::{TimeZone, Utc};
-use nazo_http_actix::{
-    ProfileAccountEndpoint, ProfileAccountFuture, ProfileAccountOperations, ProfileMe,
-    SessionCookieConfig,
-};
+use nazo_http_actix::{ProfileAccountEndpoint, SessionCookieConfig};
 use nazo_identity::{
     AccountProfileView, AuthorizedApplicationView, AuthorizedApplicationsView, ProfilePatch,
     SessionId,
 };
+use nazo_oauth_server::contracts::profile_account::{
+    ProfileAccountFuture, ProfileAccountOperations, ProfileMe,
+};
 use std::sync::Arc;
 
 use crate::bootstrap::routes;
-use crate::domain::{DynamicRegistrationConfig, dynamic_registration_endpoint};
+use nazo_oauth_server::{
+    contracts::dynamic_client_registration::DynamicRegistrationSecurityServices,
+    domain::dynamic_registration::{
+        DynamicRegistrationApplication, DynamicRegistrationConfig,
+        ServerDynamicRegistrationRequestGuard, ServerDynamicRegistrationTokens,
+    },
+};
 
 struct ContractProfileOperations;
 
@@ -292,17 +298,57 @@ async fn disabled_dynamic_client_registration_keeps_the_static_route_contract() 
     )
     .expect("test runtime module registry should be valid");
     let remote_documents = Arc::new(
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+        crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
             .expect("empty private-origin policy should be valid"),
     );
-    let dynamic_registration_endpoint = web::Data::new(dynamic_registration_endpoint(
-        DynamicRegistrationConfig::from(settings.as_ref()),
-        Arc::new(nazo_postgres::OAuthClientRepository::new(pool.clone())),
-        std::sync::Arc::new(nazo_valkey::RateLimitStore::new(&valkey)),
-        crate::test_support::test_key_manager(),
-        runtime_modules,
-        remote_documents,
+    let keyset = crate::test_support::test_key_manager();
+    let keys = keyset.snapshot();
+    let config = DynamicRegistrationConfig {
+        tenant: settings.tenant.context,
+        issuer: settings.endpoint.issuer.clone(),
+        default_audience: settings.protocol.default_audience.clone(),
+        pairwise_subject_secret: settings.protocol.pairwise_subject_secret.clone(),
+        client_secret_pepper: settings.protocol.client_secret_pepper.clone(),
+        initial_access_token: settings
+            .modules
+            .dynamic_client_registration_initial_access_token
+            .clone(),
+        rate_limit_window_seconds: settings.identity.rate_limit.window_seconds,
+        rate_limit_max_requests: settings.identity.rate_limit.token_management_max_requests,
+        id_token_signing_algs: keys.id_token_signing_alg_values_supported(),
+        response_signing_algs: keys.response_signing_alg_values_supported(),
+        request_object_encryption_algs: vec!["RSA-OAEP-256"],
+        request_object_encryption_encs: vec!["A256GCM"],
+    };
+    let crypto = Arc::new(nazo_key_management::ClientRegistrationCrypto::new(keyset));
+    let guard = Arc::new(ServerDynamicRegistrationRequestGuard::new(
+        Arc::new(nazo_valkey::RateLimitStore::new(&valkey)),
+        &config,
+        runtime_modules.snapshot_store(),
+        Arc::new(crate::adapters::audit::TenantSecurityAudit::new(
+            settings.tenant.context.tenant_id,
+        )),
     ));
+    let application = Arc::new(DynamicRegistrationApplication::new(
+        config,
+        Arc::new(nazo_postgres::OAuthClientRepository::new(pool.clone())),
+        remote_documents.clone(),
+        DynamicRegistrationSecurityServices::new(
+            remote_documents,
+            crypto.clone(),
+            crypto,
+            Arc::new(ServerDynamicRegistrationTokens),
+        ),
+        guard,
+    ));
+    let dynamic_registration_endpoint =
+        web::Data::new(nazo_http_actix::DynamicRegistrationEndpoint::new(
+            application,
+            nazo_http_actix::ClientIpConfig::new(
+                &settings.endpoint.trusted_proxy_cidrs,
+                settings.endpoint.client_ip_header_mode,
+            ),
+        ));
     let app = test::init_service(
         App::new()
             .wrap(actix_web::middleware::from_fn(

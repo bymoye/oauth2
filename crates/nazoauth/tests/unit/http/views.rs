@@ -53,25 +53,6 @@ fn pagination_rejects_non_positive_values_and_caps_page_size() {
 }
 
 #[test]
-fn append_query_preserves_invalid_base_and_skips_empty_values() {
-    assert_eq!(append_query("not a url", &[("state", "abc")]), "not a url");
-
-    let url = append_query(
-        "https://issuer.example/authorize?client_id=client-1",
-        &[("state", "abc"), ("nonce", ""), ("scope", "openid profile")],
-    );
-
-    assert!(url.starts_with("https://issuer.example/authorize?"));
-    assert!(url.contains("client_id=client-1"));
-    assert!(url.contains("state=abc"));
-    assert!(url.contains("scope=openid+profile"));
-    assert!(
-        !url.contains("nonce="),
-        "empty query values must not be serialized"
-    );
-}
-
-#[test]
 fn admin_user_json_omits_password_hash_and_tenant_context() {
     let user = user_row();
     let value = admin_user_json(user.clone());

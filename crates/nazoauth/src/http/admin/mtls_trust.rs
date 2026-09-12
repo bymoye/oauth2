@@ -14,18 +14,15 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use uuid::Uuid;
 
-use crate::{
-    adapters::audit::{audit_event, audit_fields},
-    bootstrap::MtlsTrustAnchorService,
-    http::{
-        admin::{persist_required_audit_or_unavailable, require_durable_audit_or_unavailable},
-        sessions::{
-            AdminSessionHandles, require_admin_or_forbidden_with_handles,
-            require_admin_with_recent_mfa_or_forbidden_with_handles,
-        },
-        views::pagination,
-    },
-};
+use crate::adapters::audit::audit_event;
+use crate::http::admin::persist_required_audit_or_unavailable;
+use crate::http::admin::require_durable_audit_or_unavailable;
+use crate::http::sessions::AdminSessionHandles;
+use crate::http::sessions::require_admin_or_forbidden_with_handles;
+use crate::http::sessions::require_admin_with_recent_mfa_or_forbidden_with_handles;
+use crate::http::views::pagination;
+use nazo_oauth_server::ports::audit::audit_fields;
+use nazo_oauth_server::services::MtlsTrustAnchorService;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

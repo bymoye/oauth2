@@ -13,84 +13,46 @@ pub(crate) mod routes;
 mod startup;
 mod transport;
 mod ui_release;
-pub(crate) use authentication_services::{
-    LocalAuthenticationService, LoginPasswordVerifier, TracingAuthenticationAudit,
-};
-pub(crate) use federation_services::{
-    FederationBootstrapPasswordHasher, LocalFederationService, TracingFederationAudit,
-};
+pub(crate) use authentication_services::{LoginPasswordVerifier, TracingAuthenticationAudit};
+pub(crate) use federation_services::{FederationBootstrapPasswordHasher, TracingFederationAudit};
 pub use object_store::{
     ServerAvatarObjectStoreBindings, ServerAvatarObjectStoreProvider, ServerAvatarStorageCapability,
 };
-pub(crate) use passkey_services::{
-    LocalPasskeyService, PASSKEY_CEREMONY_TTL_SECONDS, TracingPasskeyAudit,
-};
-pub(crate) use profile_services::{
-    AccountProfileService, AvatarProfileService, ClientAccessProfileService,
-    FederationProfileService, MtlsTrustAnchorService,
-};
-pub(crate) use registration_services::{LocalRegistrationService, RegistrationSecretHasher};
+pub(crate) use passkey_services::TracingPasskeyAudit;
+pub(crate) use profile_services::AvatarProfileService;
+pub(crate) use registration_services::RegistrationSecretHasher;
 pub use startup::run;
 pub(crate) use startup::tenant_runtime::TenantRuntimeRegistry;
 
 use std::{path::PathBuf, sync::Arc};
 
 use crate::adapters::email::{SmtpVerificationEmailDelivery, email_delivery_configured};
+use crate::adapters::security::ServerMfaSecretHasher;
+use crate::adapters::security::ServerScimBootstrapPasswordProvider;
 use crate::adapters::security::{
     configure_password_hash_limits, default_password_hash_max_concurrency,
     default_password_hash_queue_timeout_ms, dummy_password_hash, initialize_dummy_password_hash,
 };
 use crate::config::ConfigSource;
-#[cfg(not(test))]
-use crate::domain::{
-    BackchannelLogoutWorker, ServerTokenManagementOperations, ServerTokenManagementRequestGuard,
-    spawn_backchannel_logout_delivery_worker,
-};
-use crate::domain::{
-    CibaPingDeliveryWorker, CredentialDatasetAdminService, Openid4vcClientAttestationValidator,
-    Openid4vcCredentialCrypto, Openid4vcProofValidator, PresentationVerifierConfig,
-    ServerCredentialIssuerOperations, ServerPresentationOperations,
-    spawn_ciba_ping_delivery_worker,
-};
-use crate::domain::{
-    DynamicRegistrationConfig, ServerUserinfoOperations, dynamic_registration_endpoint,
-};
-use crate::domain::{
-    MFA_REMEMBERED_COOKIE_NAME, MFA_REMEMBERED_TTL_SECONDS, MetadataConfig, OidcLogoutConfig,
-    OidcLogoutHandles, PasskeyOperationsProvider, ResourceServerConfig,
-    ServerAuthenticationRateLimit, ServerAuthorizationDecisionOperations,
-    ServerLocalRegistrationOperations, ServerMetadataSnapshotSource, ServerMfaProfileOperations,
-    ServerMfaSecretHasher, ServerPasswordLoginOperations, ServerProfileAccountOperations,
-    ServerSessionManagementOperations, UserinfoConfig, UserinfoHandles,
-};
-use crate::domain::{
-    ServerFapiHttpMessageSignatures, ServerFapiMtlsResolver, ServerFapiResourceAuthorizer,
-};
-use crate::domain::{
-    ServerScimBootstrapPasswordProvider, ServerScimCursorProtector, ServerScimEventSigner,
-    ServerScimRequestAuthorizer,
-};
 use crate::http::admin::access_requests::AdminAccessRequestConfig;
 use crate::http::admin::clients::{
     AdminClientConfig, ServerAdminClientCrypto, ServerAdminClientService, admin_client_policy,
 };
 use crate::http::admin::federation::AdminFederationConfig;
+use crate::http::auth::MFA_REMEMBERED_COOKIE_NAME;
+use crate::http::auth::MFA_REMEMBERED_TTL_SECONDS;
 use crate::http::auth::csrf::CsrfHttpConfig;
 use crate::http::auth::federation::{
     FEDERATION_STATE_TTL_SECONDS, FederationHttpConfig, SAML_REPLAY_TTL_SECONDS,
 };
-use crate::http::authorization::{
-    AuthorizationEndpoint, AuthorizationHttpConfig, ServerAuthorizationService,
-};
-use crate::http::rate_limit::{AuthRequestLimiter, TokenManagementRequestLimiter};
+use crate::http::authorization::{AuthorizationEndpoint, authorization_config};
+use crate::http::mtls::ServerMtlsThumbprintExtractor;
 use crate::http::sessions::{AdminSessionHandles, SessionHttpConfig, SessionProfileHandles};
 #[cfg(not(test))]
 use crate::http::token::ServerTokenManagementRequestFactsExtractor;
-use crate::http::token::ciba::{CibaHttpConfig, CibaTokenHandles, ServerCibaService};
-use crate::http::token::device::{DeviceDecisionHandles, ServerDeviceGrantService};
+use crate::http::token::ciba::ciba_config;
 use crate::http::token::device_config::DeviceHttpConfig;
-use crate::http::token::dispatch::{Openid4vcTokenHandles, TokenCoreHandles, TokenEndpointHandles};
-use crate::http::token::issue::TokenIssuanceConfig;
+use crate::http::token::issue::token_issuance_config;
 use crate::runtime_modules::{RuntimeModules, ServerRuntimeModuleRegistry};
 use crate::settings::{Settings, mfa_totp_key_ring, token_issuance_response_key_ring};
 use actix_files::{Files, NamedFile};
@@ -110,6 +72,45 @@ use nazo_http_actix::{
     PasswordLoginEndpoint, ProfileAccountEndpoint, RuntimeModuleAdminEndpoint, SessionCookieConfig,
     SessionLogoutEndpoint, SessionManagementConfig, SessionManagementEndpoint, security_headers,
 };
+use nazo_oauth_server::authorization::config::AuthorizationConfig;
+use nazo_oauth_server::domain::authorization_decision::ServerAuthorizationDecisionOperations;
+use nazo_oauth_server::domain::dynamic_registration::DynamicRegistrationConfig;
+use nazo_oauth_server::domain::local_registration::ServerAuthenticationRateLimit;
+use nazo_oauth_server::domain::local_registration::ServerLocalRegistrationOperations;
+use nazo_oauth_server::domain::metadata::MetadataConfig;
+use nazo_oauth_server::domain::mfa_profile::ServerMfaProfileOperations;
+use nazo_oauth_server::domain::oidc_logout::OidcLogoutConfig;
+use nazo_oauth_server::domain::oidc_logout::OidcLogoutHandles;
+use nazo_oauth_server::domain::openid4vc::Openid4vcCredentialCrypto;
+use nazo_oauth_server::domain::openid4vc::Openid4vcProofValidator;
+use nazo_oauth_server::domain::openid4vc_endpoints::CredentialDatasetAdminService;
+use nazo_oauth_server::domain::openid4vc_endpoints::PresentationVerifierConfig;
+use nazo_oauth_server::domain::openid4vc_endpoints::ServerCredentialIssuerOperations;
+use nazo_oauth_server::domain::openid4vc_endpoints::ServerPresentationOperations;
+use nazo_oauth_server::domain::passkey::PasskeyOperationsProvider;
+use nazo_oauth_server::domain::password_login::ServerPasswordLoginOperations;
+use nazo_oauth_server::domain::profile_account::ServerProfileAccountOperations;
+use nazo_oauth_server::domain::resource_server::{
+    ResourceServerConfig, ServerFapiHttpMessageSignatures, ServerFapiResourceAuthorizer,
+};
+use nazo_oauth_server::domain::scim::ServerScimCursorProtector;
+use nazo_oauth_server::domain::scim::ServerScimEventSigner;
+use nazo_oauth_server::domain::scim::ServerScimRequestAuthorizer;
+use nazo_oauth_server::domain::session_management::ServerSessionManagementOperations;
+#[cfg(not(test))]
+use nazo_oauth_server::domain::token_management::ServerTokenManagementOperations;
+#[cfg(not(test))]
+use nazo_oauth_server::domain::token_management::ServerTokenManagementRequestGuard;
+use nazo_oauth_server::domain::userinfo::ServerUserinfoOperations;
+use nazo_oauth_server::domain::userinfo::UserinfoConfig;
+use nazo_oauth_server::domain::userinfo::UserinfoHandles;
+use nazo_oauth_server::rate_limit::{AuthRequestLimiter, TokenManagementRequestLimiter};
+use nazo_oauth_server::token::ciba::state::CibaTokenHandles;
+use nazo_oauth_server::token::device::DeviceDecisionHandles;
+use nazo_oauth_server::token::dispatch::{
+    Openid4vcTokenHandles, TokenCoreHandles, TokenEndpointHandles,
+};
+use nazo_oauth_server::token::issue::TokenIssuanceConfig;
 use nazo_openid4vc_http_actix::{CredentialIssuerEndpoint, PresentationEndpoint};
 #[cfg(test)]
 use transport::DirectTlsReload;

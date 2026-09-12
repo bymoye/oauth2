@@ -1,12 +1,12 @@
 use crate::test_support::DatabaseUserFixture;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
-use crate::http::sessions::SessionPayload;
+use nazo_oauth_server::sessions::SessionPayload;
 
 use crate::settings::Settings;
 

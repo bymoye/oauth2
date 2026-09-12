@@ -1,11 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use crate::bootstrap::PASSKEY_CEREMONY_TTL_SECONDS;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
-use crate::http::sessions::SessionPayload;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabasePasskeyFixture, DatabaseUserFixture, TestInfrastructure};
@@ -30,7 +25,12 @@ use nazo_http_actix::{
     PasskeyRegistrationBeginRequest as PasskeyBeginRequest,
     PasskeyRegistrationFinishRequest as PasskeyFinishRequest, authorization_error_response,
 };
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 use nazo_identity::ports::PasskeyCredential;
+use nazo_oauth_server::services::PASSKEY_CEREMONY_TTL_SECONDS;
+use nazo_oauth_server::sessions::SessionPayload;
 use passkey_auth::RegistrationResponse;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

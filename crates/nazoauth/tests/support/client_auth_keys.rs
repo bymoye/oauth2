@@ -4,7 +4,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use nazo_http_actix::{RemoteJwksFuture, RemoteJwksResolverPort};
+use nazo_oauth_server::contracts::dynamic_client_registration::{
+    RemoteJwksFuture, RemoteJwksResolverPort,
+};
 use serde_json::Value;
 
 /// Deterministic in-process resolver used by client-key consumer tests.

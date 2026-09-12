@@ -1,4 +1,5 @@
-use super::*;
+use nazo_oauth_server::domain::openid4vc::Openid4vcCredentialCrypto;
+use nazo_openid4vp::AuthorizationResponse;
 
 use std::sync::Arc;
 
@@ -9,16 +10,38 @@ use nazo_digital_credentials::{CredentialFormat, DcqlQuery, VcIssuerTrustPolicy}
 use nazo_key_management::{
     KeyManager, KeySettings, LocalKeyRegistration, Openid4vcMaterial, Openid4vcPublicMaterial,
 };
-use nazo_openid4vc_http_actix::{
+use nazo_oauth_server::domain::openid4vc_endpoints::{
+    PresentationVerifierConfig, ServerPresentationOperations,
+};
+use nazo_openid4vp::PresentationStorePort;
+use nazo_openid4vp::application::{
     CreatePresentationRequest, PresentationOperations, PresentationResponseBody,
     PresentationResponseInput,
 };
-use nazo_openid4vp::PresentationStorePort;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
 };
 use serde_json::json;
+use uuid::Uuid;
+
+struct PresentationFixture {
+    operations: ServerPresentationOperations,
+    store: Arc<dyn nazo_persistence::Openid4vpStore>,
+    crypto: Openid4vcCredentialCrypto,
+    snapshots: Arc<nazo_runtime_modules::SnapshotStore>,
+    issuer: String,
+    wallet_origins: Vec<String>,
+    transaction_ttl_seconds: u64,
+}
+
+impl std::ops::Deref for PresentationFixture {
+    type Target = ServerPresentationOperations;
+
+    fn deref(&self) -> &Self::Target {
+        &self.operations
+    }
+}
 
 fn invalid_pool() -> nazo_postgres::DbPool {
     nazo_postgres::create_pool(
@@ -38,8 +61,6 @@ async fn fixture_crypto_without_dns() -> Openid4vcCredentialCrypto {
 
 async fn fixture_crypto_with_dns(include_dns: bool) -> (Openid4vcCredentialCrypto, KeyManager) {
     let settings = KeySettings {
-        external_command: Vec::new(),
-        external_timeout: std::time::Duration::from_secs(1),
         rotation_interval: chrono::Duration::days(30),
         prepublish_window: chrono::Duration::days(1),
         verification_grace: chrono::Duration::hours(1),
@@ -98,7 +119,8 @@ async fn fixture_crypto_with_dns(include_dns: bool) -> (Openid4vcCredentialCrypt
     let crypto = Openid4vcCredentialCrypto::new_with_policies(
         key_manager.clone(),
         VcIssuerTrustPolicy::san_bound(),
-        crate::settings::Openid4vcRevocationPolicy::Disabled,
+        nazo_oauth_server::policy::Openid4vcRevocationPolicy::Disabled,
+        Arc::new(crate::adapters::mdoc_signer::TokioMdocDocumentSigner),
     )
     .expect("fixture OpenID4VC crypto should load");
     (crypto, key_manager)
@@ -133,7 +155,7 @@ fn rotated_material(current: &Openid4vcPublicMaterial) -> Openid4vcMaterial {
     }
 }
 
-async fn operations(pool: nazo_postgres::DbPool, enabled: bool) -> ServerPresentationOperations {
+async fn operations(pool: nazo_postgres::DbPool, enabled: bool) -> PresentationFixture {
     let crypto = fixture_crypto().await;
     operations_with_crypto(pool, crypto, enabled).await
 }
@@ -142,7 +164,7 @@ async fn operations_with_crypto(
     pool: nazo_postgres::DbPool,
     crypto: Openid4vcCredentialCrypto,
     enabled: bool,
-) -> ServerPresentationOperations {
+) -> PresentationFixture {
     let mut settings =
         crate::settings::Settings::from_config(&crate::config::ConfigSource::default())
             .expect("fixture settings should load");
@@ -161,24 +183,37 @@ async fn operations_with_crypto(
     let store: Arc<dyn nazo_persistence::Openid4vpStore> =
         Arc::new(nazo_postgres::Openid4vpRepository::new(
             pool.clone(),
-            crate::domain::tenancy::DEFAULT_TENANT_ID,
+            nazo_identity::DEFAULT_TENANT_ID,
             [0x42; 32],
         ));
-    ServerPresentationOperations::new(
-        store,
-        crate::domain::tenancy::DEFAULT_TENANT_ID,
-        crypto,
-        runtime,
+    let issuer = "https://issuer.example".to_owned();
+    let wallet_origins = vec!["https://wallet.example".to_owned()];
+    let transaction_ttl_seconds = 300;
+    let snapshots = runtime.snapshot_store();
+    let operations = ServerPresentationOperations::new(
+        store.clone(),
+        nazo_identity::DEFAULT_TENANT_ID,
+        crypto.clone(),
+        snapshots.clone(),
         Arc::new(nazo_postgres::TenantResourceRepository::new(pool)),
         PresentationVerifierConfig {
-            issuer: "https://issuer.example".to_owned(),
-            wallet_origins: vec!["https://wallet.example".to_owned()],
+            issuer: issuer.clone(),
+            wallet_origins: wallet_origins.clone(),
             // Keep the live fixture comfortably above the minimum clamp:
             // certificate generation and a serialized DB round-trip can
             // exceed thirty seconds on a cold CI worker.
-            transaction_ttl_seconds: 300,
+            transaction_ttl_seconds,
         },
-    )
+    );
+    PresentationFixture {
+        operations,
+        store,
+        crypto,
+        snapshots,
+        issuer,
+        wallet_origins,
+        transaction_ttl_seconds,
+    }
 }
 
 fn valid_dcql() -> DcqlQuery {
@@ -581,7 +616,7 @@ async fn create_and_request_cover_standard_modes_and_tenant_bound_trust() {
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind::<diesel::sql_types::Uuid, _>(policy_id)
-    .bind::<diesel::sql_types::Uuid, _>(crate::domain::tenancy::DEFAULT_TENANT_ID)
+    .bind::<diesel::sql_types::Uuid, _>(nazo_identity::DEFAULT_TENANT_ID)
     .bind::<diesel::sql_types::Varchar, _>(&policy_resource_id)
     .bind::<diesel::sql_types::Varchar, _>(&policy_digest)
     .bind::<diesel::sql_types::Jsonb, _>(ordinary_trust_policy_material())
@@ -625,7 +660,7 @@ async fn create_and_request_cover_standard_modes_and_tenant_bound_trust() {
         )),
         other_tenant,
         operations.crypto.clone(),
-        operations.runtime.clone(),
+        operations.snapshots.clone(),
         Arc::new(nazo_postgres::TenantResourceRepository::new(pool.clone())),
         PresentationVerifierConfig {
             issuer: operations.issuer.clone(),

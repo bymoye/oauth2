@@ -5,7 +5,6 @@
 //! 在同一个数据库事务内原子完成。明文审批令牌只在签发响应中出现一次，
 //! 永不写入日志或审计载荷；任何载荷都不存在可携带 Recovery Secret 的字段。
 
-use crate::adapters::audit::audit_fields;
 use crate::http::admin::{
     persist_required_audit_or_unavailable, require_durable_audit_or_unavailable,
 };
@@ -19,6 +18,7 @@ use actix_web::web::{Data, Json, Query};
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
 use nazo_http_actix::{csrf_error, has_valid_csrf_token_for_cookies, json_response, oauth_error};
+use nazo_oauth_server::ports::audit::audit_fields;
 use nazo_persistence::control_plane::{IdentityApprovalError, RecoveryRotationError};
 use std::collections::HashMap;
 

@@ -8,7 +8,9 @@ use std::{
 
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 
-use super::ciba_ping_tls::{CIBA_PING_TLS_MAX, CIBA_PING_TLS_MIN, apply_ciba_ping_tls_policy};
+use crate::adapters::ciba_ping_tls::{
+    CIBA_PING_TLS_MAX, CIBA_PING_TLS_MIN, apply_ciba_ping_tls_policy,
+};
 
 fn test_identity() -> (
     rustls::pki_types::PrivateKeyDer<'static>,
@@ -140,4 +142,34 @@ async fn ciba_ping_transport_preserves_terminal_and_retry_http_statuses() {
         .await
         .expect("TLS 1.3 endpoint should return its retry status");
     assert_eq!(retry.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[test]
+fn ciba_ping_sender_private_network_exceptions_require_https_origins() {
+    use super::CibaPingHttpSender;
+    let sender =
+        CibaPingHttpSender::new(&["https://Example.COM:443".to_owned()]).expect("HTTPS origin");
+    assert!(
+        sender
+            .private_network_origins
+            .contains("https://example.com")
+    );
+    for invalid in [
+        "http://example.com",
+        "https://example.com/path",
+        "https://example.com/?query=yes",
+    ] {
+        assert!(
+            CibaPingHttpSender::new(&[invalid.to_owned()]).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn ciba_ping_sender_preserves_notification_idempotency_key() {
+    assert_eq!(
+        super::ciba_ping_idempotency_key("request-hash"),
+        "nazo-ciba-ping-request-hash"
+    );
 }

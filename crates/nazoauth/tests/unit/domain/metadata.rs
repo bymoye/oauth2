@@ -1,9 +1,11 @@
 use nazo_auth::{CibaMetadataProfile, MetadataAuthorizationServerProfile, MetadataSubjectType};
 
-use super::*;
+use super::metadata_config;
 use crate::config::ConfigSource;
-use crate::settings::AuthorizationServerProfile;
+use crate::settings::Settings;
 use nazo_http_actix::IpCidr;
+use nazo_oauth_server::contracts::metadata::MetadataEndpointConfig;
+use nazo_oauth_server::policy::{AuthorizationServerProfile, CibaSecurityProfile, SubjectType};
 
 fn settings() -> Settings {
     Settings::from_config(&ConfigSource::default()).expect("default settings")
@@ -24,7 +26,7 @@ fn metadata_config_maps_only_the_focused_settings_boundary() {
     settings.protocol.require_pushed_authorization_requests = true;
 
     assert_eq!(
-        MetadataConfig::from(&settings).endpoint_config(),
+        metadata_config(&settings).endpoint_config(),
         MetadataEndpointConfig {
             issuer: "https://issuer.example".to_owned(),
             mtls_endpoint_base_url: "https://mtls.issuer.example".to_owned(),
@@ -53,7 +55,7 @@ fn metadata_config_uses_composable_discovery_for_every_legacy_profile() {
         let mut settings = settings();
         settings.protocol.authorization_server_profile = profile;
         settings.protocol.require_pushed_authorization_requests = false;
-        let config = MetadataConfig::from(&settings);
+        let config = metadata_config(&settings);
         assert_eq!(
             config.authorization_server_profile,
             MetadataAuthorizationServerProfile::Composable
@@ -76,9 +78,6 @@ fn metadata_config_maps_both_ciba_profiles() {
     ] {
         let mut settings = settings();
         settings.protocol.ciba_security_profile = profile;
-        assert_eq!(
-            MetadataConfig::from(&settings).ciba_security_profile,
-            expected
-        );
+        assert_eq!(metadata_config(&settings).ciba_security_profile, expected);
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use nazo_oauth_server::ports::audit::audit_fields;
 use serde_json::json;
 
 #[tokio::test]
@@ -283,47 +284,28 @@ fn high_impact_state_changes_are_guarded_by_required_audit_intent() {
     // around mutations. Runtime audit serialization is exercised above; this
     // guard prevents a future refactor from moving the required intent behind
     // a state change without pretending to be a protocol E2E test.
-    let authorization = include_str!("../../../src/domain/authorization_decision.rs");
-    assert_source_order(
-        authorization,
-        "ensure_audit_storage().await",
-        "audit_event_required(\n            \"authorization_decision_intent\"",
-    );
-    assert_source_order(
-        authorization,
-        "audit_event_required(\n            \"authorization_decision_intent\"",
-        "admit_user_decision(",
-    );
+    let authorization =
+        include_str!("../../../../authorization-server/src/domain/authorization_decision.rs");
+    assert_source_order(authorization, ".ensure_storage()", "record_required(");
+    assert_source_order(authorization, "record_required(", "admit_user_decision(");
     assert!(authorization.contains("AuthorizationDecisionError::AuditUnavailable"));
 
-    let device = include_str!("../../../src/http/token/device.rs");
-    assert_source_order(
-        device,
-        "ensure_audit_storage().await",
-        "audit_event_required(\n        \"device_decision_intent\"",
-    );
-    assert_source_order(
-        device,
-        "audit_event_required(\n        \"device_decision_intent\"",
-        "let result = match form.decision.as_str()",
-    );
+    let device = include_str!("../../../../authorization-server/src/token/device.rs");
+    assert_source_order(device, ".ensure_storage()", "record_required(");
+    assert_source_order(device, "record_required(", "let result = match decision {");
     assert!(device.contains("设备授权审计无法持久化."));
 
-    let ciba = include_str!("../../../src/http/token/ciba/decision.rs");
+    let ciba = include_str!("../../../../authorization-server/src/token/ciba/decision.rs");
     let ciba_intent = source_body(
         ciba,
         "async fn prepare_ciba_decision_intent(",
         "async fn set_ciba_request_decision(",
     );
-    assert_source_order(
-        ciba_intent,
-        "ensure_audit_storage().await",
-        "audit_event_required(\"ciba_decision_intent\"",
-    );
+    assert_source_order(ciba_intent, ".ensure_storage()", ".record_required(");
     let ciba_browser = source_body(
         ciba,
-        "pub(crate) async fn ciba_decision(",
-        "async fn prepare_ciba_decision_intent(",
+        "pub async fn decide(",
+        "async fn load_ciba_request_payload(",
     );
     assert!(
         ciba_browser.contains("set_ciba_request_decision("),
@@ -331,16 +313,55 @@ fn high_impact_state_changes_are_guarded_by_required_audit_intent() {
     );
     assert!(ciba.contains("CIBA decision audit could not be persisted."));
 
-    let issuance = include_str!("../../../src/http/token/issue_grant.rs");
+    let issuance = include_str!("../../../../authorization-server/src/token/issue_grant.rs");
     // Token issuance now commits its success audit in the same PG transaction
     // as the durable token fact.  Keep the preflight before the idempotent
     // read, and ensure the retired intent/saga markers cannot return.
     assert_source_order(
         issuance,
-        "ensure_audit_storage().await",
+        "context.security_audit.ensure_storage().await",
         "token_issuance_by_grant(",
     );
     assert!(issuance.contains("commit_token_issuance("));
     assert!(!issuance.contains("token_issuance_intent"));
     assert!(!issuance.contains("record_token_issuance_signed("));
+}
+
+#[tokio::test]
+async fn explicitly_bound_audit_does_not_use_the_request_tenant() {
+    let bound = nazo_identity::TenantId::new(Uuid::from_u128(701)).unwrap();
+    let request = nazo_identity::TenantId::new(Uuid::from_u128(702)).unwrap();
+    let audit = TenantSecurityAudit::new(bound);
+    REQUEST_TENANT
+        .scope(request, async {
+            let queued = prepare_event_for_tenant(
+                "login_success",
+                serde_json::Map::new(),
+                Some(audit.tenant_id),
+            )
+            .unwrap();
+            assert_eq!(queued.payload["tenant_id"], json!(bound));
+            let error = audit
+                .record_required(
+                    "login_success",
+                    audit_fields(&[("tenant_id", json!(request))]),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("tenant_context_mismatch"));
+        })
+        .await;
+}
+
+#[test]
+fn explicitly_bound_audit_captures_tenant_without_request_scope() {
+    let tenant = nazo_identity::TenantId::new(Uuid::from_u128(703)).unwrap();
+    let audit = TenantSecurityAudit::new(tenant);
+    let queued = prepare_event_for_tenant(
+        "login_success",
+        serde_json::Map::new(),
+        Some(audit.tenant_id),
+    )
+    .unwrap();
+    assert_eq!(queued.payload["tenant_id"], json!(tenant));
 }

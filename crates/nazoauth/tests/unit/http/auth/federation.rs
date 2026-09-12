@@ -3,12 +3,7 @@ use nazo_identity::PublicAccount;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 
-use crate::adapters::security::pkce_s256;
 use crate::config::ConfigSource;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
-use crate::http::sessions::SessionPayload;
 use crate::schema::external_identity_links;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_get;
@@ -18,11 +13,15 @@ use crate::test_support::{
 };
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::crypto::pkce_s256;
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::create_pool;
 use nazo_postgres::get_conn;
 use nazo_valkey::test_support::oidc_federation_storage_key as oidc_state_key;
 
-use crate::adapters::security::random_urlsafe_token;
 use crate::settings::{OidcFederationSettings, SamlGatewaySettings};
 use crate::test_support::ClientSigningFixture;
 use crate::test_support::client_signing_fixture;
@@ -36,8 +35,8 @@ use fred::{
     },
 };
 use jsonwebtoken::{Algorithm, Header};
-use nazo_http_actix::OAuthJsonErrorFields;
 use nazo_identity::OidcFederationState;
+use nazo_oauth_server::crypto::random_urlsafe_token;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -122,6 +121,7 @@ async fn federation_provider_start(
 ) -> HttpResponse {
     super::federation_provider_start(
         crate::test_support::auth_request_limiter(&state),
+        crate::test_support::client_ip_config(&state),
         crate::test_support::federation_service(&state),
         crate::test_support::federation_http_config(&state),
         req,
@@ -507,11 +507,15 @@ impl LiveFederationFixture {
     }
 }
 
-fn oauth_error_code(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_code(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn cookie_value_from_response(response: &HttpResponse, name: &str) -> Option<String> {
@@ -700,8 +704,8 @@ async fn federation_provider_list_returns_enabled_non_secret_provider_metadata()
     assert!(providers[0].get("jwks_url").is_none());
 }
 
-#[test]
-fn oidc_callback_input_rejects_provider_error_before_code_or_state_processing() {
+#[actix_web::test]
+async fn oidc_callback_input_rejects_provider_error_before_code_or_state_processing() {
     let query = OidcCallbackQuery {
         code: Some("authorization-code".to_owned()),
         state: Some("A".repeat(32)),
@@ -712,16 +716,13 @@ fn oidc_callback_input_rejects_provider_error_before_code_or_state_processing() 
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
 
-#[test]
-fn oidc_callback_input_requires_urlsafe_state_and_bounded_non_empty_code() {
+#[actix_web::test]
+async fn oidc_callback_input_requires_urlsafe_state_and_bounded_non_empty_code() {
     let valid_state = "A".repeat(32);
     let valid = OidcCallbackQuery {
         code: Some(" code-1 ".to_owned()),
@@ -748,10 +749,7 @@ fn oidc_callback_input_requires_urlsafe_state_and_bounded_non_empty_code() {
             .expect_err("missing or malformed state must fail before token exchange");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            response
-                .extensions()
-                .get::<OAuthJsonErrorFields>()
-                .map(|fields| fields.error.as_str()),
+            oauth_error_code(response).await.as_deref(),
             Some("invalid_request")
         );
     }
@@ -765,10 +763,7 @@ fn oidc_callback_input_requires_urlsafe_state_and_bounded_non_empty_code() {
         .expect_err("missing, blank, or oversized authorization code must fail closed");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
-            response
-                .extensions()
-                .get::<OAuthJsonErrorFields>()
-                .map(|fields| fields.error.as_str()),
+            oauth_error_code(response).await.as_deref(),
             Some("invalid_request")
         );
     }
@@ -791,10 +786,7 @@ async fn oidc_callback_after_rate_limit_rejects_provider_error_before_state_look
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -820,10 +812,7 @@ async fn federation_provider_callback_rejects_unknown_provider_before_input_proc
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -845,10 +834,7 @@ async fn oidc_callback_after_rate_limit_validates_input_before_state_storage_err
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_code(response).await.as_deref(),
         Some("server_error")
     );
 }
@@ -873,7 +859,7 @@ async fn oidc_callback_treats_missing_state_as_expired_before_token_exchange() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -907,7 +893,7 @@ async fn oidc_callback_rejects_malformed_stored_state_before_token_exchange() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -939,7 +925,7 @@ async fn oidc_callback_rejects_expired_stored_state_before_token_exchange() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -982,7 +968,7 @@ async fn oidc_callback_rejects_state_bound_to_another_provider_before_token_exch
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -1016,7 +1002,7 @@ async fn oidc_callback_requires_normalized_email_claim_before_identity_resolutio
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -1050,7 +1036,7 @@ async fn oidc_callback_rejects_unverified_email_before_identity_resolution() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -1084,7 +1070,7 @@ async fn oidc_callback_rejects_missing_email_verification_before_identity_resolu
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -1314,7 +1300,7 @@ async fn saml_acs_requires_gateway_configuration_before_payload_validation() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("temporarily_unavailable")
     );
 }
@@ -1347,7 +1333,7 @@ async fn saml_acs_rejects_invalid_email_before_signature_or_identity_resolution(
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -1373,7 +1359,7 @@ async fn saml_acs_rejects_signed_assertion_with_wrong_audience_before_identity_r
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -1398,7 +1384,7 @@ async fn federation_provider_start_rejects_unknown_provider_after_rate_limit() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -1499,7 +1485,7 @@ async fn oidc_callback_denies_failed_token_exchange_and_consumes_state() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
     assert!(
@@ -1554,7 +1540,10 @@ async fn oidc_callback_returns_server_error_when_jwks_response_is_invalid() {
         .expect("JWKS endpoint should receive the fetch request");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
 }
 
 #[actix_web::test]
@@ -1595,7 +1584,7 @@ async fn oidc_callback_rejects_id_token_policy_failures_and_consumes_state() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("access_denied")
     );
     assert!(
@@ -1647,11 +1636,14 @@ async fn oidc_callback_reports_identity_resolution_db_failure_without_session_co
         .expect("JWKS endpoint should receive the fetch request");
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
     assert!(
         cookie_value_from_response(&response, &state.settings.session.session_cookie_name)
             .is_none(),
         "identity-resolution database failures must not issue a federated session"
+    );
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
     );
     assert!(
         valkey_get(&state.valkey, oidc_state_key(&state_token))
@@ -1852,10 +1844,6 @@ async fn oidc_callback_rejects_existing_inactive_email_account_without_link_or_s
         .expect("JWKS endpoint should receive the fetch request");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        oauth_error_code(&response).as_deref(),
-        Some("access_denied")
-    );
     assert!(
         cookie_value_from_response(
             &response,
@@ -1863,6 +1851,10 @@ async fn oidc_callback_rejects_existing_inactive_email_account_without_link_or_s
         )
         .is_none(),
         "inactive existing email accounts must not receive a federated session"
+    );
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("access_denied")
     );
     assert!(
         fixture
@@ -1930,10 +1922,6 @@ async fn oidc_callback_rejects_inactive_linked_user() {
         .expect("JWKS endpoint should receive the fetch request");
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        oauth_error_code(&response).as_deref(),
-        Some("access_denied")
-    );
     assert!(
         cookie_value_from_response(
             &response,
@@ -1941,6 +1929,10 @@ async fn oidc_callback_rejects_inactive_linked_user() {
         )
         .is_none(),
         "inactive linked users must not receive a session cookie"
+    );
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("access_denied")
     );
 }
 
@@ -1986,10 +1978,6 @@ async fn social_callback_without_email_rejects_inactive_linked_user() {
     .await
     .expect("social callback should complete within the fixture deadline");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        oauth_error_code(&response).as_deref(),
-        Some("access_denied")
-    );
     assert!(
         cookie_value_from_response(
             &response,
@@ -1997,6 +1985,10 @@ async fn social_callback_without_email_rejects_inactive_linked_user() {
         )
         .is_none(),
         "inactive linked social users must not receive a session"
+    );
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("access_denied")
     );
 }
 
@@ -2068,7 +2060,7 @@ async fn saml_acs_creates_new_federated_user_session_and_external_link() {
     .await;
     assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&replay).as_deref(),
+        oauth_error_code(replay).await.as_deref(),
         Some("access_denied"),
         "a signed SAML assertion must be accepted at most once"
     );

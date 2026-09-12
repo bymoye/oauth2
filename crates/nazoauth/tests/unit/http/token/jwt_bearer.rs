@@ -1,12 +1,35 @@
-use nazo_http_actix::OAuthJsonErrorFields;
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
+use actix_web::HttpRequest;
+use actix_web::HttpResponse;
+use actix_web::http::StatusCode;
+use chrono::Utc;
+use nazo_auth::JwtBearerAssertionClaims;
+use nazo_auth::JwtBearerGrantPolicy;
+use nazo_auth::ValidatedClientAssertion;
+use nazo_auth::ValidatedJwtBearerAssertion;
+use nazo_auth::validate_jwt_bearer_assertion_claims;
+use nazo_oauth_server::contracts::token_forms::TokenForm;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
+use serde_json::json;
+const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const JWT_BEARER_ASSERTION_TYP: &str = "oauth-jwt-bearer+jwt";
+use nazo_oauth_server::token::jwt_bearer::JwtBearerAssertionError;
+use nazo_oauth_server::token::jwt_bearer::consume_jwt_bearer_assertion_with_authorization_service;
+use nazo_oauth_server::token::jwt_bearer::jwt_bearer_grant_key;
+use nazo_oauth_server::token::jwt_bearer::token_jwt_bearer_with_service;
+use nazo_oauth_server::token::jwt_bearer::validate_jwt_bearer_assertion_with_issuer;
 
 use crate::test_support::TestInfrastructure;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 use crate::settings::Settings;
 
@@ -47,26 +70,31 @@ pub(crate) async fn token_jwt_bearer(
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let config = crate::http::token::issue::TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = crate::http::token::issue::test_support::test_authorization_service(state);
-    token_jwt_bearer_with_service(
-        &service,
-        &TokenIssuanceContext {
-            config: &config,
-            modules: &modules,
-            authorization: &authorization,
-            remote_client_documents: crate::test_support::test_remote_client_documents(),
-        },
-        req,
-        &mut client,
-        form,
-        client_assertion,
+    crate::http::token::issue::test_support::present_token_result(
+        token_jwt_bearer_with_service(
+            &service,
+            &TokenIssuanceContext {
+                config: &config,
+                modules: &modules,
+                authorization: &authorization,
+                security_audit: crate::http::authorization::test_support::test_security_audit(),
+                remote_client_documents: crate::test_support::test_remote_client_documents(),
+            },
+            &crate::http::token::issue::test_support::token_request_facts(
+                req,
+                state.settings.as_ref(),
+            ),
+            &mut client,
+            form,
+            client_assertion,
+        )
+        .await,
     )
-    .await
 }
 
-use super::*;
 use crate::config::ConfigSource;
 use actix_web::test::TestRequest;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -382,10 +410,7 @@ async fn jwt_bearer_grant_rejects_public_clients_and_missing_assertions() {
         token_jwt_bearer(&state, &req, &public_client, &jwt_bearer_form(None), None).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("unauthorized_client")
     );
 
@@ -400,10 +425,7 @@ async fn jwt_bearer_grant_rejects_public_clients_and_missing_assertions() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_request")
     );
 }
@@ -467,10 +489,7 @@ async fn jwt_bearer_replay_rejects_a_consumed_jti_even_with_a_persisted_response
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 }

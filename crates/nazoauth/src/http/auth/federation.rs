@@ -13,13 +13,14 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use serde_json::json;
 
-use crate::bootstrap::LocalFederationService;
+use crate::adapters::email::normalize_email_address;
 use crate::settings::{
     ExternalLoginProvider, ExternalLoginProviderAdapter, FederationProviderRegistry,
     OidcFederationSettings, SamlGatewaySettings, SocialProviderSettings,
 };
-use crate::{adapters::email::normalize_email_address, http::rate_limit::AuthRequestLimiter};
 use nazo_http_actix::{ClientIpConfig, client_ip_with_config};
+use nazo_oauth_server::rate_limit::AuthRequestLimiter;
+use nazo_oauth_server::services::LocalFederationService;
 
 mod oidc;
 mod saml;
@@ -132,12 +133,15 @@ pub(crate) async fn federation_provider_list(config: Data<FederationHttpConfig>)
 
 pub(crate) async fn federation_provider_start(
     limiter: Data<AuthRequestLimiter>,
+    client_ip: Data<ClientIpConfig>,
     service: Data<LocalFederationService>,
     config: Data<FederationHttpConfig>,
     req: HttpRequest,
     path: Path<String>,
 ) -> HttpResponse {
-    if let Err(response) = limiter.enforce(&req).await {
+    if let Err(response) =
+        crate::http::rate_limit::enforce_auth_request_limit(&limiter, &req, &client_ip).await
+    {
         return response;
     }
     let provider_id = path.into_inner();
@@ -181,7 +185,9 @@ pub(crate) async fn federation_provider_callback(
     path: Path<String>,
     Query(query): Query<OidcCallbackQuery>,
 ) -> HttpResponse {
-    if let Err(response) = limiter.enforce(&req).await {
+    if let Err(response) =
+        crate::http::rate_limit::enforce_auth_request_limit(&limiter, &req, &client_ip).await
+    {
         return response;
     }
     let provider_id = path.into_inner();
@@ -371,7 +377,9 @@ pub(crate) async fn federation_saml_acs(
     req: HttpRequest,
     Json(payload): Json<SamlGatewayAssertion>,
 ) -> HttpResponse {
-    if let Err(response) = limiter.enforce(&req).await {
+    if let Err(response) =
+        crate::http::rate_limit::enforce_auth_request_limit(&limiter, &req, &client_ip).await
+    {
         return response;
     }
     let Some(settings) = config.saml_gateway.as_ref() else {

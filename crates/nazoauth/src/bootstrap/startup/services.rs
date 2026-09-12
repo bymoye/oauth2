@@ -65,6 +65,10 @@ impl ServiceAssembly {
         let identity = &self.identity;
         let startup = &self.startup;
         let mut extensions = Extensions::new();
+        insert(
+            &mut extensions,
+            web::Data::from(core.security_audit.clone()),
+        );
 
         insert(
             &mut extensions,
@@ -73,7 +77,7 @@ impl ServiceAssembly {
         insert(
             &mut extensions,
             web::Data::from(startup.remote_client_documents.clone()
-                as Arc<dyn nazo_http_actix::RemoteJwksResolverPort>),
+                as Arc<dyn nazo_oauth_server::contracts::dynamic_client_registration::RemoteJwksResolverPort>),
         );
         if let Some(source) =
             crate::keyctl::MdocCrlSource::from_settings(&startup.settings, startup.keyset.clone())
@@ -95,9 +99,7 @@ impl ServiceAssembly {
         insert(&mut extensions, startup.mtls_certificate_source.clone());
         insert(&mut extensions, startup.readiness_dependencies.clone());
         insert(&mut extensions, core.token_endpoint_handles.clone());
-        insert(&mut extensions, core.ciba_service.clone());
-        insert(&mut extensions, core.ciba_users.clone());
-        insert(&mut extensions, core.ciba_config.clone());
+        insert(&mut extensions, core.ciba_application.clone());
         insert(&mut extensions, core.token_issuance_config.clone());
         insert(&mut extensions, core.device_service.clone());
         insert(&mut extensions, core.device_grants.clone());

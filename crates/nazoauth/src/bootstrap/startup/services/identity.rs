@@ -1,6 +1,11 @@
 use super::super::configuration::StartupConfiguration;
 use super::dependencies::CoreServices;
 use super::*;
+use nazo_oauth_server::services::{
+    AccountProfileService, ClientAccessProfileService, FederationProfileService,
+    LocalAuthenticationService, LocalFederationService, LocalPasskeyService,
+    LocalRegistrationService, MtlsTrustAnchorService, PASSKEY_CEREMONY_TTL_SECONDS,
+};
 
 /// Identity, session, administration, and local-login endpoints.  These
 /// adapters share session/cookie policy and are kept together so that the
@@ -82,66 +87,78 @@ pub(super) async fn build(
         session_cookie_config.clone(),
         startup.runtime_modules.administration(),
     ));
-    let admin_sessions = web::Data::new(AdminSessionHandles::from_port(
+    let session_resolver = Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
         transient_state.sessions(),
         persistence.session_accounts(),
         settings.tenant.context.tenant_id,
+    ));
+    let admin_sessions = web::Data::new(AdminSessionHandles::new(
+        session_resolver.clone(),
         session_http_config.clone(),
     ));
+    let authorization_application = Arc::new(
+        nazo_oauth_server::authorization::AuthorizationApplication::new(
+            core.authorization_service.clone().into_inner(),
+            core.security_audit.clone(),
+            core.authorization_config.clone().into_inner(),
+            session_resolver.clone(),
+            runtime_registry.snapshot_store(),
+            startup.remote_client_documents.clone(),
+            startup.remote_client_documents.clone(),
+            keyset.clone(),
+            settings.tenant.context.tenant_id.as_uuid(),
+            if settings.modules.enable_openid4vci_issuer {
+                Some(
+                    persistence.openid4vci_authorization_offers(
+                        settings
+                            .openid4vc
+                            .data_encryption_key
+                            .expect("enabled OpenID4VCI requires a data encryption key"),
+                    ),
+                )
+            } else {
+                None
+            },
+        ),
+    );
     let authorization_endpoint = web::Data::new(AuthorizationEndpoint::new(
-        core.authorization_service.clone().into_inner(),
-        core.authorization_config.clone().into_inner(),
-        admin_sessions.clone().into_inner(),
-        runtime_registry.clone(),
-        startup.remote_client_documents.clone(),
-        keyset.clone(),
-        settings.tenant.context.tenant_id.as_uuid(),
-        if settings.modules.enable_openid4vci_issuer {
-            Some(
-                persistence.openid4vci_authorization_offers(
-                    settings
-                        .openid4vc
-                        .data_encryption_key
-                        .expect("enabled OpenID4VCI requires a data encryption key"),
-                ),
-            )
-        } else {
-            None
-        },
+        authorization_application,
+        ClientIpConfig::new(
+            &settings.endpoint.trusted_proxy_cidrs,
+            settings.endpoint.client_ip_header_mode,
+        ),
+        session_http_config.clone(),
     ));
     let admin_federation = web::Data::new(AdminFederationConfig::from_settings(&startup.settings));
-    let session_profiles = web::Data::new(SessionProfileHandles::from_port(
-        transient_state.sessions(),
-        persistence.session_accounts(),
-        settings.tenant.context.tenant_id,
+    let session_profiles = web::Data::new(SessionProfileHandles::new(
+        session_resolver.clone(),
         session_http_config.clone(),
     ));
     let session_management_endpoint = web::Data::new(SessionManagementEndpoint::new(
         Arc::new(ServerSessionManagementOperations::new(
-            session_profiles.get_ref().clone(),
+            session_resolver.clone(),
             persistence.admin_clients(),
-            runtime_registry.clone(),
+            runtime_registry.snapshot_store(),
         )),
         SessionManagementConfig::new(
             settings.endpoint.issuer.as_str(),
             session.session_cookie_name.as_str(),
         ),
     ));
-    let device_decision_handles = web::Data::new(DeviceDecisionHandles::new(
-        core.authorization_service.clone(),
-        core.device_service.clone(),
-        core.device_grants.clone(),
-        session_profiles.clone(),
-        core.device_config.clone(),
-        core.authorization_runtime.clone(),
-    ));
     let oidc_logout_operations = OidcLogoutHandles::new(
-        session_profiles.get_ref().clone(),
+        session_resolver.clone(),
         persistence.logout_clients(),
         persistence.logout_outbox(),
         keyset.clone(),
-        OidcLogoutConfig::from(settings),
-        runtime_registry.clone(),
+        OidcLogoutConfig {
+            issuer: settings.endpoint.issuer.as_str().into(),
+            pairwise_subject_secret: settings
+                .protocol
+                .pairwise_subject_secret
+                .as_deref()
+                .map(Into::into),
+        },
+        runtime_registry.snapshot_store(),
     );
     let oidc_logout = web::Data::new(OidcLogoutEndpoint::new(
         Arc::new(oidc_logout_operations),
@@ -247,8 +264,9 @@ pub(super) async fn build(
             identity_session_service.clone(),
             settings.tenant.context.tenant_id,
             core.authorization_config.clone().into_inner(),
-            runtime_registry.clone(),
+            runtime_registry.snapshot_store(),
             startup.remote_client_documents.clone(),
+            core.security_audit.clone(),
         )),
         session_cookie_config.clone(),
         client_ip_config.get_ref().clone(),
@@ -258,21 +276,29 @@ pub(super) async fn build(
         transient_state.request_rate_limits(),
         identity_settings.rate_limit.window_seconds,
         identity_settings.rate_limit.auth_max_requests,
-        client_ip_config.get_ref().clone(),
     ));
     let token_management_limiter = web::Data::new(TokenManagementRequestLimiter::new(
         transient_state.request_rate_limits(),
         identity_settings.rate_limit.window_seconds,
         identity_settings.rate_limit.token_management_max_requests,
-        client_ip_config.get_ref().clone(),
+    ));
+    let device_decision_handles = web::Data::new(DeviceDecisionHandles::new(
+        core.authorization_service.clone().into_inner(),
+        core.device_service.clone().into_inner(),
+        core.device_grants.clone().into_inner(),
+        Arc::new(crate::http::token::device_config::device_config_from_settings(settings)),
+        runtime_registry.snapshot_store(),
+        startup.remote_client_documents.clone(),
+        token_management_limiter.clone().into_inner(),
+        core.security_audit.clone(),
     ));
     let email_delivery =
         SmtpVerificationEmailDelivery::from_delivery(&identity_settings.email.delivery);
     let registration = LocalRegistrationService::from_port(
         persistence.registration_accounts(),
         transient_state.email_verification(),
-        RegistrationSecretHasher,
-        email_delivery,
+        Arc::new(RegistrationSecretHasher),
+        Arc::new(email_delivery),
         settings.tenant.context,
         nazo_identity::RegistrationServiceConfig {
             delivery_enabled: email_delivery_configured(&startup.settings),
@@ -321,10 +347,10 @@ pub(super) async fn build(
     let authentication = LocalAuthenticationService::from_ports(
         persistence.login_accounts(),
         transient_state.login_throttle(),
-        LoginPasswordVerifier,
+        Arc::new(LoginPasswordVerifier),
         persistence.remembered_mfa_devices(mfa_totp_keys.clone()),
         transient_state.login_sessions(),
-        TracingAuthenticationAudit,
+        Arc::new(TracingAuthenticationAudit::new(core.security_audit.clone())),
         nazo_identity::AuthenticationServiceConfig {
             tenant_id: settings.tenant.context.tenant_id,
             dummy_password_hash: nazo_identity::PasswordHash::new(dummy_password_hash()?)?,
@@ -358,7 +384,7 @@ pub(super) async fn build(
             transient_state.passkey_ceremonies(),
             persistence.remembered_mfa_devices(mfa_totp_keys),
             transient_state.login_sessions(),
-            TracingPasskeyAudit,
+            Arc::new(TracingPasskeyAudit::new(core.security_audit.clone())),
             nazo_identity::PasskeyServiceConfig {
                 tenant_id: settings.tenant.context.tenant_id,
                 rp_id: passkey.rp_id.to_owned(),
@@ -396,9 +422,9 @@ pub(super) async fn build(
     let federation = web::Data::new(LocalFederationService::from_port(
         persistence.federation_logins(),
         transient_state.federation_state(),
-        FederationBootstrapPasswordHasher,
+        Arc::new(FederationBootstrapPasswordHasher),
         transient_state.login_sessions(),
-        TracingFederationAudit,
+        Arc::new(TracingFederationAudit::new(core.security_audit.clone())),
         nazo_identity::FederationServiceConfig {
             tenant: settings.tenant.context,
             state_ttl_seconds: FEDERATION_STATE_TTL_SECONDS,

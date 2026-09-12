@@ -1,20 +1,15 @@
 use super::{admin_clients, clients_list_response};
-use crate::domain::ClientRow;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
 use crate::http::admin::clients::test_support::{
     CreateClientRequest, InsertClientError, PreparedClientRegistration, admin_client_service,
     admin_session_handles, insert_prepared_client, prepare_client_insert_with_secret_pepper,
 };
-use crate::http::sessions::SessionPayload;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
+use actix_web::HttpRequest;
 use actix_web::cookie::Cookie;
 use actix_web::http::StatusCode;
 use actix_web::web::{Data, Query};
-use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
 use diesel::sql_query;
 use diesel::sql_types::{Int4, Text, Uuid as SqlUuid};
@@ -23,12 +18,16 @@ use fred::interfaces::ClientLike;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::sessions::SessionPayload;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use nazo_http_actix::OAuthJsonErrorFields;
 use nazo_postgres::{create_pool, get_conn};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -185,11 +184,15 @@ fn create_client_request(client_name: &str) -> CreateClientRequest {
     }
 }
 
-fn oauth_error_name(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 struct LiveAdminClientListFixture {
@@ -386,7 +389,7 @@ async fn admin_clients_requires_admin_before_database_lookup() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }

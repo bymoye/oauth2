@@ -8,21 +8,20 @@ use fred::interfaces::ClientLike;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
-use nazo_http_actix::OAuthJsonErrorFields;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use crate::domain::ClientRow;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
 use crate::http::sessions::SessionHttpConfig;
-use crate::http::sessions::SessionPayload;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
 use chrono::Utc;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::{create_pool, get_conn};
 
 use crate::http::admin::clients::test_support::{
@@ -106,10 +105,12 @@ fn admin_grant_dependencies(
 ) {
     let session = &state.settings.session;
     (
-        Data::new(AdminSessionHandles::from_port(
-            Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
-            Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
-            state.settings.tenant.context.tenant_id,
+        Data::new(AdminSessionHandles::new(
+            std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
+                Arc::new(nazo_valkey::SessionStore::new(&state.valkey_connection())),
+                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
+                state.settings.tenant.context.tenant_id,
+            )),
             SessionHttpConfig::new(
                 &session.session_cookie_name,
                 &session.csrf_cookie_name,
@@ -197,11 +198,15 @@ fn create_client_request(client_name: &str) -> CreateClientRequest {
     }
 }
 
-fn oauth_error_name(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 fn database_url_with_search_path(schema: &str) -> Option<String> {
@@ -595,7 +600,7 @@ async fn admin_grants_requires_admin_before_database_lookup() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -623,7 +628,7 @@ async fn admin_revoke_grant_rejects_missing_csrf_before_auth_or_lookup() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -659,7 +664,7 @@ async fn admin_revoke_grant_requires_admin_even_with_valid_csrf() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        oauth_error_name(&response).as_deref(),
+        oauth_error_name(response).await.as_deref(),
         Some("access_denied")
     );
 }
@@ -745,7 +750,7 @@ async fn admin_revoke_grant_validates_input_and_removes_live_grants() {
     .await;
     assert_eq!(invalid_user_response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_name(&invalid_user_response).as_deref(),
+        oauth_error_name(invalid_user_response).await.as_deref(),
         Some("invalid_request")
     );
 
@@ -760,7 +765,7 @@ async fn admin_revoke_grant_validates_input_and_removes_live_grants() {
     .await;
     assert_eq!(missing_client_response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
-        oauth_error_name(&missing_client_response).as_deref(),
+        oauth_error_name(missing_client_response).await.as_deref(),
         Some("invalid_request")
     );
 

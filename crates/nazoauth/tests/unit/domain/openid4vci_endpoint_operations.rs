@@ -1,7 +1,20 @@
-use super::dataset::openid4vci_credential_identifier;
-use super::*;
+use nazo_digital_credentials::EphemeralEncryptionKey;
+use nazo_oauth_server::domain::openid4vc::client_attestation::Openid4vcClientAttestationValidator;
+use nazo_oauth_server::domain::openid4vc::{Openid4vcCredentialCrypto, Openid4vcProofValidator};
+use nazo_oauth_server::domain::openid4vc_endpoints::{
+    ServerCredentialIssuerOperations, openid4vci_authorization_detail,
+};
+use nazo_openid4vci::application::{
+    AccessTokenScheme, CreateCredentialOfferRequest, CreateCredentialOfferResponse,
+    CredentialHttpError, CredentialIssuerOperations, CredentialRequestBody,
+    CredentialRequestContext, CredentialResponseBody, PreAuthorizedTokenRequest,
+};
+use nazo_openid4vci::{
+    CredentialConfiguration, CredentialRequest, DeferredCredentialRequest, NotificationRequest,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -20,14 +33,51 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ECDSA_P256_SHA256,
 };
+use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::{
-    config::ConfigSource,
-    domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID},
-    http::{authorization::ServerAuthorizationService, token::ServerTokenService},
-    runtime_modules::test_support::runtime_module_registry_with_modules_for_test,
-    settings::Settings,
-};
+use crate::config::ConfigSource;
+use crate::runtime_modules::test_support::runtime_module_registry_with_modules_for_test;
+use crate::settings::Settings;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::services::ServerAuthorizationService;
+use nazo_oauth_server::services::ServerTokenService;
+
+struct IssuerFixture {
+    operations: ServerCredentialIssuerOperations,
+    issuer: String,
+    tenant_id: Uuid,
+    token_service: Arc<ServerTokenService>,
+    request_encryption: EphemeralEncryptionKey,
+    datasets: Arc<dyn nazo_persistence::Openid4vciDatasetStore>,
+}
+
+impl std::ops::Deref for IssuerFixture {
+    type Target = ServerCredentialIssuerOperations;
+
+    fn deref(&self) -> &Self::Target {
+        &self.operations
+    }
+}
+
+impl IssuerFixture {
+    async fn access(&self, context: &CredentialRequestContext) -> Result<(), CredentialHttpError> {
+        match self
+            .operations
+            .credential(
+                context.clone(),
+                CredentialRequestBody::Json(credential_request()),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.status == 400 => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
 
 fn invalid_pool() -> nazo_postgres::DbPool {
     nazo_postgres::create_pool(
@@ -39,8 +89,6 @@ fn invalid_pool() -> nazo_postgres::DbPool {
 
 async fn fixture_crypto() -> Openid4vcCredentialCrypto {
     let settings = KeySettings {
-        external_command: Vec::new(),
-        external_timeout: std::time::Duration::from_secs(1),
         rotation_interval: chrono::Duration::days(30),
         prepublish_window: chrono::Duration::days(1),
         verification_grace: chrono::Duration::hours(1),
@@ -97,12 +145,13 @@ async fn fixture_crypto() -> Openid4vcCredentialCrypto {
     Openid4vcCredentialCrypto::new_with_policies(
         keyset,
         VcIssuerTrustPolicy::san_bound(),
-        crate::settings::Openid4vcRevocationPolicy::Disabled,
+        nazo_oauth_server::policy::Openid4vcRevocationPolicy::Disabled,
+        Arc::new(crate::adapters::mdoc_signer::TokioMdocDocumentSigner),
     )
     .expect("endpoint credential crypto")
 }
 
-async fn operations(enabled: bool) -> ServerCredentialIssuerOperations {
+async fn operations(enabled: bool) -> IssuerFixture {
     let pool = invalid_pool();
     let mut valkey_builder = fred::prelude::Builder::default_centralized();
     valkey_builder.with_performance_config(|performance: &mut fred::prelude::PerformanceConfig| {
@@ -129,7 +178,7 @@ async fn operations(enabled: bool) -> ServerCredentialIssuerOperations {
 
 async fn operations_with_client_attestation(
     client_attestation: Arc<Openid4vcClientAttestationValidator>,
-) -> ServerCredentialIssuerOperations {
+) -> IssuerFixture {
     let pool = invalid_pool();
     let mut valkey_builder = fred::prelude::Builder::default_centralized();
     valkey_builder.with_performance_config(|performance: &mut fred::prelude::PerformanceConfig| {
@@ -173,7 +222,7 @@ async fn operations_with_inputs(
     enabled: bool,
     configurations: BTreeMap<String, CredentialConfiguration>,
     deferred_configurations: BTreeSet<String>,
-) -> ServerCredentialIssuerOperations {
+) -> IssuerFixture {
     operations_with_inputs_and_attestation(
         pool,
         valkey_connection,
@@ -192,7 +241,7 @@ async fn operations_with_inputs_and_attestation(
     configurations: BTreeMap<String, CredentialConfiguration>,
     deferred_configurations: BTreeSet<String>,
     client_attestation: Option<Arc<Openid4vcClientAttestationValidator>>,
-) -> ServerCredentialIssuerOperations {
+) -> IssuerFixture {
     let mut settings =
         Settings::from_config(&ConfigSource::default()).expect("unit settings should load");
     settings.endpoint.issuer = "https://issuer.example".to_owned();
@@ -237,24 +286,37 @@ async fn operations_with_inputs_and_attestation(
     let datasets: Arc<dyn nazo_persistence::Openid4vciDatasetStore> = Arc::new(
         nazo_postgres::Openid4vciDatasetRepository::new(pool, [0x51; 32]),
     );
-    ServerCredentialIssuerOperations::new(
+    let issuer = settings.endpoint.issuer;
+    let request_encryption =
+        EphemeralEncryptionKey::derive(&[0x51; 32], b"credential-request-encryption")
+            .expect("fixture encryption key should derive");
+    let operations = ServerCredentialIssuerOperations::new(
         store,
         users,
-        datasets,
+        datasets.clone(),
         DEFAULT_TENANT_ID,
         [0x51; 32],
-        token_service,
+        token_service.clone(),
         authorization,
-        runtime,
+        runtime.snapshot_store(),
+        Arc::new(crate::bootstrap::RegistrationSecretHasher),
         crypto,
         proof_validator,
         client_attestation,
-        settings.endpoint.issuer,
+        issuer.clone(),
         configurations,
         deferred_configurations,
         nazo_auth::DpopNoncePolicy::Optional,
     )
-    .expect("credential issuer fixture should build")
+    .expect("credential issuer fixture should build");
+    IssuerFixture {
+        operations,
+        issuer,
+        tenant_id: DEFAULT_TENANT_ID,
+        token_service,
+        request_encryption,
+        datasets,
+    }
 }
 
 fn configured_client_attestation_fixture()
@@ -343,7 +405,7 @@ fn live_configuration(configuration_id: &str) -> (String, CredentialConfiguratio
 }
 
 struct LiveEndpointFixture {
-    issuer: ServerCredentialIssuerOperations,
+    issuer: IssuerFixture,
     pool: nazo_postgres::DbPool,
     admin_id: Uuid,
     subject_id: Uuid,
@@ -511,7 +573,13 @@ fn jwt_credential_request(configuration_id: &str, issuer: &str, nonce: &str) -> 
         }),
     );
     CredentialRequest {
-        credential_identifier: Some(openid4vci_credential_identifier(configuration_id)),
+        credential_identifier: Some(nazo_openid4vci::CredentialIdentifier(
+            openid4vci_authorization_detail("https://issuer.example", configuration_id)
+                ["credential_identifiers"][0]
+                .as_str()
+                .expect("fixture identifier")
+                .to_owned(),
+        )),
         credential_configuration_id: None,
         proofs: Some(nazo_openid4vci::Proofs(BTreeMap::from([(
             "jwt".to_owned(),
@@ -553,42 +621,6 @@ fn assert_error(
     assert_eq!(error.error, code);
     assert_eq!(error.description, description);
     assert!(error.dpop_nonce.is_none());
-}
-
-#[tokio::test]
-async fn request_json_accepts_json_and_rejects_invalid_encrypted_request() {
-    let issuer = operations(false).await;
-    let request = credential_request();
-    assert_eq!(
-        issuer
-            .request_json(CredentialRequestBody::Json(request.clone()))
-            .await
-            .expect("JSON request should pass through"),
-        request
-    );
-
-    let error = issuer
-        .request_json::<CredentialRequest>(CredentialRequestBody::Jwt("not-a-jwe".to_owned()))
-        .await
-        .expect_err("malformed encrypted request must fail closed");
-    assert_eq!(error.status, 400);
-    assert_eq!(error.error, "invalid_encryption_parameters");
-
-    let mut jwk = issuer.request_encryption.public_jwk();
-    jwk["alg"] = json!("ECDH-ES");
-    jwk["kid"] = json!("openid4vci-request-encryption");
-    let malformed = encrypt_ecdh_es(b"not-json", &jwk, Some("application/json"))
-        .expect("fixture request JWE should encrypt");
-    let error = issuer
-        .request_json::<CredentialRequest>(CredentialRequestBody::Jwt(malformed))
-        .await
-        .expect_err("encrypted non-JSON request must fail closed");
-    assert_error(
-        error,
-        400,
-        "invalid_credential_request",
-        "Encrypted credential request is malformed.",
-    );
 }
 
 #[tokio::test]
@@ -687,128 +719,6 @@ async fn enabled_metadata_is_signed_and_advertises_request_and_response_encrypti
         10
     );
     assert!(metadata.signed_metadata.is_some());
-}
-
-#[tokio::test]
-async fn finish_response_supports_json_ecdh_and_deflate_and_rejects_unsupported_parameters() {
-    let issuer = operations(false).await;
-    let response = CredentialResponse {
-        credentials: Some(vec![nazo_openid4vci::IssuedCredential {
-            credential: json!("unit-credential"),
-        }]),
-        transaction_id: None,
-        notification_id: None,
-        interval: None,
-    };
-
-    assert!(matches!(
-        issuer
-            .finish_response(response.clone(), None)
-            .await
-            .expect("unencrypted response should be JSON"),
-        CredentialResponseBody::Json(_)
-    ));
-
-    let mut jwk = issuer.request_encryption.public_jwk();
-    jwk["alg"] = json!("ECDH-ES");
-    jwk["kid"] = json!("openid4vci-request-encryption");
-    for zip in [None, Some("DEF".to_owned())] {
-        let encrypted = issuer
-            .finish_response(
-                response.clone(),
-                Some(&CredentialResponseEncryption {
-                    jwk: jwk.clone(),
-                    enc: "A256GCM".to_owned(),
-                    zip: zip.clone(),
-                }),
-            )
-            .await
-            .expect("supported ECDH response encryption should succeed");
-        let compact = match encrypted {
-            CredentialResponseBody::Jwt(value) => value,
-            CredentialResponseBody::Json(_) => {
-                panic!("encrypted response must use compact JWE")
-            }
-        };
-        let parts = compact.split('.').collect::<Vec<_>>();
-        assert_eq!(parts.len(), 5);
-        assert!(parts[1].is_empty(), "ECDH-ES uses direct key agreement");
-        let protected: Value = serde_json::from_slice(
-            &URL_SAFE_NO_PAD
-                .decode(parts[0])
-                .expect("protected header should be base64url"),
-        )
-        .expect("protected header should be JSON");
-        assert_eq!(protected["alg"], "ECDH-ES");
-        assert_eq!(protected["enc"], "A256GCM");
-        assert_eq!(protected["kid"], "openid4vci-request-encryption");
-        assert_eq!(protected["cty"], "application/json");
-        assert_eq!(protected.get("zip").and_then(Value::as_str), zip.as_deref());
-
-        let plaintext = issuer
-            .request_encryption
-            .decrypt_credential_request(&compact, "openid4vci-request-encryption")
-            .expect("recipient private key should decrypt the response");
-        assert_eq!(
-            plaintext,
-            serde_json::to_vec(&response).expect("credential response should serialize")
-        );
-
-        // The protected header is authenticated as the JWE AAD.  Changing it
-        // while retaining ciphertext must therefore invalidate decryption.
-        let mut changed_protected = protected;
-        changed_protected["aad-test"] = json!("tampered");
-        let changed_header = URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&changed_protected).expect("header should serialize"));
-        let tampered = format!(
-            "{changed_header}.{}.{}.{}.{}",
-            parts[1], parts[2], parts[3], parts[4]
-        );
-        assert!(
-            issuer
-                .request_encryption
-                .decrypt_credential_request(&tampered, "openid4vci-request-encryption")
-                .is_err()
-        );
-    }
-
-    for (jwk, enc, zip) in [
-        (json!({"alg":"RSA-OAEP"}), "A256GCM", None),
-        (json!({"alg":"ECDH-ES"}), "A128GCM", None),
-        (json!({"alg":"ECDH-ES"}), "A256GCM", Some("GZIP".to_owned())),
-    ] {
-        let error = issuer
-            .finish_response(
-                response.clone(),
-                Some(&CredentialResponseEncryption {
-                    jwk,
-                    enc: enc.to_owned(),
-                    zip,
-                }),
-            )
-            .await
-            .expect_err("unsupported response encryption must fail closed");
-        assert_eq!(error.status, 400);
-        assert_eq!(error.error, "invalid_encryption_parameters");
-    }
-
-    let error = issuer
-        .finish_response(
-            response,
-            Some(&CredentialResponseEncryption {
-                jwk: json!({"alg":"ECDH-ES"}),
-                enc: "A256GCM".to_owned(),
-                zip: None,
-            }),
-        )
-        .await
-        .expect_err("an incomplete ECDH key must fail during encryption");
-    assert_error(
-        error,
-        400,
-        "invalid_encryption_parameters",
-        "Credential response encryption key is invalid.",
-    );
 }
 
 #[tokio::test]

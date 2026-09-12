@@ -1,6 +1,6 @@
 use crate::test_support::DatabaseExternalIdentityFixture;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
 use chrono::Utc;
 

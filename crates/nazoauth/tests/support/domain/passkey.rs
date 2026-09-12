@@ -1,4 +1,5 @@
-use super::*;
+use nazo_identity::SessionService;
+use nazo_oauth_server::domain::passkey::PasskeyOperationsProvider;
 
 fn test_operations(
     state: &crate::test_support::TestInfrastructure,
@@ -23,11 +24,13 @@ pub(crate) fn test_login_endpoint(
     let endpoint = &state.settings.endpoint;
     actix_web::web::Data::new(nazo_http_actix::PasskeyLoginEndpoint::new(
         test_operations(state),
-        std::sync::Arc::new(crate::domain::ServerAuthenticationRateLimit::new(
-            std::sync::Arc::new(nazo_valkey::RateLimitStore::new(&state.valkey_connection())),
-            identity.rate_limit.window_seconds,
-            identity.rate_limit.auth_max_requests,
-        )),
+        std::sync::Arc::new(
+            nazo_oauth_server::domain::local_registration::ServerAuthenticationRateLimit::new(
+                std::sync::Arc::new(nazo_valkey::RateLimitStore::new(&state.valkey_connection())),
+                identity.rate_limit.window_seconds,
+                identity.rate_limit.auth_max_requests,
+            ),
+        ),
         nazo_http_actix::ClientIpConfig::new(
             &endpoint.trusted_proxy_cidrs,
             endpoint.client_ip_header_mode,
@@ -35,7 +38,7 @@ pub(crate) fn test_login_endpoint(
         nazo_http_actix::PasskeyLoginConfig::new(
             &session.session_cookie_name,
             &session.csrf_cookie_name,
-            crate::domain::MFA_REMEMBERED_COOKIE_NAME,
+            crate::http::auth::MFA_REMEMBERED_COOKIE_NAME,
             session.session_ttl_seconds,
             session.cookie_secure,
         ),

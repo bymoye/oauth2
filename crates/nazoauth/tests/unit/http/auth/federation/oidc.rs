@@ -1,9 +1,9 @@
 use super::*;
-use crate::adapters::security::random_urlsafe_token;
 use crate::settings::OidcFederationSettings;
 use crate::test_support::ClientSigningFixture;
 use crate::test_support::client_signing_fixture;
 use jsonwebtoken::{Algorithm, Header};
+use nazo_oauth_server::crypto::random_urlsafe_token;
 use serde_json::json;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

@@ -1,17 +1,15 @@
 //! 会话用户与权限解析。
 use actix_web::http::StatusCode;
+use nazo_oauth_server::sessions::{
+    AdminSessionError, CurrentSession, SessionResolver, require_admin_session, require_recent_mfa,
+};
 
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::Utc;
 use nazo_http_actix::oauth_error;
-use nazo_identity::{
-    PublicAccount, SessionId,
-    ports::{RepositoryError, SessionAccountPort, SessionStorePort},
-};
-use serde::{Deserialize, Serialize};
+use nazo_identity::PublicAccount;
 use std::sync::Arc;
 
-use uuid::Uuid;
 // 只处理从请求 Cookie 到当前用户/管理员身份的解析。
 
 use nazo_http_actix::{
@@ -19,53 +17,22 @@ use nazo_http_actix::{
     with_cookie_headers,
 };
 
-#[derive(Clone, Deserialize, Serialize)]
-pub(crate) struct SessionPayload {
-    pub(crate) user_id: Uuid,
-    pub(crate) auth_time: i64,
-    pub(crate) amr: Vec<String>,
-    #[serde(default)]
-    pub(crate) pending_mfa: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) oidc_sid: Option<String>,
-}
-
-pub(crate) struct CurrentSession {
-    pub(crate) user: PublicAccount,
-    pub(crate) auth_time: i64,
-    pub(crate) amr: Vec<String>,
-    pub(crate) oidc_sid: String,
-    pub(crate) logged_in_client_ids: Vec<String>,
-}
-
-/// Maximum age of an interactive MFA step-up accepted for high-impact admin
-/// mutations.  This is intentionally a fixed security default: making the
-/// check configurable would make an accidental deployment setting capable of
-/// silently turning the admin write boundary back into password-only access.
-pub(crate) const ADMIN_MFA_MAX_AGE_SECONDS: i64 = 5 * 60;
-const AUTH_TIME_CLOCK_SKEW_SECONDS: i64 = 30;
-
 /// Runtime-admin authentication dependencies, assembled once at the composition root.
 ///
-/// This deliberately owns backend-neutral ports instead of exposing database pools,
-/// transient-state connections, or complete server settings to HTTP handlers.
+/// This owns the application resolver and cookie configuration, without exposing
+/// storage connections or complete server settings to HTTP handlers.
 pub(crate) struct AdminSessionHandles {
-    sessions: Arc<dyn SessionStorePort>,
-    users: Arc<dyn SessionAccountPort>,
-    tenant_id: nazo_identity::TenantId,
+    resolver: Arc<SessionResolver>,
     http: SessionHttpConfig,
 }
 
 /// Profile session endpoint dependencies assembled at the composition root.
 ///
-/// The profile transport only receives the session/account ports and the small amount
-/// of HTTP/runtime configuration it consumes. It cannot reach raw storage connections,
-/// the keyset, or complete settings.
+/// The profile transport only receives the application resolver and cookie
+/// configuration. It cannot reach raw storage connections, the keyset, or settings.
 #[derive(Clone)]
 pub(crate) struct SessionProfileHandles {
-    sessions: Arc<dyn SessionStorePort>,
-    users: Arc<dyn SessionAccountPort>,
-    tenant_id: nazo_identity::TenantId,
+    resolver: Arc<SessionResolver>,
     http: SessionHttpConfig,
 }
 
@@ -103,18 +70,8 @@ impl SessionHttpConfig {
 }
 
 impl AdminSessionHandles {
-    pub(crate) fn from_port(
-        sessions: Arc<dyn SessionStorePort>,
-        users: Arc<dyn SessionAccountPort>,
-        tenant_id: nazo_identity::TenantId,
-        http: SessionHttpConfig,
-    ) -> Self {
-        Self {
-            sessions,
-            users,
-            tenant_id,
-            http,
-        }
+    pub(crate) fn new(resolver: Arc<SessionResolver>, http: SessionHttpConfig) -> Self {
+        Self { resolver, http }
     }
 
     pub(crate) fn http_config(&self) -> &SessionHttpConfig {
@@ -125,14 +82,10 @@ impl AdminSessionHandles {
         &self,
         req: &HttpRequest,
     ) -> anyhow::Result<Option<CurrentSession>> {
-        current_session_from_handles(
-            self.sessions.as_ref(),
-            self.users.as_ref(),
-            self.tenant_id,
-            self.http.session_cookie_name(),
-            req,
-        )
-        .await
+        let Some(session_id) = cookie_value(req, self.http.session_cookie_name()) else {
+            return Ok(None);
+        };
+        self.resolver.current_session_by_id(&session_id).await
     }
 
     pub(crate) async fn current_session_or_login_required(
@@ -152,22 +105,8 @@ impl AdminSessionHandles {
 }
 
 impl SessionProfileHandles {
-    pub(crate) fn from_port(
-        sessions: Arc<dyn SessionStorePort>,
-        users: Arc<dyn SessionAccountPort>,
-        tenant_id: nazo_identity::TenantId,
-        http: SessionHttpConfig,
-    ) -> Self {
-        Self {
-            sessions,
-            users,
-            tenant_id,
-            http,
-        }
-    }
-
-    pub(crate) fn tenant_id(&self) -> nazo_identity::TenantId {
-        self.tenant_id
+    pub(crate) fn new(resolver: Arc<SessionResolver>, http: SessionHttpConfig) -> Self {
+        Self { resolver, http }
     }
 
     pub(crate) fn http_config(&self) -> &SessionHttpConfig {
@@ -223,26 +162,6 @@ impl SessionProfileHandles {
         }
     }
 
-    pub(crate) async fn delete_session(&self, session_id: &str) -> Result<(), RepositoryError> {
-        self.sessions
-            .delete(&SessionId::new(session_id))
-            .await
-            .map(|_| ())
-    }
-
-    pub(crate) async fn current_session_by_id(
-        &self,
-        session_id: &str,
-    ) -> anyhow::Result<Option<CurrentSession>> {
-        current_session_by_id_from_handles(
-            self.sessions.as_ref(),
-            self.users.as_ref(),
-            self.tenant_id,
-            session_id,
-        )
-        .await
-    }
-
     pub(crate) async fn current_session(
         &self,
         req: &HttpRequest,
@@ -250,111 +169,8 @@ impl SessionProfileHandles {
         let Some(session_id) = cookie_value(req, self.http.session_cookie_name()) else {
             return Ok(None);
         };
-        self.current_session_by_id(&session_id).await
+        self.resolver.current_session_by_id(&session_id).await
     }
-}
-
-impl SessionPayload {
-    fn from_record(record: &nazo_identity::session::SessionRecord) -> Self {
-        Self {
-            user_id: record.user_id().as_uuid(),
-            auth_time: record.auth_time(),
-            amr: record.amr().to_vec(),
-            pending_mfa: record.pending_mfa(),
-            oidc_sid: record.oidc_sid().map(str::to_owned),
-        }
-    }
-}
-
-pub(crate) async fn current_session_from_handles(
-    sessions: &dyn SessionStorePort,
-    users: &dyn SessionAccountPort,
-    tenant_id: nazo_identity::TenantId,
-    session_cookie_name: &str,
-    req: &HttpRequest,
-) -> anyhow::Result<Option<CurrentSession>> {
-    let Some(sid) = cookie_value(req, session_cookie_name) else {
-        return Ok(None);
-    };
-    current_session_by_id_from_handles(sessions, users, tenant_id, &sid).await
-}
-
-async fn current_session_by_id_from_handles(
-    sessions: &dyn SessionStorePort,
-    users: &dyn SessionAccountPort,
-    tenant_id: nazo_identity::TenantId,
-    session_id: &str,
-) -> anyhow::Result<Option<CurrentSession>> {
-    let session_id = SessionId::new(session_id);
-    let stored = match sessions.load(&session_id).await {
-        Ok(stored) => stored,
-        Err(error @ RepositoryError::Consistency(_)) => {
-            tracing::warn!(%error, "session payload is malformed");
-            let _ = sessions.delete(&session_id).await;
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(stored) = stored else {
-        return Ok(None);
-    };
-    let now = Utc::now().timestamp();
-    let logged_in_client_ids = stored.record().logged_in_client_ids().to_vec();
-    let payload = SessionPayload::from_record(stored.record());
-    let payload = if valid_session_payload(&payload, now) {
-        payload
-    } else {
-        tracing::warn!("session payload contains invalid authentication metadata");
-        let _ = sessions.delete(&session_id).await;
-        return Ok(None);
-    };
-    if payload.pending_mfa {
-        return Ok(None);
-    }
-    session_from_payload(
-        sessions,
-        users,
-        tenant_id,
-        &session_id,
-        payload,
-        logged_in_client_ids,
-    )
-    .await
-}
-
-async fn session_from_payload(
-    sessions: &dyn SessionStorePort,
-    users: &dyn SessionAccountPort,
-    tenant_id: nazo_identity::TenantId,
-    session_id: &SessionId,
-    payload: SessionPayload,
-    logged_in_client_ids: Vec<String>,
-) -> anyhow::Result<Option<CurrentSession>> {
-    let user_id = nazo_identity::UserId::new(payload.user_id)?;
-    let Some(user) = users
-        .public_account_by_id(tenant_id, user_id)
-        .await?
-        .filter(|u| u.principal.active)
-    else {
-        let _ = sessions.delete(session_id).await;
-        return Ok(None);
-    };
-    Ok(Some(CurrentSession {
-        user,
-        auth_time: payload.auth_time,
-        amr: payload.amr,
-        oidc_sid: payload.oidc_sid.expect("valid session payload has sid"),
-        logged_in_client_ids,
-    }))
-}
-
-fn valid_session_payload(payload: &SessionPayload, now: i64) -> bool {
-    nazo_identity::session::valid_authentication_metadata(
-        payload.auth_time,
-        &payload.amr,
-        payload.oidc_sid.as_deref(),
-        now,
-    )
 }
 
 fn login_required_response_for_cookies(
@@ -399,46 +215,34 @@ pub(crate) async fn require_admin_with_recent_mfa_or_forbidden_with_handles(
     req: &HttpRequest,
 ) -> Result<PublicAccount, HttpResponse> {
     let session = current_admin_session_or_forbidden(handles, req).await?;
-    if recent_admin_mfa(&session, Utc::now().timestamp()) {
-        Ok(session.user)
-    } else {
-        Err(authorization_error_response(
-            StatusCode::PRECONDITION_REQUIRED,
-            "mfa_step_up_required",
-            "高影响管理员操作需要最近一次多因素认证.",
-        ))
-    }
+    require_recent_mfa(&session, Utc::now().timestamp()).map_err(admin_session_error_response)?;
+    Ok(session.user)
 }
 
 async fn current_admin_session_or_forbidden(
     handles: &AdminSessionHandles,
     req: &HttpRequest,
 ) -> Result<CurrentSession, HttpResponse> {
-    match handles.current_session(req).await {
-        Ok(Some(session)) if session.user.admin_level() > 0 => Ok(session),
-        Ok(Some(_)) | Ok(None) => Err(oauth_error(
+    let session = handles
+        .current_session(req)
+        .await
+        .map_err(session_lookup_error_response)?;
+    require_admin_session(session).map_err(admin_session_error_response)
+}
+
+fn admin_session_error_response(error: AdminSessionError) -> HttpResponse {
+    match error {
+        AdminSessionError::AccessDenied => oauth_error(
             StatusCode::FORBIDDEN,
             "access_denied",
             "当前账号无管理权限.",
-        )),
-        Err(error) => Err(session_lookup_error_response(error)),
+        ),
+        AdminSessionError::MfaStepUpRequired => authorization_error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "mfa_step_up_required",
+            "高影响管理员操作需要最近一次多因素认证.",
+        ),
     }
-}
-
-fn recent_admin_mfa(session: &CurrentSession, now: i64) -> bool {
-    recent_mfa_authentication(session.auth_time, &session.amr, now)
-}
-
-/// Pure policy predicate kept separate from session lookup so both the HTTP
-/// boundary and its old/no-factor regression tests use exactly one rule.
-fn recent_mfa_authentication(auth_time: i64, amr: &[String], now: i64) -> bool {
-    let age = now.saturating_sub(auth_time);
-    auth_time <= now.saturating_add(AUTH_TIME_CLOCK_SKEW_SECONDS)
-        && (0..=ADMIN_MFA_MAX_AGE_SECONDS).contains(&age)
-        && amr.iter().any(|method| method == "mfa")
-        && amr
-            .iter()
-            .any(|method| matches!(method.as_str(), "otp" | "recovery_code"))
 }
 
 fn session_lookup_error_response(error: anyhow::Error) -> HttpResponse {

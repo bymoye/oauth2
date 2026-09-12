@@ -1,13 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
-use crate::domain::{
-    MFA_REMEMBERED_COOKIE_NAME, MFA_REMEMBERED_TTL_SECONDS, ServerMfaSecretHasher,
-};
-use crate::http::sessions::SessionPayload;
+use crate::adapters::security::ServerMfaSecretHasher;
+use crate::http::auth::{MFA_REMEMBERED_COOKIE_NAME, MFA_REMEMBERED_TTL_SECONDS};
 use crate::schema::{user_passkey_credentials, users};
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_get;
@@ -28,7 +23,11 @@ use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
 use nazo_http_actix::{PasskeyLoginBeginRequest, PasskeyLoginFinishRequest, oauth_error};
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 use nazo_identity::PublicAccount;
+use nazo_oauth_server::sessions::SessionPayload;
 use nazo_postgres::get_conn;
 use passkey_auth::{AuthenticationResponse, PasskeyCredential, RegistrationResponse, Webauthn};
 use serde_json::{Value, json};
@@ -49,7 +48,7 @@ async fn remember_mfa_device(
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(crate::adapters::security::blake3_hex);
+        .map(nazo_oauth_server::crypto::blake3_hex);
     nazo_identity::MfaService::new(
         Arc::new(nazo_postgres::MfaRepository::new(state.diesel_db.clone())),
         Arc::new(ServerMfaSecretHasher),

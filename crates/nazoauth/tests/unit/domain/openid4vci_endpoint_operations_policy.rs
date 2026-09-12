@@ -1,7 +1,7 @@
 use super::*;
 
 async fn signed_access_token(
-    issuer: &ServerCredentialIssuerOperations,
+    issuer: &IssuerFixture,
     subject_id: Uuid,
     dpop_jkt: Option<&str>,
 ) -> String {
@@ -10,7 +10,7 @@ async fn signed_access_token(
 }
 
 async fn signed_mtls_access_token(
-    issuer: &ServerCredentialIssuerOperations,
+    issuer: &IssuerFixture,
     subject_id: Uuid,
     configuration_id: &str,
     mtls_x5t_s256: &str,
@@ -29,7 +29,7 @@ async fn signed_mtls_access_token(
 }
 
 async fn signed_access_token_with_binding(
-    issuer: &ServerCredentialIssuerOperations,
+    issuer: &IssuerFixture,
     subject_id: Uuid,
     dpop_jkt: Option<&str>,
     mtls_x5t_s256: Option<&str>,
@@ -58,30 +58,6 @@ async fn signed_access_token_with_binding(
         .await
         .expect("test key manager should sign the access token")
         .token
-}
-
-#[tokio::test]
-async fn dpop_nonce_generation_fails_closed_when_nonce_state_is_unavailable() {
-    let issuer = operations(true).await;
-    let error = issuer
-        .next_dpop_nonce(&CredentialAccess {
-            token_id: Uuid::now_v7(),
-            tenant_id: issuer.tenant_id,
-            subject_id: Uuid::now_v7(),
-            client_id: "unit-client".to_owned(),
-            configuration_ids: vec!["unit-config".to_owned()],
-            credential_identifiers: Vec::new(),
-            dpop_jkt: Some("unit-dpop-thumbprint".to_owned()),
-            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
-        })
-        .await
-        .expect_err("unavailable DPoP nonce state must fail closed");
-    assert_error(
-        error,
-        503,
-        "server_error",
-        "DPoP nonce issuance is unavailable.",
-    );
 }
 
 #[tokio::test]

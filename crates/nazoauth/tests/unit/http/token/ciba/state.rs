@@ -1,4 +1,3 @@
-use super::*;
 use crate::test_support::valkey::valkey_atomic_snapshot;
 use crate::test_support::valkey::valkey_eval_string;
 use fred::interfaces::ClientLike;
@@ -6,12 +5,14 @@ use fred::prelude::{
     Builder as ValkeyBuilder, Client as ValkeyClient, Config as ValkeyConfig, ConnectionConfig,
     PerformanceConfig,
 };
+use nazo_auth::CibaService;
 use nazo_auth::{
     CibaAtomicResult, CibaAuthenticationContext, CibaCreateFailure, CibaDecision,
     CibaDecisionEvaluation, CibaDecisionFailure, CibaPollCommit, CibaPollFailure,
     CibaPollTransition, CibaStateFuture, CibaStateStorePort, CibaStoredRequest,
     evaluate_ciba_decision, evaluate_ciba_poll,
 };
+use nazo_auth::{CibaRequestState, CibaStatePortError, CibaStatus};
 use nazo_valkey::AtomicResult as ValkeyAtomicResult;
 use nazo_valkey::CibaStore;
 use nazo_valkey::test_support::ciba_request_storage_key;
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 use tokio::sync::Barrier;
+use uuid::Uuid;
 
 fn pending_state(now: i64) -> CibaRequestState {
     CibaRequestState {

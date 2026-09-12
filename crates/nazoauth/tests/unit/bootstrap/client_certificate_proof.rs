@@ -39,7 +39,7 @@ async fn mtls_admits_tenant_keys_but_rejects_a_forged_certificate_verify_signatu
             "/probe",
             web::get().to(|request: HttpRequest| async move {
                 request
-                    .conn_data::<crate::http::mtls::MtlsClientCertificate>()
+                    .conn_data::<nazo_oauth_server::contracts::token_client_auth::ClientCertificateFacts>()
                     .map(|certificate| certificate.deployment_trusted_chain.to_string())
                     .unwrap_or_else(|| "absent".to_owned())
             }),

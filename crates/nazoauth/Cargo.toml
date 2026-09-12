@@ -12,6 +12,7 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+http.workspace = true
 actix-cors = { workspace = true }
 actix-files = { workspace = true }
 actix-multipart = "0.8.0"
@@ -92,6 +93,7 @@ yasna = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 chrono = { workspace = true }
 diesel = { workspace = true, features = ["64-column-tables", "chrono", "postgres_backend", "serde_json", "uuid"] }
 diesel-async = { workspace = true, features = ["deadpool", "postgres"] }

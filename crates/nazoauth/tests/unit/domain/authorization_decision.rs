@@ -1,4 +1,4 @@
-use super::*;
+use nazo_oauth_server::domain::authorization_decision::ServerAuthorizationDecisionOperations;
 
 #[actix_web::test]
 async fn authorization_decision_fails_closed_when_jarm_encryption_keys_cannot_refresh() {
@@ -58,9 +58,6 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use crate::domain::ConsentPayload;
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
-use crate::http::authorization::{AuthorizationHttpConfig, ServerAuthorizationService};
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
@@ -68,7 +65,12 @@ use chrono::{Duration, Utc};
 use nazo_http_actix::{
     AuthorizationDecisionEndpoint, AuthorizationDecisionForm, ClientIpConfig, SessionCookieConfig,
 };
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 use nazo_identity::ports::SessionStorePort;
+use nazo_oauth_server::domain::oauth::ConsentPayload;
+use nazo_oauth_server::services::ServerAuthorizationService;
 use nazo_postgres::{create_pool, get_conn};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -108,12 +110,15 @@ fn authorization_decision_endpoint(
             service,
             sessions,
             nazo_identity::TenantId::new(DEFAULT_TENANT_ID).expect("default tenant ID is valid"),
-            Arc::new(AuthorizationHttpConfig::from(state.settings.as_ref())),
-            runtime_modules,
+            Arc::new(crate::http::authorization::authorization_config(
+                state.settings.as_ref(),
+            )),
+            runtime_modules.snapshot_store(),
             Arc::new(
-                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
                     .expect("empty resolver should build"),
             ),
+            crate::http::authorization::test_support::test_security_audit_arc(),
         )),
         SessionCookieConfig::new(
             &session.session_cookie_name,
@@ -435,7 +440,7 @@ impl DecisionLiveFixture {
     }
 
     async fn store_session(&self, user: &DatabaseUserFixture, sid: &str, auth_time: i64) {
-        let payload = crate::http::sessions::SessionPayload {
+        let payload = nazo_oauth_server::sessions::SessionPayload {
             user_id: user.id,
             auth_time,
             amr: vec!["pwd".to_owned()],

@@ -1,14 +1,30 @@
 use crate::adapters::security::tokens::decode_access_claims_with;
+use actix_web::HttpRequest;
+use actix_web::HttpResponse;
+use actix_web::http::StatusCode;
+use nazo_auth::ValidatedClientAssertion;
+use nazo_oauth_server::contracts::token_forms::TokenForm;
+use nazo_oauth_server::domain::client_policy::json_array_to_strings;
+use nazo_oauth_server::domain::oauth::RefreshTokenPolicy;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::domain::rows::TokenRow;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
+use nazo_oauth_server::token::refresh::RefreshAudienceError;
+use nazo_oauth_server::token::refresh::refresh_token_audiences;
+use nazo_oauth_server::token::refresh::refresh_token_policy;
+use nazo_oauth_server::token::refresh::token_refresh_with_service;
 
 use crate::test_support::TestInfrastructure;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
 
-use crate::settings::{AuthorizationServerProfile, Settings};
+use crate::settings::Settings;
+use nazo_oauth_server::policy::AuthorizationServerProfile;
 
 use actix_web::http::header;
 
@@ -21,8 +37,7 @@ use serde_json::json;
 use nazo_auth::RefreshTokenAuthenticationContext;
 use uuid::Uuid;
 
-use crate::adapters::security::blake3_hex;
-use crate::http::token::issue::TokenIssuanceConfig;
+use nazo_oauth_server::crypto::blake3_hex;
 
 pub(crate) async fn token_refresh(
     state: &TestInfrastructure,
@@ -38,27 +53,32 @@ pub(crate) async fn token_refresh(
         )),
         state.keyset.clone(),
     );
-    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = crate::http::token::issue::test_support::test_authorization_service(state);
-    token_refresh_with_service(
-        &service,
-        &TokenIssuanceContext {
-            config: &config,
-            modules: &modules,
-            authorization: &authorization,
-            remote_client_documents: crate::test_support::test_remote_client_documents(),
-        },
-        req,
-        client,
-        form,
-        client_assertion,
-        None,
+    crate::http::token::issue::test_support::present_token_result(
+        token_refresh_with_service(
+            &service,
+            &TokenIssuanceContext {
+                config: &config,
+                modules: &modules,
+                authorization: &authorization,
+                security_audit: crate::http::authorization::test_support::test_security_audit(),
+                remote_client_documents: crate::test_support::test_remote_client_documents(),
+            },
+            &crate::http::token::issue::test_support::token_request_facts(
+                req,
+                state.settings.as_ref(),
+            ),
+            client,
+            form,
+            client_assertion,
+            None,
+        )
+        .await,
     )
-    .await
 }
 
-use super::*;
 use std::sync::Arc;
 
 use crate::config::ConfigSource;
@@ -739,103 +759,13 @@ async fn concurrent_baseline_refreshes_preserve_an_unbound_row_for_an_mtls_const
 }
 
 #[test]
-fn refresh_token_scope_request_defaults_to_original_authorization() {
-    let original = vec![
-        "openid".to_owned(),
-        "profile".to_owned(),
-        "offline_access".to_owned(),
-    ];
-
-    assert_eq!(refresh_token_scopes(&original, None).unwrap(), original);
-    assert_eq!(refresh_token_scopes(&original, Some("")).unwrap(), original);
-    assert_eq!(
-        refresh_token_scopes(&original, Some("   ")).unwrap(),
-        original
-    );
-}
-
-#[test]
-fn refresh_token_scope_request_may_narrow_original_authorization() {
-    let original = vec![
-        "openid".to_owned(),
-        "profile".to_owned(),
-        "offline_access".to_owned(),
-    ];
-
-    assert_eq!(
-        refresh_token_scopes(&original, Some("openid offline_access")).unwrap(),
-        vec!["openid".to_owned(), "offline_access".to_owned()]
-    );
-    assert_eq!(
-        refresh_token_scopes(&original, Some("openid")).unwrap(),
-        vec!["openid".to_owned()],
-        "RFC 6749 allows the access-token scope to be narrower than the refresh-token authorization"
-    );
-}
-
-#[test]
-fn openid4vci_refresh_token_scope_may_narrow_to_credential_authorization() {
-    let original = vec!["eu.europa.ec.eudi.pid.1".to_owned()];
-
-    assert_eq!(
-        refresh_token_scopes(&original, Some("eu.europa.ec.eudi.pid.1")).unwrap(),
-        original
-    );
-    assert!(
-        refresh_token_scopes(&original, Some("eu.europa.ec.eudi.pid.1 administrator")).is_err(),
-        "OpenID4VCI refresh must not expand the original scope grant"
-    );
-}
-
-#[test]
-fn attested_refresh_token_requires_the_original_client_instance_key() {
-    assert!(client_attestation_refresh_binding_matches(
-        "attest_jwt_client_auth",
-        Some("original-instance-key"),
-        Some("original-instance-key"),
-    ));
-    assert!(!client_attestation_refresh_binding_matches(
-        "attest_jwt_client_auth",
-        Some("original-instance-key"),
-        Some("different-instance-key"),
-    ));
-    assert!(!client_attestation_refresh_binding_matches(
-        "attest_jwt_client_auth",
-        None,
-        Some("original-instance-key"),
-    ));
-    assert!(!client_attestation_refresh_binding_matches(
-        "attest_jwt_client_auth",
-        Some("original-instance-key"),
-        None,
-    ));
-    assert!(client_attestation_refresh_binding_matches(
-        "private_key_jwt",
-        None,
-        None,
-    ));
-}
-
-#[test]
-fn refresh_token_scope_request_rejects_privilege_expansion() {
-    let original = vec!["openid".to_owned(), "offline_access".to_owned()];
-
-    for requested in ["email", "openid email", "offline_access admin"] {
-        assert!(
-            refresh_token_scopes(&original, Some(requested)).is_err(),
-            "refresh_token grant must reject scope expansion: {requested}"
-        );
-    }
-}
-
-#[test]
 fn refresh_token_audience_request_defaults_to_refresh_token_audience() {
     let mut token = token_row();
     token.audience = json!(["https://api.example/one", "https://api.example/two"]);
     let form = refresh_form_without_token();
 
     assert_eq!(
-        super::refresh_token_audiences(&token, &form).unwrap(),
+        refresh_token_audiences(&token, &form).unwrap(),
         vec![
             "https://api.example/one".to_owned(),
             "https://api.example/two".to_owned(),
@@ -851,7 +781,7 @@ fn refresh_token_audience_request_may_only_narrow_original_audience() {
     form.audiences = vec!["https://api.example/two".to_owned()];
 
     assert_eq!(
-        super::refresh_token_audiences(&token, &form).unwrap(),
+        refresh_token_audiences(&token, &form).unwrap(),
         vec!["https://api.example/two".to_owned()]
     );
 }
@@ -864,7 +794,7 @@ fn refresh_token_audience_request_rejects_expansion() {
     form.audiences = vec!["https://api.example/two".to_owned()];
 
     assert_eq!(
-        super::refresh_token_audiences(&token, &form),
+        refresh_token_audiences(&token, &form),
         Err(RefreshAudienceError::RequestedExceedsOriginal)
     );
 }
@@ -875,7 +805,7 @@ fn refresh_token_audience_rejects_missing_persisted_binding() {
     token.audience = json!([]);
 
     assert_eq!(
-        super::refresh_token_audiences(&token, &refresh_form_without_token()),
+        refresh_token_audiences(&token, &refresh_form_without_token()),
         Err(RefreshAudienceError::MissingOriginal)
     );
 }

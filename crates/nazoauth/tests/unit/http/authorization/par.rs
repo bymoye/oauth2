@@ -1,14 +1,21 @@
 use super::*;
 use crate::config::ConfigSource;
-use crate::domain::ClientRow;
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
 use crate::http::authorization::test_support::AuthorizationTestFixture;
-use crate::http::authorization::{AuthorizationHttpConfig, ServerAuthorizationService};
-use crate::http::sessions::AdminSessionHandles;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::Utc;
+use nazo_auth::{
+    ExpandedParAdmissionPolicy, ParAdmissionError, RawParAdmissionPolicy,
+    validate_expanded_par_admission, validate_raw_par_admission,
+};
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::services::ServerAuthorizationService;
 use nazo_postgres::{DbPool, create_pool, get_conn};
+use serde_json::json;
 
-use crate::settings::{AuthorizationServerProfile, DpopNoncePolicy, Settings};
+use crate::settings::Settings;
 use crate::test_support::ClientSigningFixture;
 use crate::test_support::client_signing_fixture;
 use crate::test_support::hash_client_secret_fixture as hash_client_secret;
@@ -20,17 +27,15 @@ use fred::interfaces::ClientLike;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
+use nazo_auth::DpopNoncePolicy;
 use nazo_http_actix::IpCidr;
+use nazo_oauth_server::policy::AuthorizationServerProfile;
 use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
 async fn par(fixture: &ParTestFixture, req: HttpRequest, body: Bytes) -> HttpResponse {
-    let context = fixture.authorization.context();
-    if let Err(response) = enforce_par_rate_limit(&context, &req).await {
-        return response;
-    }
-    par_after_rate_limit(fixture, req, body).await
+    super::par(Data::new(fixture.authorization.endpoint()), req, body).await
 }
 
 async fn par_after_rate_limit(
@@ -38,8 +43,30 @@ async fn par_after_rate_limit(
     req: HttpRequest,
     body: Bytes,
 ) -> HttpResponse {
-    par_after_rate_limit_with_context(&fixture.authorization.context(), req, body).await
+    // The original tests started after the limiter. Supply a successful rate port
+    // while retaining every other real/failing state operation and the public endpoint.
+    let authorization = AuthorizationTestFixture::new(
+        ServerAuthorizationService::new(
+            nazo_postgres::AuthorizationFlowRepository::new(
+                fixture.database.clone(),
+                fixture.tenant_id,
+            ),
+            Arc::new(rate_state::AllowParRateState(fixture.state.clone())),
+            fixture.keyset.clone(),
+        ),
+        fixture.authorization.config.clone(),
+        fixture.authorization.client_ip.clone(),
+        fixture.authorization.sessions.clone(),
+        fixture.authorization.session_http.clone(),
+        fixture.authorization.enabled_modules.clone(),
+        fixture.keyset.clone(),
+        fixture.tenant_id,
+    );
+    super::par(Data::new(authorization.endpoint()), req, body).await
 }
+
+#[path = "par_rate_state.rs"]
+mod rate_state;
 
 fn client(require_dpop_bound_tokens: bool) -> ClientRow {
     client_row! {
@@ -127,10 +154,10 @@ fn raw_par_policy<'a>(
         require_dpop_bound_tokens: client.require_dpop_bound_tokens,
         require_mtls_bound_tokens: client.require_mtls_bound_tokens,
         require_request_object: client.require_par_request_object
-            || AuthorizationHttpConfig::from(settings)
+            || crate::http::authorization::authorization_config(settings)
                 .profile
                 .requires_signed_authorization_request(),
-        fapi2_security: AuthorizationHttpConfig::from(settings)
+        fapi2_security: crate::http::authorization::authorization_config(settings)
             .profile
             .requires_fapi2_security(),
     }
@@ -148,23 +175,17 @@ fn expanded_par_policy(client: &ClientRow, fapi2: bool) -> ExpandedParAdmissionP
 
 #[test]
 fn par_error_log_fields_skip_success_and_include_only_safe_error_metadata() {
-    let created = json_response_status(
-        StatusCode::CREATED,
-        json!({
-            "request_uri": "urn:ietf:params:oauth:request_uri:secret",
-            "expires_in": 90
-        }),
-    );
+    let created =
+        Ok(json!({ "request_uri": "urn:ietf:params:oauth:request_uri:secret", "expires_in":90 }));
     assert_eq!(par_error_log_fields(&created), None);
-
-    let rejected = oauth_error(
-        StatusCode::BAD_REQUEST,
+    let rejected = Err(OAuthEndpointError::json(
+        http::StatusCode::BAD_REQUEST,
         "invalid_request_object",
         "request=secret must not be logged",
-    );
+    ));
     assert_eq!(
         par_error_log_fields(&rejected),
-        Some((400, Some("invalid_request_object".to_owned())))
+        Some((400, "invalid_request_object".to_owned()))
     );
 }
 
@@ -291,6 +312,8 @@ struct ParTestFixture {
     authorization: AuthorizationTestFixture,
     database: DbPool,
     keyset: nazo_key_management::KeyManager,
+    state: Arc<dyn nazo_auth::AuthorizationStateStorePort>,
+    tenant_id: Uuid,
 }
 
 impl ParTestFixture {
@@ -302,25 +325,31 @@ impl ParTestFixture {
     ) -> Self {
         let connection = nazo_valkey::test_support::scoped_connection(valkey.clone());
         let session = &settings.session;
+        let state: Arc<dyn nazo_auth::AuthorizationStateStorePort> =
+            Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection));
         let authorization = AuthorizationTestFixture::new(
             ServerAuthorizationService::new(
                 nazo_postgres::AuthorizationFlowRepository::new(
                     database.clone(),
                     settings.tenant.context.tenant_id.as_uuid(),
                 ),
-                std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
+                state.clone(),
                 keyset.clone(),
             ),
-            AuthorizationHttpConfig::from(&settings),
-            AdminSessionHandles::from_port(
+            crate::http::authorization::authorization_config(&settings),
+            nazo_http_actix::ClientIpConfig::new(
+                &settings.endpoint.trusted_proxy_cidrs,
+                settings.endpoint.client_ip_header_mode,
+            ),
+            std::sync::Arc::new(nazo_oauth_server::sessions::SessionResolver::new(
                 Arc::new(nazo_valkey::SessionStore::new(&connection)),
                 Arc::new(nazo_postgres::UserRepository::new(database.clone())),
                 settings.tenant.context.tenant_id,
-                crate::http::sessions::SessionHttpConfig::new(
-                    &session.session_cookie_name,
-                    &session.csrf_cookie_name,
-                    session.cookie_secure,
-                ),
+            )),
+            crate::http::sessions::SessionHttpConfig::new(
+                &session.session_cookie_name,
+                &session.csrf_cookie_name,
+                session.cookie_secure,
             ),
             crate::test_support::persisted_runtime_modules_fixture(),
             keyset.clone(),
@@ -330,6 +359,8 @@ impl ParTestFixture {
             authorization,
             database,
             keyset,
+            state,
+            tenant_id: settings.tenant.context.tenant_id.as_uuid(),
         }
     }
 
@@ -343,6 +374,8 @@ impl ParTestFixture {
             ),
             database: self.database.clone(),
             keyset: self.keyset.clone(),
+            state: Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
+            tenant_id: self.tenant_id,
         }
     }
 
@@ -492,7 +525,7 @@ impl LiveParFixture {
             .expect("PAR test client cleanup should succeed");
         let secret_hash = hash_client_secret(
             secret,
-            &self.par.authorization.context().config.client_secret_pepper,
+            &self.par.authorization.config().client_secret_pepper,
         );
         sql_query(
             r#"
@@ -1349,8 +1382,7 @@ async fn par_persists_mtls_thumbprint_for_sender_constrained_request_uri() {
     let stored = fixture
         .par
         .authorization
-        .context()
-        .service
+        .service()
         .load_par(request_uri)
         .await
         .expect("PAR payload should be readable")
@@ -1419,14 +1451,13 @@ async fn par_success_persists_request_uri_without_client_secret_material() {
     assert!(request_uri.starts_with("urn:ietf:params:oauth:request_uri:"));
     assert_eq!(
         value["expires_in"],
-        json!(fixture.par.authorization.context().config.par_ttl_seconds)
+        json!(fixture.par.authorization.config().par_ttl_seconds)
     );
 
     let stored = fixture
         .par
         .authorization
-        .context()
-        .service
+        .service()
         .load_par(request_uri)
         .await
         .expect("PAR payload should be readable")

@@ -1,6 +1,4 @@
 //! 管理端用户账户接口。
-use crate::adapters::audit::audit_fields;
-use crate::adapters::security::blake3_hex;
 use crate::http::admin::{
     persist_required_audit_or_unavailable, require_durable_audit_or_unavailable,
 };
@@ -21,6 +19,8 @@ use nazo_identity::{
     email::normalize_email_address,
     ports::{AdminUserRepositoryPort, NewUser, RegistrationAccountRepositoryPort, SecretHashPort},
 };
+use nazo_oauth_server::crypto::blake3_hex;
+use nazo_oauth_server::ports::audit::audit_fields;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;

@@ -17,7 +17,7 @@ pub(super) struct StartupConfiguration {
     pub(super) mtls_certificate_source: web::Data<crate::http::mtls::MtlsCertificateSource>,
     pub(super) readiness_dependencies: web::Data<crate::http::well_known::ReadinessDependencies>,
     pub(super) remote_client_documents:
-        Arc<crate::domain::remote_client_documents::RemoteClientDocumentResolver>,
+        Arc<crate::adapters::remote_client_documents::RemoteClientDocumentResolver>,
     pub(super) runtime_modules: web::Data<RuntimeModules>,
     pub(super) keyset: nazo_key_management::KeyManager,
 }
@@ -149,7 +149,6 @@ pub(super) async fn load(
 
     // The queue is process-global, so exactly one worker claims it. Start it
     // only after every initial tenant graph has been built successfully.
-    #[cfg(not(test))]
     let backchannel_logout_worker = match background::spawn_backchannel_logout_worker(
         process.persistence.provider().logout_delivery_store(),
         &process.route_settings,
@@ -160,8 +159,6 @@ pub(super) async fn load(
             return Err(error);
         }
     };
-    #[cfg(test)]
-    let backchannel_logout_worker = None;
 
     Ok(StartupRuntime {
         process,

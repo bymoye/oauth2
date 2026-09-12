@@ -1,13 +1,12 @@
 use super::create_error_response;
 use crate::adapters::security::LOCAL_DEVELOPMENT_CLIENT_SECRET_PEPPER;
-use crate::adapters::security::client_secret_digest;
 use crate::http::admin::clients::test_support::{
     CreateClientRequest, InsertClientError, PreparedClientRegistration,
     prepare_client_insert_with_secret_pepper,
 };
 use actix_web::http::StatusCode;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use nazo_http_actix::OAuthJsonErrorFields;
+use nazo_oauth_server::crypto::client_secret_digest;
 use serde_json::json;
 
 async fn prepare_client_insert_for_test(
@@ -473,17 +472,14 @@ async fn prepare_client_insert_discards_sector_identifier_for_public_subjects() 
     assert!(prepared.sector_identifier_host.is_none());
 }
 
-#[test]
-fn insert_client_error_response_preserves_oauth_error_category() {
+#[actix_web::test]
+async fn insert_client_error_response_preserves_oauth_error_category() {
     let invalid = create_error_response(InsertClientError::InvalidRequest(
         "redirect_uri is invalid".to_owned(),
     ));
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        invalid
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(invalid).await.as_deref(),
         Some("invalid_request")
     );
 
@@ -492,10 +488,18 @@ fn insert_client_error_response_preserves_oauth_error_category() {
     ));
     assert_eq!(server.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        server
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(server).await.as_deref(),
         Some("server_error")
     );
+}
+
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }

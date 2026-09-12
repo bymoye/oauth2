@@ -14,8 +14,8 @@ use nazo_auth::{AdminClientError, CreateClientRequest, OAuthClient, SuppliedClie
 use nazo_identity::ports::SecretHashPort as _;
 use uuid::Uuid;
 
+use crate::adapters::remote_client_documents::RemoteClientDocumentResolver;
 use crate::bootstrap::RegistrationSecretHasher;
-use crate::domain::remote_client_documents::RemoteClientDocumentResolver;
 use crate::http::admin::clients::{
     ServerAdminClientCrypto, ServerAdminClientService, admin_client_policy,
 };
@@ -153,6 +153,7 @@ pub(crate) async fn control_plane_resources(
             .map_err(anyhow::Error::msg)?;
     let keyset = nazo_key_management::KeyManager::load_or_create_database(
         settings.key_settings(),
+        settings.external_key_signer(),
         binding.tenant.tenant_id.as_uuid(),
         signing_keys,
         crate::settings::signing_key_wrapping_key_ring(&config)?,

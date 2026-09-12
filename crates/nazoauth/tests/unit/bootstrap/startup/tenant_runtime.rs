@@ -868,6 +868,15 @@ async fn two_instances_converge_on_new_cache_revision_and_reject_stale_replay() 
 
 #[tokio::test]
 async fn tenant_shutdown_owns_and_stops_every_background_worker() {
+    let key_settings = nazo_key_management::KeySettings {
+        rotation_interval: chrono::Duration::days(90),
+        prepublish_window: chrono::Duration::days(1),
+        verification_grace: chrono::Duration::hours(1),
+    };
+    let prepublish_window = key_settings.prepublish_window;
+    let keyset = nazo_key_management::test_support::key_manager(key_settings)
+        .await
+        .expect("test key manager");
     let runtime =
         TenantRuntime::for_test(binding(1, "tenant-a.example", "https://tenant-a.example"));
     let worker = || tokio::spawn(async { std::future::pending::<()>().await });
@@ -877,7 +886,10 @@ async fn tenant_shutdown_owns_and_stops_every_background_worker() {
             .lock()
             .expect("tenant runtime lifecycle mutex is not poisoned");
         lifecycle.runtime_module_reconciler = Some(worker());
-        lifecycle.key_lifecycle = Some(tokio::spawn(async {}));
+        lifecycle.key_lifecycle = Some(crate::jobs::key_lifecycle::KeyLifecycleTask::start(
+            keyset,
+            prepublish_window,
+        ));
         lifecycle.ciba_ping_worker = Some(worker());
     }
 

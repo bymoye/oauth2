@@ -1,27 +1,34 @@
-impl UserinfoHandles {
-    pub(crate) fn from_test_infrastructure(
-        state: &crate::test_support::TestInfrastructure,
-    ) -> Self {
-        Self::new(
-            std::sync::Arc::new(nazo_valkey::ReplayStore::new(&state.valkey_connection())),
-            state.keyset.clone(),
-            UserinfoConfig::from(state.settings.as_ref()),
-            std::sync::Arc::new(
-                crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
-                    .expect("empty resolver should build"),
-            ),
-        )
-    }
+pub(crate) fn userinfo_handles_from_test_infrastructure(
+    state: &crate::test_support::TestInfrastructure,
+) -> UserinfoHandles {
+    UserinfoHandles::new(
+        std::sync::Arc::new(nazo_valkey::ReplayStore::new(&state.valkey_connection())),
+        crate::http::authorization::test_support::test_security_audit_arc(),
+        state.keyset.clone(),
+        userinfo_config(state.settings.as_ref()),
+        std::sync::Arc::new(
+            crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                .expect("empty resolver should build"),
+        ),
+    )
 }
 
-use super::*;
+fn userinfo_config(settings: &Settings) -> UserinfoConfig {
+    UserinfoConfig::new(
+        settings.endpoint.issuer.as_str(),
+        settings.protocol.default_audience.as_str(),
+        settings.endpoint.mtls_endpoint_base_url.as_str(),
+        settings.protocol.dpop_nonce_policy,
+    )
+}
+
+use nazo_oauth_server::domain::userinfo::{
+    ServerUserinfoOperations, UserinfoConfig, UserinfoHandles,
+};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use crate::config::ConfigSource;
-use crate::domain::UserinfoConfig;
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
-use crate::http::token::ServerTokenService;
 use crate::settings::Settings;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
 use actix_web::{
@@ -29,10 +36,13 @@ use actix_web::{
     http::{StatusCode, header},
     web::{Bytes, Data},
 };
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::services::ServerTokenService;
 use nazo_postgres::{create_pool, get_conn};
 
 use crate::adapters::security::tokens::{AccessTokenJwtInput, IssuedAccessToken, make_jwt};
-use crate::adapters::security::{blake3_hex, jwt_decoding_key_from_jwk};
 use crate::schema::oauth_clients;
 use crate::test_support::client_signing_fixture;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -46,7 +56,8 @@ use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
 use nazo_auth::Claims;
-use nazo_http_actix::{IpCidr, OAuthJsonErrorFields, UserinfoEndpoint};
+use nazo_http_actix::{IpCidr, UserinfoEndpoint};
+use nazo_oauth_server::crypto::{blake3_hex, jwt_decoding_key_from_jwk};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -98,17 +109,20 @@ async fn call_userinfo(
     req: HttpRequest,
     body: Bytes,
 ) -> HttpResponse {
-    let endpoint = Data::new(UserinfoEndpoint::new(Arc::new(
-        ServerUserinfoOperations::new(
+    let endpoint = Data::new(UserinfoEndpoint::new(
+        Arc::new(ServerUserinfoOperations::new(
             Arc::new(userinfo_token_service(&state)),
-            UserinfoHandles::from_test_infrastructure(state.get_ref()),
-        ),
-    )));
+            userinfo_handles_from_test_infrastructure(state.get_ref()),
+        )),
+        Arc::new(crate::http::mtls::ServerMtlsThumbprintExtractor::new(
+            state.settings.endpoint.trusted_proxy_cidrs.clone(),
+        )),
+    ));
     nazo_http_actix::userinfo(endpoint, req, body).await
 }
 
 fn userinfo_audience_allowed(settings: &Settings, audience: &Value) -> bool {
-    UserinfoConfig::from(settings).audience_allowed(audience)
+    userinfo_config(settings).audience_allowed(audience)
 }
 
 async fn live_userinfo_state() -> Option<Data<TestInfrastructure>> {
@@ -376,9 +390,14 @@ fn decrypt_userinfo_jwe(
     let cek = private_key
         .decrypt_oaep_sha256(&encrypted_key)
         .expect("RSA-OAEP encrypted key should decrypt");
-    let plaintext =
-        crate::crypto::aes_256_gcm_decrypt(&cek, &iv, parts[0].as_bytes(), &ciphertext, &tag)
-            .expect("A256GCM ciphertext should decrypt");
+    let plaintext = nazo_oauth_server::crypto::aes_256_gcm_decrypt(
+        &cek,
+        &iv,
+        parts[0].as_bytes(),
+        &ciphertext,
+        &tag,
+    )
+    .expect("A256GCM ciphertext should decrypt");
     (
         protected_header,
         String::from_utf8(plaintext).expect("JWE plaintext should be UTF-8"),
@@ -536,11 +555,15 @@ async fn userinfo_response_for_active_user(
     call_userinfo(state, req, Bytes::new()).await
 }
 
-fn oauth_error_code(response: &HttpResponse) -> Option<String> {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
+async fn oauth_error_code(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 #[actix_web::test]
@@ -565,7 +588,7 @@ async fn userinfo_rejects_signed_access_token_with_wrong_audience() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -609,7 +632,7 @@ async fn userinfo_rejects_signed_access_token_without_valid_tenant_boundary() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -638,7 +661,7 @@ async fn userinfo_rejects_revoked_access_token_before_subject_lookup() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -670,7 +693,10 @@ async fn userinfo_returns_server_error_when_subject_mapping_store_is_unavailable
     let response = userinfo_error_for_token(state, "Bearer", &token.token).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
 }
 
 #[actix_web::test]
@@ -694,7 +720,7 @@ async fn userinfo_rejects_sender_constrained_tokens_on_wrong_transport() {
         userinfo_error_for_token(state.clone(), "Bearer", &bearer_with_dpop_cnf.token).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_dpop_proof")
     );
 
@@ -713,7 +739,7 @@ async fn userinfo_rejects_sender_constrained_tokens_on_wrong_transport() {
     let response = userinfo_error_for_token(state, "DPoP", &dpop_without_cnf.token).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_dpop_proof")
     );
 }
@@ -740,7 +766,7 @@ async fn userinfo_rejects_mtls_bound_token_without_verified_certificate() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -771,7 +797,7 @@ async fn userinfo_requires_openid_scope_and_user_subject_type() {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            oauth_error_code(&response).as_deref(),
+            oauth_error_code(response).await.as_deref(),
             Some("insufficient_scope")
         );
     }
@@ -797,7 +823,7 @@ async fn userinfo_rejects_invalid_or_inactive_token_subject() {
     let response = userinfo_error_for_token(state.clone(), "Bearer", &invalid_subject.token).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 
@@ -817,7 +843,7 @@ async fn userinfo_rejects_invalid_or_inactive_token_subject() {
     let response = userinfo_error_for_token(state, "Bearer", &inactive_token.token).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -983,7 +1009,10 @@ async fn userinfo_crypto_failure_never_falls_back_to_json() {
     let response = userinfo_response_for_active_user(state, &user, &client_id).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
 }
 
 #[actix_web::test]
@@ -995,7 +1024,6 @@ async fn userinfo_rejects_missing_or_conflicting_access_token_transport_before_d
         .to_http_request();
     let missing = call_userinfo(state.clone(), missing_req, Bytes::new()).await;
     assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&missing).as_deref(), Some("invalid_token"));
     assert_eq!(
         missing
             .headers()
@@ -1024,10 +1052,6 @@ async fn userinfo_rejects_missing_or_conflicting_access_token_transport_before_d
     .await;
     assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_error_code(&duplicate).as_deref(),
-        Some("invalid_request")
-    );
-    assert_eq!(
         duplicate
             .headers()
             .get(header::WWW_AUTHENTICATE)
@@ -1043,6 +1067,14 @@ async fn userinfo_rejects_missing_or_conflicting_access_token_transport_before_d
             .and_then(|value| value.to_str().ok()),
         Some("application/json")
     );
+    assert_eq!(
+        oauth_error_code(missing).await.as_deref(),
+        Some("invalid_token")
+    );
+    assert_eq!(
+        oauth_error_code(duplicate).await.as_deref(),
+        Some("invalid_request")
+    );
 }
 
 #[actix_web::test]
@@ -1057,7 +1089,7 @@ async fn userinfo_rejects_unverifiable_access_token_before_revocation_lookup() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }
@@ -1081,7 +1113,10 @@ async fn userinfo_returns_server_error_when_revocation_lookup_fails_after_decode
     let response = userinfo_error_for_token(state, "Bearer", &token.token).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
 }
 
 #[actix_web::test]
@@ -1126,7 +1161,10 @@ async fn userinfo_returns_server_error_when_revocation_query_fails_after_decode(
     let response = userinfo_error_for_token(state.clone(), "Bearer", &token.token).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
     drop_schema(&state, &schema).await;
 }
 
@@ -1163,7 +1201,10 @@ async fn userinfo_returns_server_error_when_subject_lookup_fails_after_token_val
     let response = userinfo_error_for_token(state.clone(), "Bearer", &token.token).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response).as_deref(), Some("server_error"));
+    assert_eq!(
+        oauth_error_code(response).await.as_deref(),
+        Some("server_error")
+    );
     drop_schema(&state, &schema).await;
 }
 
@@ -1201,7 +1242,7 @@ async fn userinfo_rejects_mtls_bound_token_with_mismatched_verified_certificate(
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        oauth_error_code(&response).as_deref(),
+        oauth_error_code(response).await.as_deref(),
         Some("invalid_token")
     );
 }

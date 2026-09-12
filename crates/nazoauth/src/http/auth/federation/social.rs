@@ -1,4 +1,5 @@
-use crate::{adapters::email::normalize_email_address, adapters::security::pkce_s256};
+use crate::adapters::email::normalize_email_address;
+use nazo_oauth_server::crypto::pkce_s256;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Url;

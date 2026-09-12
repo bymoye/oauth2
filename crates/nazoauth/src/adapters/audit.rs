@@ -9,6 +9,7 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use nazo_oauth_server::ports::audit::{AuditFuture, SecurityAudit};
 use nazo_persistence::{SecurityAuditEvent, SecurityAuditLedger};
 
 use super::audit_anchor::AuditAnchorPreflight;
@@ -20,6 +21,40 @@ tokio::task_local! {
     /// request future. Capture this authority before handing events to the
     /// deployment-wide asynchronous ledger worker.
     pub(crate) static REQUEST_TENANT: nazo_identity::TenantId;
+}
+
+/// Audit capability bound to one tenant and the process's existing durable sink.
+#[derive(Clone)]
+pub(crate) struct TenantSecurityAudit {
+    tenant_id: nazo_identity::TenantId,
+}
+
+impl TenantSecurityAudit {
+    pub(crate) fn new(tenant_id: nazo_identity::TenantId) -> Self {
+        Self { tenant_id }
+    }
+}
+
+impl SecurityAudit for TenantSecurityAudit {
+    fn ensure_storage(&self) -> AuditFuture<'_> {
+        Box::pin(ensure_audit_storage())
+    }
+
+    fn record(&self, event: &str, fields: serde_json::Map<String, serde_json::Value>) {
+        enqueue_event(
+            event,
+            prepare_event_for_tenant(event, fields, Some(self.tenant_id)),
+        );
+    }
+
+    fn record_required<'a>(
+        &'a self,
+        event: &'a str,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> AuditFuture<'a> {
+        let queued = prepare_event_for_tenant(event, fields, Some(self.tenant_id));
+        Box::pin(async move { append_required_event(event, queued).await })
+    }
 }
 
 const SENSITIVE_FIELD_NAMES: &[&str] = &[
@@ -253,8 +288,15 @@ pub(crate) async fn audit_event_required(
     event: &str,
     fields: serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<()> {
-    let queued = prepare_event(event, fields)
-        .map_err(|reason| anyhow::anyhow!("security audit event rejected: {reason}"))?;
+    append_required_event(event, prepare_event(event, fields)).await
+}
+
+async fn append_required_event(
+    event: &str,
+    queued: Result<QueuedAuditEvent, &'static str>,
+) -> anyhow::Result<()> {
+    let queued =
+        queued.map_err(|reason| anyhow::anyhow!("security audit event rejected: {reason}"))?;
     let Some(required) = REQUIRED_AUDIT_REPOSITORY.get() else {
         anyhow::bail!("durable security audit repository is not configured");
     };
@@ -285,9 +327,13 @@ pub(crate) async fn audit_event_required(
 /// structured `audit.persistence` error. High-impact management actions must
 /// use [`ensure_audit_storage`] and [`audit_event_required`] instead.
 pub(crate) fn audit_event(event: &str, fields: serde_json::Map<String, serde_json::Value>) {
+    enqueue_event(event, prepare_event(event, fields));
+}
+
+fn enqueue_event(event: &str, queued: Result<QueuedAuditEvent, &'static str>) {
     debug_assert!(audit_event_name_valid(event));
     debug_assert!(audit_event_category(event).is_some());
-    let queued = match prepare_event(event, fields) {
+    let queued = match queued {
         Ok(queued) => queued,
         Err(reason) => {
             tracing::error!(
@@ -332,9 +378,21 @@ pub(crate) fn audit_event(event: &str, fields: serde_json::Map<String, serde_jso
 
 fn prepare_event(
     event: &str,
-    mut fields: serde_json::Map<String, serde_json::Value>,
+    fields: serde_json::Map<String, serde_json::Value>,
 ) -> Result<QueuedAuditEvent, &'static str> {
-    if let Ok(tenant_id) = REQUEST_TENANT.try_with(|tenant| *tenant) {
+    prepare_event_for_tenant(
+        event,
+        fields,
+        REQUEST_TENANT.try_with(|tenant| *tenant).ok(),
+    )
+}
+
+fn prepare_event_for_tenant(
+    event: &str,
+    mut fields: serde_json::Map<String, serde_json::Value>,
+    tenant_id: Option<nazo_identity::TenantId>,
+) -> Result<QueuedAuditEvent, &'static str> {
+    if let Some(tenant_id) = tenant_id {
         let tenant = serde_json::json!(tenant_id);
         if fields
             .get("tenant_id")
@@ -372,15 +430,6 @@ fn prepare_event(
         payload,
         occurred_at: Utc::now(),
     })
-}
-
-pub(crate) fn audit_fields(
-    items: &[(&str, serde_json::Value)],
-) -> serde_json::Map<String, serde_json::Value> {
-    items
-        .iter()
-        .map(|(key, value)| ((*key).to_owned(), value.clone()))
-        .collect()
 }
 
 fn audit_event_category(event: &str) -> Option<&'static str> {

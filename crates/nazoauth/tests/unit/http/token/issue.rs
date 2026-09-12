@@ -1,15 +1,16 @@
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
 use crate::test_support::TestInfrastructure;
 
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
 
-use crate::domain::tenancy::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use crate::domain::NativeSsoTokenBinding;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::oauth::NativeSsoTokenBinding;
 
 use nazo_auth::OidcClaimRequest;
-
-use nazo_http_actix::OAuthJsonErrorFields;
 
 pub(crate) async fn issue_token_response(
     state: &TestInfrastructure,
@@ -44,21 +45,24 @@ async fn issue_token_response_with_modules(
         )),
         state.keyset.clone(),
     );
-    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = token_issuance_config(state.settings.as_ref());
     let authorization = test_support::test_authorization_service(state);
-    super::issue_token_response(
-        &TokenIssuanceContext {
-            config: &config,
-            modules: &modules,
-            authorization: &authorization,
-            remote_client_documents: crate::test_support::test_remote_client_documents(),
-        },
-        &service,
-        client,
-        TokenIssuanceMode::Fresh,
-        issue,
+    present_token_result(
+        nazo_oauth_server::token::issue::issue_token_response(
+            &TokenIssuanceContext {
+                config: &config,
+                modules: &modules,
+                authorization: &authorization,
+                security_audit: crate::http::authorization::test_support::test_security_audit(),
+                remote_client_documents: crate::test_support::test_remote_client_documents(),
+            },
+            &service,
+            client,
+            TokenIssuanceMode::Fresh,
+            issue,
+        )
+        .await,
     )
-    .await
 }
 
 async fn issue_token_response_with_grant_for_test(
@@ -108,22 +112,25 @@ async fn issue_token_response_with_mode_for_test(
         )),
         state.keyset.clone(),
     );
-    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = test_support::test_authorization_service(state);
-    super::issue_token_response(
-        &TokenIssuanceContext {
-            config: &config,
-            modules: &modules,
-            authorization: &authorization,
-            remote_client_documents: crate::test_support::test_remote_client_documents(),
-        },
-        &service,
-        client,
-        mode,
-        issue,
+    present_token_result(
+        nazo_oauth_server::token::issue::issue_token_response(
+            &TokenIssuanceContext {
+                config: &config,
+                modules: &modules,
+                authorization: &authorization,
+                security_audit: crate::http::authorization::test_support::test_security_audit(),
+                remote_client_documents: crate::test_support::test_remote_client_documents(),
+            },
+            &service,
+            client,
+            mode,
+            issue,
+        )
+        .await,
     )
-    .await
 }
 
 async fn response_body(response: HttpResponse) -> Vec<u8> {
@@ -210,6 +217,32 @@ async fn delete_token_issuance(state: &TestInfrastructure, issuance_id: Uuid) {
 }
 
 use super::*;
+use actix_web::{
+    HttpResponse,
+    http::{
+        StatusCode,
+        header::{self, HeaderValue},
+    },
+};
+use nazo_oauth_server::{
+    contracts::{oauth_error::OAuthEndpointError, token_endpoint::TokenEndpointSuccess},
+    crypto::blake3_hex,
+    domain::{
+        oauth::{RefreshTokenPolicy, TokenIssue},
+        rows::ClientRow,
+    },
+    services::ServerTokenService,
+    token::issue::TokenIssuanceContext,
+};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+fn present_token_result(result: Result<TokenEndpointSuccess, OAuthEndpointError>) -> HttpResponse {
+    match result {
+        Ok(success) => nazo_http_actix::token_endpoint_success_response(success),
+        Err(error) => nazo_http_actix::oauth_endpoint_error_response(error),
+    }
+}
 use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
@@ -355,43 +388,6 @@ fn client_with_grants(grant_types: &[&str]) -> ClientRow {
         sector_identifier_uri: None,
         sector_identifier_host: None,
     }
-}
-
-#[test]
-fn id_token_signing_alg_uses_rs256_default_and_ps256_for_fapi_clients() {
-    let baseline = client_with_grants(&["authorization_code"]);
-    assert_eq!(
-        id_token_signing_alg_for_client(&baseline),
-        jsonwebtoken::Algorithm::RS256
-    );
-
-    let mut private_key_jwt = baseline.clone();
-    private_key_jwt.token_endpoint_auth_method = "private_key_jwt".to_owned();
-    assert_eq!(
-        id_token_signing_alg_for_client(&private_key_jwt),
-        jsonwebtoken::Algorithm::RS256
-    );
-
-    let mut holder_bound = baseline.clone();
-    holder_bound.require_dpop_bound_tokens = true;
-    assert_eq!(
-        id_token_signing_alg_for_client(&holder_bound),
-        jsonwebtoken::Algorithm::PS256
-    );
-
-    let mut par_request_object = baseline;
-    par_request_object.require_par_request_object = true;
-    assert_eq!(
-        id_token_signing_alg_for_client(&par_request_object),
-        jsonwebtoken::Algorithm::PS256
-    );
-
-    let mut negotiated = par_request_object;
-    negotiated.id_token_signed_response_alg = Some("ES256".to_owned());
-    assert_eq!(
-        id_token_signing_alg_for_client(&negotiated),
-        jsonwebtoken::Algorithm::ES256
-    );
 }
 
 fn issue_state_with_invalid_signing_key() -> TestInfrastructure {
@@ -574,104 +570,6 @@ async fn delete_token_issuance_for_grant(
     }
 }
 
-#[test]
-fn refresh_token_requires_authorized_use_case_and_client_grant() {
-    let client = client_with_grants(&["authorization_code", "refresh_token"]);
-    let scopes = vec!["openid".to_owned(), "profile".to_owned()];
-    assert!(!should_issue_refresh_token(&client, &scopes, false));
-
-    let scopes = vec!["openid".to_owned(), "offline_access".to_owned()];
-    assert!(should_issue_refresh_token(&client, &scopes, false));
-
-    let scopes = vec!["org.iso.18013.5.1.mDL".to_owned()];
-    assert!(should_issue_refresh_token(&client, &scopes, true));
-
-    let client = client_with_grants(&["authorization_code"]);
-    assert!(!should_issue_refresh_token(&client, &scopes, true));
-}
-
-#[test]
-fn refresh_token_grant_matching_is_exact_and_scope_case_sensitive() {
-    let client = client_with_grants(&["authorization_code", "refresh_token:legacy"]);
-    let scopes = vec!["openid".to_owned(), "offline_access".to_owned()];
-    assert!(
-        !should_issue_refresh_token(&client, &scopes, false),
-        "refresh issuance must require the exact refresh_token grant"
-    );
-
-    let client = client_with_grants(&["authorization_code", "refresh_token"]);
-    for scopes in [
-        vec!["openid".to_owned(), "OFFLINE_ACCESS".to_owned()],
-        vec!["openid".to_owned(), "offline_access ".to_owned()],
-        vec!["openid".to_owned(), "offline".to_owned()],
-    ] {
-        assert!(
-            !should_issue_refresh_token(&client, &scopes, false),
-            "refresh issuance must require exact offline_access authorization scope: {scopes:?}"
-        );
-    }
-}
-
-#[test]
-fn failed_authorization_code_transition_is_idempotent_only_for_terminal_or_missing_states() {
-    use nazo_auth::AuthorizationCodeTransitionResult::*;
-    for state in [Applied, Missing, Failed, Consumed] {
-        assert!(
-            authorization_code_state::failed_authorization_code_transition_result(state).is_ok(),
-            "failed marker cleanup should tolerate {state:?}"
-        );
-    }
-
-    for state in [Pending, Consuming, Malformed] {
-        let error = authorization_code_state::failed_authorization_code_transition_result(state)
-            .expect_err("failed marker must not hide an unexpected active state");
-        assert!(
-            error.to_string().contains(&format!("{state:?}")),
-            "error should preserve the unexpected state for diagnostics"
-        );
-    }
-}
-
-#[test]
-fn consumed_authorization_code_marker_lives_as_long_as_issued_credentials() {
-    let refresh_family_id = Uuid::now_v7();
-
-    assert_eq!(
-        authorization_code_state::consumed_authorization_code_ttl_seconds(
-            300,
-            2_592_000,
-            Some(refresh_family_id),
-        ),
-        2_592_000,
-        "authorization code replay marker must not expire before the refresh token family"
-    );
-
-    assert_eq!(
-        authorization_code_state::consumed_authorization_code_ttl_seconds(300, 2_592_000, None),
-        300,
-        "without a refresh token family the marker only needs to cover the access token lifetime"
-    );
-}
-
-#[test]
-fn consumed_authorization_code_marker_ttl_fails_closed_for_non_positive_settings() {
-    assert_eq!(
-        authorization_code_state::consumed_authorization_code_ttl_seconds(0, 2_592_000, None),
-        1,
-        "zero access-token TTL settings must still leave a replay marker"
-    );
-
-    assert_eq!(
-        authorization_code_state::consumed_authorization_code_ttl_seconds(
-            300,
-            -10,
-            Some(Uuid::now_v7())
-        ),
-        1,
-        "invalid refresh-token TTL settings must not produce an absent or already-expired marker"
-    );
-}
-
 fn token_issue_with_sid(id_token_claims: Vec<String>) -> TokenIssue {
     TokenIssue {
         user_id: None,
@@ -737,253 +635,6 @@ fn token_issue_without_openid() -> TokenIssue {
 }
 
 #[test]
-fn issuance_digest_binds_every_result_affecting_grant_identity() {
-    let client = client_with_grants(&["urn:ietf:params:oauth:grant-type:token-exchange"]);
-    let grant_key = "idempotency:stable-grant";
-    let baseline = issuance_request_digest(&client, &token_issue_without_openid(), grant_key);
-
-    let mut actor_changed = token_issue_without_openid();
-    actor_changed.actor = Some(json!({
-        "sub": "delegating-actor",
-        "client_id": "actor-client",
-    }));
-    assert_ne!(
-        issuance_request_digest(&client, &actor_changed, grant_key),
-        baseline,
-        "RFC 8693 actor identity must not reuse another actor's issued response",
-    );
-
-    let mut authorization_code_changed = token_issue_without_openid();
-    authorization_code_changed.authorization_code_hash = Some("code-hash".to_owned());
-    assert_ne!(
-        issuance_request_digest(&client, &authorization_code_changed, grant_key),
-        baseline,
-        "authorization-code consumption identity must be bound to the issuance",
-    );
-
-    let mut refresh_policy_changed = token_issue_without_openid();
-    refresh_policy_changed.refresh_token_policy = RefreshTokenPolicy::Rotate {
-        family_id: Uuid::now_v7(),
-        rotated_from_id: Uuid::now_v7(),
-    };
-    assert_ne!(
-        issuance_request_digest(&client, &refresh_policy_changed, grant_key),
-        baseline,
-        "refresh rotation identity must not reuse a non-rotation response",
-    );
-
-    let mut native_sso_changed = token_issue_without_openid();
-    native_sso_changed.native_sso = Some(NativeSsoTokenBinding {
-        device_secret: "device-secret".to_owned(),
-        ds_hash: "device-secret-hash".to_owned(),
-        sid: "native-sso-session".to_owned(),
-    });
-    assert_ne!(
-        issuance_request_digest(&client, &native_sso_changed, grant_key),
-        baseline,
-        "Native SSO device binding must not reuse an ordinary token response",
-    );
-
-    let native_sso_digest = issuance_request_digest(&client, &native_sso_changed, grant_key);
-    native_sso_changed.native_sso = Some(NativeSsoTokenBinding {
-        device_secret: "fresh-device-secret-from-retry".to_owned(),
-        ds_hash: "fresh-device-secret-hash-from-retry".to_owned(),
-        sid: "native-sso-session".to_owned(),
-    });
-    assert_eq!(
-        issuance_request_digest(&client, &native_sso_changed, grant_key),
-        native_sso_digest,
-        "server-generated Native SSO secret material must not break idempotent retries",
-    );
-
-    native_sso_changed
-        .native_sso
-        .as_mut()
-        .expect("Native SSO binding should remain present")
-        .sid = "different-native-sso-session".to_owned();
-    assert_ne!(
-        issuance_request_digest(&client, &native_sso_changed, grant_key),
-        native_sso_digest,
-        "a different Native SSO session must not reuse another session's response",
-    );
-}
-
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
-#[test]
-fn id_token_sid_is_omitted_unless_explicitly_requested() {
-    let client = client_with_grants(&["authorization_code"]);
-    let issue = token_issue_with_sid(Vec::new());
-    assert_eq!(id_token_session_sid(&client, &issue, false), None);
-
-    let issue = token_issue_with_sid(vec!["sid".to_owned()]);
-    assert_eq!(
-        id_token_session_sid(&client, &issue, false),
-        Some("op-session-sid")
-    );
-}
-
-#[test]
-fn id_token_sid_is_included_for_session_bound_logout_clients() {
-    let issue = token_issue_with_sid(Vec::new());
-
-    let mut frontchannel_client = client_with_grants(&["authorization_code"]);
-    frontchannel_client.frontchannel_logout_uri = Some("https://client.example/logout".to_owned());
-    assert_eq!(
-        id_token_session_sid(&frontchannel_client, &issue, true),
-        Some("op-session-sid")
-    );
-
-    let mut backchannel_client = client_with_grants(&["authorization_code"]);
-    backchannel_client.backchannel_logout_uri =
-        Some("https://client.example/backchannel".to_owned());
-    assert_eq!(
-        id_token_session_sid(&backchannel_client, &issue, false),
-        Some("op-session-sid")
-    );
-}
-
-#[test]
-fn id_token_sid_is_not_enabled_for_all_clients_by_logout_feature_flags() {
-    let client = client_with_grants(&["authorization_code"]);
-    let issue = token_issue_with_sid(Vec::new());
-
-    assert_eq!(id_token_session_sid(&client, &issue, true), None);
-}
-
-#[test]
-fn id_token_sid_request_object_also_allows_session_sid() {
-    let client = client_with_grants(&["authorization_code"]);
-    let mut issue = token_issue_with_sid(Vec::new());
-    issue.id_token_claim_requests.push(OidcClaimRequest {
-        name: "sid".to_owned(),
-        essential: true,
-        value: None,
-        values: Vec::new(),
-    });
-
-    assert_eq!(
-        id_token_session_sid(&client, &issue, false),
-        Some("op-session-sid")
-    );
-}
-
-#[test]
-fn refresh_id_token_sid_contract_distinguishes_presence_and_original_omission() {
-    let client = client_with_grants(&["authorization_code"]);
-    let mut issue = token_issue_with_sid(Vec::new());
-    issue.refresh_id_token_sid = Some(Some("native-sso-sid".to_owned()));
-    assert_eq!(
-        id_token_session_sid(&client, &issue, false),
-        Some("native-sso-sid")
-    );
-
-    issue.refresh_id_token_sid = Some(None);
-    assert_eq!(id_token_session_sid(&client, &issue, false), None);
-}
-
-#[test]
-fn refresh_without_id_token_preserves_the_original_sid_contract() {
-    let mut issue = token_issue_with_sid(Vec::new());
-    issue.refresh_id_token_sid = Some(Some("original-sid".to_owned()));
-
-    assert_eq!(persisted_id_token_sid(&issue, None), Some("original-sid"));
-    assert_eq!(
-        persisted_id_token_sid(&issue, Some("new-sid")),
-        Some("new-sid")
-    );
-}
-
-#[test]
-fn essential_id_token_claim_requests_match_protocol_claim_values() {
-    let client = client_with_grants(&["authorization_code"]);
-    let mut issue = token_issue_with_sid(Vec::new());
-    issue.acr = Some("urn:example:loa:2".to_owned());
-    issue.id_token_claim_requests = vec![
-        OidcClaimRequest {
-            name: "auth_time".to_owned(),
-            essential: true,
-            value: Some(json!(1_000)),
-            values: Vec::new(),
-        },
-        OidcClaimRequest {
-            name: "amr".to_owned(),
-            essential: true,
-            value: None,
-            values: vec![json!(["password"]), json!(["password", "otp"])],
-        },
-        OidcClaimRequest {
-            name: "acr".to_owned(),
-            essential: true,
-            value: Some(json!("urn:example:loa:2")),
-            values: Vec::new(),
-        },
-        OidcClaimRequest {
-            name: "sid".to_owned(),
-            essential: true,
-            value: None,
-            values: Vec::new(),
-        },
-        OidcClaimRequest {
-            name: "department".to_owned(),
-            essential: true,
-            value: None,
-            values: vec![json!("engineering"), json!("security")],
-        },
-    ];
-    let extra_claims = json!({"department": "engineering"});
-
-    assert!(refreshed_id_token_essential_claims_satisfied(
-        &issue,
-        &client,
-        false,
-        Some(&extra_claims),
-    ));
-
-    assert!(claim_request_value_matches(
-        &OidcClaimRequest {
-            name: "department".to_owned(),
-            essential: true,
-            value: None,
-            values: Vec::new(),
-        },
-        &json!("anything"),
-    ));
-    assert!(!claim_request_value_matches(
-        &OidcClaimRequest {
-            name: "department".to_owned(),
-            essential: true,
-            value: Some(json!("finance")),
-            values: Vec::new(),
-        },
-        &json!("engineering"),
-    ));
-    assert!(!claim_request_value_matches(
-        &OidcClaimRequest {
-            name: "department".to_owned(),
-            essential: true,
-            value: None,
-            values: vec![json!("finance")],
-        },
-        &json!("engineering"),
-    ));
-
-    issue.acr = Some("urn:example:loa:1".to_owned());
-    assert!(!refreshed_id_token_essential_claims_satisfied(
-        &issue,
-        &client,
-        false,
-        Some(&extra_claims),
-    ));
-}
-
-#[test]
 fn request_idempotency_key_trims_and_rejects_invalid_values() {
     let missing = actix_web::test::TestRequest::get().to_http_request();
     assert_eq!(request_idempotency_key(&missing), None);
@@ -1007,32 +658,6 @@ fn request_idempotency_key_trims_and_rejects_invalid_values() {
     assert_eq!(request_idempotency_key(&too_long_request), None);
 }
 
-#[test]
-fn response_from_token_issuance_returns_only_a_persisted_body() {
-    let mut record = TokenIssuanceRecord {
-        issuance_id: Uuid::now_v7(),
-        tenant_id: DEFAULT_TENANT_ID,
-        client_id: Uuid::now_v7(),
-        user_id: None,
-        grant_key: "grant".to_owned(),
-        request_digest: "digest".to_owned(),
-        access_token_jti: Some("jti".to_owned()),
-        access_token_expires_at: Some(Utc::now().timestamp() + 300),
-        response_body: Some(br#"{}"#.to_vec()),
-        response_digest: Some("digest".to_owned()),
-        response_key_version: Some("v1".to_owned()),
-    };
-    let response = response_from_token_issuance(&record)
-        .expect("committed issuance with a response body should be recoverable");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(header::CACHE_CONTROL).unwrap(),
-        "no-store"
-    );
-    record.response_body = None;
-    assert!(response_from_token_issuance(&record).is_none());
-}
-
 #[actix_web::test]
 async fn signing_failure_does_not_issue_any_tokens() {
     let Some(mut state) = issue_state_with_live_database() else {
@@ -1047,7 +672,6 @@ async fn signing_failure_does_not_issue_any_tokens() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(oauth_error_code(&response), "server_error");
     assert_eq!(
         response.headers().get(header::CACHE_CONTROL).unwrap(),
         HeaderValue::from_static("no-store")
@@ -1056,6 +680,13 @@ async fn signing_failure_does_not_issue_any_tokens() {
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value.get("error"), Some(&json!("server_error")));
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
@@ -1072,11 +703,17 @@ async fn invalid_authorization_details_state_fails_before_token_signing() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value.get("error"), Some(&json!("server_error")));
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
@@ -1121,7 +758,7 @@ async fn native_sso_issue_fails_closed_when_the_runtime_module_is_disabled() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_scope");
+    assert_eq!(oauth_error_code(response).await, "invalid_scope");
 }
 
 #[actix_web::test]
@@ -1138,7 +775,7 @@ async fn native_sso_issue_requires_openid_before_token_signing() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_scope");
+    assert_eq!(oauth_error_code(response).await, "invalid_scope");
 }
 
 #[actix_web::test]
@@ -1247,7 +884,7 @@ async fn issuance_rechecks_principal_deactivation_before_commit() {
         let issue_client = client.clone();
         let mut issuer = actix_web::rt::spawn(async move {
             let response = issue_token_response(&issue_state, &issue_client, issue).await;
-            (response.status(), oauth_error_code(&response))
+            (response.status(), oauth_error_code(response).await)
         });
         wait_for_issuance_commit_lock(&mut observer, blocking_backend_pid, &mut issuer).await;
 
@@ -1378,11 +1015,17 @@ async fn dpop_nonce_store_failure_stops_token_issue_before_access_token_signing(
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
     assert!(value.get("id_token").is_none());
@@ -1400,11 +1043,17 @@ async fn id_token_subject_load_failure_does_not_issue_oidc_response() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert!(value.get("id_token").is_none());
     assert!(value.get("refresh_token").is_none());
 }
@@ -1457,11 +1106,17 @@ async fn attested_client_refresh_token_requires_client_instance_binding() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(oauth_error_code(&response), "invalid_client_attestation");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "invalid_client_attestation"
+    );
     assert_eq!(
         value.get("error"),
         Some(&json!("invalid_client_attestation"))
@@ -1484,11 +1139,17 @@ async fn refresh_token_persistence_failure_does_not_return_partial_refresh_token
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert!(value.get("refresh_token").is_none());
 }
 
@@ -1509,11 +1170,17 @@ async fn refresh_token_rotation_failure_does_not_return_partial_credentials() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
     assert!(value.get("id_token").is_none());
@@ -1533,11 +1200,17 @@ async fn consumed_authorization_code_marker_failure_returns_error_after_revocati
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let body = actix_web::body::to_bytes(response.into_body())
         .await
         .expect("response body should collect");
     let value: Value = serde_json::from_slice(&body).expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
 }
@@ -1702,13 +1375,14 @@ async fn concurrent_prepared_issuance_recovers_the_winning_response() {
         .expect("prepared issuance should be stored");
     assert!(matches!(prepared, PrepareTokenIssuanceResult::Created(_)));
 
-    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
     let authorization = test_support::test_authorization_service(&state);
     let context = TokenIssuanceContext {
         config: &config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let first_future = issue_token_response_with_service_and_grant(
@@ -1775,8 +1449,8 @@ async fn prepared_issuance_rejects_a_different_request_digest_for_the_same_grant
             .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
     assert!(!response_body(response).await.is_empty());
+    assert_eq!(oauth_error_code(response).await, "invalid_grant");
 }
 
 #[actix_web::test]
@@ -1804,9 +1478,15 @@ async fn refresh_issue_rejects_missing_essential_id_token_claims() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "invalid_grant"
+    );
     assert_eq!(value["error"], "invalid_grant");
     assert!(value.get("id_token").is_none());
 }
@@ -1831,9 +1511,15 @@ async fn id_token_signing_failure_does_not_issue_oidc_credentials() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("id_token").is_none());
 }
@@ -1861,9 +1547,15 @@ async fn id_token_encryption_failure_does_not_issue_an_unencrypted_token() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("id_token").is_none());
 }
@@ -1891,9 +1583,15 @@ async fn native_sso_issue_requires_a_refresh_session_before_persisting_device_st
     let response = issue_native_sso_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "invalid_grant"
+    );
     assert_eq!(value["error"], "invalid_grant");
     assert!(value.get("device_secret").is_none());
 }
@@ -1919,7 +1617,7 @@ async fn native_sso_idempotent_retry_rejects_expired_access_with_live_refresh() 
         )),
         state.keyset.clone(),
     );
-    let config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let config = token_issuance_config(state.settings.as_ref());
     let mut modules = state.active_module_snapshot();
     modules
         .accepting
@@ -1929,6 +1627,7 @@ async fn native_sso_idempotent_retry_rejects_expired_access_with_live_refresh() 
         config: &config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let grant_key = format!("native-expiry-{}", Uuid::now_v7());
@@ -1948,12 +1647,28 @@ async fn native_sso_idempotent_retry_rejects_expired_access_with_live_refresh() 
     let mode = TokenIssuanceMode::Idempotent {
         grant_key: grant_key.clone(),
     };
-    let first =
-        super::issue_token_response(&context, &service, &client, mode.clone(), issue()).await;
+    let first = present_token_result(
+        nazo_oauth_server::token::issue::issue_token_response(
+            &context,
+            &service,
+            &client,
+            mode.clone(),
+            issue(),
+        )
+        .await,
+    );
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = response_body(first).await;
-    let retry =
-        super::issue_token_response(&context, &service, &client, mode.clone(), issue()).await;
+    let retry = present_token_result(
+        nazo_oauth_server::token::issue::issue_token_response(
+            &context,
+            &service,
+            &client,
+            mode.clone(),
+            issue(),
+        )
+        .await,
+    );
     assert_eq!(retry.status(), StatusCode::OK);
     assert_eq!(response_body(retry).await, first_body);
     let mut connection = get_conn(&state.diesel_db).await.unwrap();
@@ -1962,10 +1677,24 @@ async fn native_sso_idempotent_retry_rejects_expired_access_with_live_refresh() 
         .bind::<Text, _>(blake3_hex(&grant_key)).execute(&mut connection).await.unwrap();
     assert_eq!(changed, 1);
     drop(connection);
-    let expired = super::issue_token_response(&context, &service, &client, mode, issue()).await;
+    let expired = present_token_result(
+        nazo_oauth_server::token::issue::issue_token_response(
+            &context,
+            &service,
+            &client,
+            mode,
+            issue(),
+        )
+        .await,
+    );
     assert_eq!(expired.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&expired), "invalid_request");
     let body: Value = serde_json::from_slice(&response_body(expired).await).unwrap();
+    assert_eq!(
+        body.get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "invalid_request"
+    );
     assert!(body.get("access_token").is_none());
     assert!(body.get("refresh_token").is_none());
     assert_eq!(refresh_token_row_count(&state, &client).await, 1);
@@ -2045,9 +1774,15 @@ async fn authorization_code_marker_failure_revokes_the_issued_access_token() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("access_token").is_none());
 }
@@ -2074,9 +1809,15 @@ async fn refresh_rotation_conflict_fails_closed_without_returning_credentials() 
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "invalid_grant"
+    );
     assert_eq!(value["error"], "invalid_grant");
     assert!(value.get("access_token").is_none());
     assert!(value.get("refresh_token").is_none());
@@ -2130,9 +1871,15 @@ async fn busy_prepared_issuance_fails_closed_after_bounded_wait() {
     delete_token_issuance(&state, issuance_id).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
 }
 
@@ -2231,9 +1978,15 @@ async fn dpop_nonce_failure_is_reported_after_the_issuance_claim() {
     delete_token_issuance_for_grant(&state, &client, &grant_key).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("access_token").is_none());
 }
@@ -2260,9 +2013,15 @@ async fn access_token_subject_mapping_failure_fails_closed_before_response_assem
     delete_token_issuance_for_grant(&state, &client, &grant_key).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("access_token").is_none());
 }
@@ -2285,9 +2044,15 @@ async fn malformed_active_subject_claims_fail_closed_before_id_token_signing() {
     let response = issue_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("id_token").is_none());
 }
@@ -2317,9 +2082,15 @@ async fn native_sso_device_secret_failure_does_not_return_partial_credentials() 
     let response = issue_native_sso_token_response(&state, &client, issue).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("device_secret").is_none());
 }
@@ -2345,9 +2116,15 @@ async fn refresh_issue_new_persistence_failure_uses_non_rotation_error_mapping()
     delete_token_issuance_for_grant(&state, &client, &grant_key).await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(oauth_error_code(&response), "server_error");
     let value: Value = serde_json::from_slice(&response_body(response).await)
         .expect("OAuth error body should be JSON");
+    assert_eq!(
+        value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("OAuth JSON should contain an error code"),
+        "server_error"
+    );
     assert_eq!(value["error"], "server_error");
     assert!(value.get("refresh_token").is_none());
 }

@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 pub(crate) async fn my_access_requests(
     sessions: Data<SessionProfileHandles>,
-    service: Data<crate::bootstrap::ClientAccessProfileService>,
+    service: Data<nazo_oauth_server::services::ClientAccessProfileService>,
     req: HttpRequest,
 ) -> HttpResponse {
     let user = match sessions.current_user_or_login_required(&req).await {
@@ -92,7 +92,7 @@ pub(crate) struct CreateAccessRequest {
 
 pub(crate) async fn create_access_request(
     sessions: Data<SessionProfileHandles>,
-    service: Data<crate::bootstrap::ClientAccessProfileService>,
+    service: Data<nazo_oauth_server::services::ClientAccessProfileService>,
     req: HttpRequest,
     Json(payload): Json<CreateAccessRequest>,
 ) -> HttpResponse {

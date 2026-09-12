@@ -5,14 +5,14 @@ use crate::adapters::avatar_files::{
     AvatarPromotion, cleanup_avatar_temps, finish_avatar_promotion, promote_avatar_files,
     remove_avatar_file_if_exists, rename_avatar_file_if_exists, rollback_avatar_promotion,
 };
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
-use crate::http::sessions::SessionPayload;
 use crate::schema::users;
 use crate::settings::Settings;
 use crate::test_support::valkey::valkey_set_ex;
 use crate::test_support::{DatabaseUserFixture, TestInfrastructure};
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::sessions::SessionPayload;
 
 use actix_web::error::PayloadError;
 use actix_web::{

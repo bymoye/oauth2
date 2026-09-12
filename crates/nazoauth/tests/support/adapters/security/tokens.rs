@@ -1,4 +1,4 @@
-use super::jwt_decoding_key_from_jwk;
+use nazo_oauth_server::crypto::jwt_decoding_key_from_jwk;
 
 use chrono::Utc;
 

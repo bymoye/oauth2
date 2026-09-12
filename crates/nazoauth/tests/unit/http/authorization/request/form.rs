@@ -1,7 +1,8 @@
-use super::super::{authorization_duplicate_parameters, oauth_json_error};
+use super::super::tests::response_oauth_error_code;
 use super::*;
 use actix_web::test::TestRequest;
 use nazo_auth::parse_resource_indicator_parameter;
+use nazo_oauth_server::authorization::AuthorizationApplication;
 
 fn authorization_post_request(content_type: &str, query: &str) -> HttpRequest {
     TestRequest::post()
@@ -10,44 +11,44 @@ fn authorization_post_request(content_type: &str, query: &str) -> HttpRequest {
         .to_http_request()
 }
 
-#[test]
-fn authorization_post_form_requires_form_urlencoded_content_type() {
+#[actix_web::test]
+async fn authorization_post_form_requires_form_urlencoded_content_type() {
     let req = authorization_post_request("application/json", "");
 
     let response = parse_authorization_post_form(
         &req,
         &Bytes::from_static(br#"{"response_type":"code"}"#),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap_err();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_json_error(&response).as_deref(),
+        response_oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
 
-#[test]
-fn authorization_post_form_rejects_non_utf8_body() {
+#[actix_web::test]
+async fn authorization_post_form_rejects_non_utf8_body() {
     let req = authorization_post_request("application/x-www-form-urlencoded", "");
 
     let response = parse_authorization_post_form(
         &req,
         &Bytes::from_static(&[0xff, 0xfe]),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap_err();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_json_error(&response).as_deref(),
+        response_oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
 
-#[test]
-fn authorization_post_form_rejects_duplicate_oauth_parameter_in_query() {
+#[actix_web::test]
+async fn authorization_post_form_rejects_duplicate_oauth_parameter_in_query() {
     let req = authorization_post_request(
         "application/x-www-form-urlencoded",
         "response_type=code&response_type=token",
@@ -56,31 +57,31 @@ fn authorization_post_form_rejects_duplicate_oauth_parameter_in_query() {
     let response = parse_authorization_post_form(
         &req,
         &Bytes::from_static(b"client_id=client"),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap_err();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_json_error(&response).as_deref(),
+        response_oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
 
-#[test]
-fn authorization_post_form_rejects_duplicate_oauth_parameter_in_body() {
+#[actix_web::test]
+async fn authorization_post_form_rejects_duplicate_oauth_parameter_in_body() {
     let req = authorization_post_request("application/x-www-form-urlencoded; charset=utf-8", "");
 
     let response = parse_authorization_post_form(
         &req,
         &Bytes::from_static(b"response_type=code&response_type=token"),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap_err();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        oauth_json_error(&response).as_deref(),
+        response_oauth_error_code(response).await.as_deref(),
         Some("invalid_request")
     );
 }
@@ -92,7 +93,7 @@ fn authorization_post_form_preserves_unknown_parameters_without_duplicate_reject
     let parsed = parse_authorization_post_form(
         &req,
         &Bytes::from_static(b"response_type=code&custom=a&custom=b"),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap();
 
@@ -107,7 +108,7 @@ fn authorization_post_form_preserves_unknown_parameters_without_duplicate_reject
 fn authorization_query_preserves_multiple_resource_indicators() {
     let parsed = parse_authorization_query(
         "response_type=code&resource=https%3A%2F%2Fapi.example%2Fone&resource=https%3A%2F%2Fapi.example%2Ftwo",
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap();
 
@@ -129,7 +130,7 @@ fn authorization_post_form_preserves_multiple_resource_indicators() {
         &Bytes::from_static(
             b"response_type=code&resource=https%3A%2F%2Fapi.example%2Fone&resource=https%3A%2F%2Fapi.example%2Ftwo",
         ),
-        &authorization_duplicate_parameters(),
+        &AuthorizationApplication::duplicate_parameters(),
     )
     .unwrap();
 

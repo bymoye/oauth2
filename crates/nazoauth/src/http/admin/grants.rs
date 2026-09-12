@@ -1,5 +1,4 @@
 //! 管理端用户授权关系接口。
-use crate::adapters::audit::audit_fields;
 use crate::http::admin::{
     persist_required_audit_or_unavailable, require_durable_audit_or_unavailable,
 };
@@ -14,6 +13,7 @@ use actix_web::{HttpRequest, HttpResponse};
 use nazo_auth::{AdminGrantRepositoryPort, AdminGrantRevokeError, AdminGrantView};
 use nazo_http_actix::{csrf_error, has_valid_csrf_token_for_cookies};
 use nazo_http_actix::{json_response, oauth_error};
+use nazo_oauth_server::ports::audit::audit_fields;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;

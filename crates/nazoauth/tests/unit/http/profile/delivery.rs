@@ -10,7 +10,6 @@ fn delivery_payload_response(raw: &str) -> HttpResponse {
 }
 
 use super::*;
-use nazo_http_actix::OAuthJsonErrorFields;
 
 #[actix_web::test]
 async fn delivery_payload_response_adds_read_once_notice_without_dropping_credentials() {
@@ -53,16 +52,24 @@ fn delivery_payload_response_rejects_uncommitted_or_orphaned_payloads() {
     }
 }
 
-#[test]
-fn delivery_payload_response_fails_closed_for_corrupted_stored_payload() {
+#[actix_web::test]
+async fn delivery_payload_response_fails_closed_for_corrupted_stored_payload() {
     let response = delivery_payload_response("{not-json");
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        oauth_error_name(response).await.as_deref(),
         Some("server_error")
     );
+}
+
+async fn oauth_error_name(response: actix_web::HttpResponse) -> Option<String> {
+    let bytes = actix_web::body::to_bytes(response.into_body())
+        .await
+        .expect("OAuth response body should collect");
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("OAuth response body should be JSON");
+    body.get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }

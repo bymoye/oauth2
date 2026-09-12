@@ -1,14 +1,16 @@
 use super::*;
-use crate::adapters::security::CLIENT_ASSERTION_TYPE_JWT_BEARER;
 use actix_web::test::TestRequest;
+use actix_web::{HttpResponse, http::StatusCode};
 use actix_web::{
     http::header::{self, HeaderValue},
     web::Bytes,
 };
+use nazo_auth::CLIENT_ASSERTION_TYPE_JWT_BEARER;
 use nazo_http_actix::{
-    TokenManagementFormError, TokenOnlyForm, parse_token_management_form,
-    token_management_form_error, token_management_has_conflicting_client_auth,
+    parse_token_management_form, token_management_form_error,
+    token_management_has_conflicting_client_auth,
 };
+use nazo_oauth_server::contracts::token_forms::{TokenManagementFormError, TokenOnlyForm};
 use proptest::prelude::*;
 
 fn form_request() -> HttpRequest {

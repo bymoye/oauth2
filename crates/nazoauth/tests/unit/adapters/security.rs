@@ -1,11 +1,21 @@
 use super::tokens::*;
 use super::*;
 use crate::config::ConfigSource;
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID, DEFAULT_TENANT_ID};
 use crate::settings::Settings;
 use crate::test_support::ClientSigningFixture;
 use crate::test_support::client_signing_fixture;
 use actix_web::test::TestRequest;
+use chrono::Utc;
+use nazo_auth::ValidatedClientAssertion;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::security::client_assertion::{
+    ClientAssertionError, verify_private_key_jwt_claims_for_issuer,
+};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[test]
 fn password_hash_capacity_defaults_match_the_documented_bounded_policy() {
@@ -115,7 +125,7 @@ fn verify_private_key_jwt_claims_with_settings(
     client: &ClientRow,
     assertion: &str,
 ) -> Result<ValidatedClientAssertion, ClientAssertionError> {
-    verify_private_key_jwt_claims_with_issuer(
+    verify_private_key_jwt_claims_for_issuer(
         &settings.endpoint.issuer,
         req.uri().path(),
         std::slice::from_ref(&settings.endpoint.mtls_endpoint_base_url.as_str()),

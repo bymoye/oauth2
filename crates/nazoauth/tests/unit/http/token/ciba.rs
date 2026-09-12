@@ -1,54 +1,80 @@
-use nazo_http_actix::OAuthJsonErrorFields;
+async fn load_ciba_request_payload(
+    service: &ServerCibaService,
+    id: &str,
+) -> Result<Option<CibaRequestState>, CibaStatePortError> {
+    service
+        .load(id)
+        .await
+        .map(|stored| stored.map(|stored| stored.into_state()))
+}
+fn configure_ciba_test_app(
+    cfg: &mut actix_web::web::ServiceConfig,
+    state: &TestInfrastructure,
+    runtime: &crate::runtime_modules::ServerRuntimeModuleRegistry,
+) {
+    let application = nazo_oauth_server::token::ciba::CibaApplication::new(
+        Arc::new(super::super::issue::test_support::test_authorization_service(state)),
+        Arc::new(CibaTokenHandles::new(
+            Arc::new(ServerCibaService::new(Arc::new(CibaStore::new(
+                &state.valkey_connection(),
+            )))),
+            Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone())),
+            Arc::new(ciba_config(state.settings.as_ref())),
+        )),
+        crate::test_support::test_remote_client_documents_data().into_inner(),
+        runtime.snapshot_store(),
+        crate::http::authorization::test_support::test_security_audit_arc(),
+    );
+    cfg.app_data(actix_web::web::Data::new(application))
+        .app_data(actix_web::web::Data::new(
+            crate::http::sessions::test_support::admin_session_handles(state),
+        ))
+        .app_data(actix_web::web::Data::new(
+            nazo_http_actix::ClientIpConfig::new(
+                &state.settings.endpoint.trusted_proxy_cidrs,
+                state.settings.endpoint.client_ip_header_mode,
+            ),
+        ));
+}
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
 
 use crate::test_support::TestInfrastructure;
 
-use crate::domain::tenancy::{DEFAULT_ORGANIZATION_ID, DEFAULT_REALM_ID};
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
 
-use super::super::dispatch::validate_token_request_profile;
-use super::request::{
-    ciba_binding_message_is_supported, ciba_hint_count, ciba_request_object_audience_valid,
-    ciba_request_object_hint_count, ciba_request_object_jti_valid, ciba_request_object_times_valid,
-    ciba_requested_expiry_seconds, ciba_selected_acr, decode_jwt_header_value,
-    merge_request_object_string, parse_backchannel_authentication_form,
-    parse_requested_expiry_string, split_compact_jwt,
-    unverified_signed_ciba_request_object_client_id, validate_ciba_binding_message,
-};
+use super::request::parse_backchannel_authentication_form;
 
-fn validate_and_apply_ciba_request_object_claims(
-    state: &TestInfrastructure,
-    client: &ClientRow,
-    form: &mut BackchannelAuthenticationForm,
-) -> Result<Option<CibaRequestObjectReplay>, HttpResponse> {
-    validate_and_apply_ciba_request_object_claims_with_config(
-        &CibaHttpConfig::from(state.settings.as_ref()),
-        client,
-        form,
-    )
-}
-
-fn validate_ciba_security_profile_client(
-    settings: &Settings,
-    client: &ClientRow,
-    auth_method: &str,
-) -> Result<(), HttpResponse> {
-    validate_ciba_security_profile_client_with_config(
-        &CibaHttpConfig::from(settings),
-        client,
-        auth_method,
-    )
-}
-
-fn validate_ciba_request_object_presence(
-    settings: &Settings,
-    client: &ClientRow,
-    form: &BackchannelAuthenticationForm,
-) -> Result<(), HttpResponse> {
-    validate_ciba_request_object_presence_with_config(&CibaHttpConfig::from(settings), client, form)
-}
-
-use super::*;
+use super::state::ciba_config;
 use crate::config::ConfigSource;
+use crate::settings::Settings;
+use actix_web::{
+    HttpRequest, HttpResponse,
+    http::{StatusCode, header},
+};
+use chrono::Utc;
+use nazo_auth::{
+    CibaAuthenticationContext, CibaRequestState, CibaStatePortError, CibaStatus,
+    ValidatedClientAssertion,
+};
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::{
+    contracts::token_forms::TokenForm,
+    domain::rows::ClientRow,
+    services::{ServerCibaService, ServerTokenService},
+    token::{
+        ciba::{
+            CIBA_GRANT_TYPE,
+            poll::token_ciba,
+            state::{CibaTokenContext, CibaTokenHandles, ciba_grant_key},
+        },
+        issue::TokenIssuanceContext,
+    },
+};
 use nazo_postgres::{create_pool, get_conn};
+use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::test_support::ClientSigningFixture;
 use crate::test_support::client_signing_fixture;
@@ -56,40 +82,8 @@ use crate::test_support::valkey::valkey_set_ex;
 use diesel::sql_query;
 use diesel::sql_types::{Bool, Text, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
-use std::io::{self, Write};
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration as StdDuration;
-use tracing::Subscriber;
-use tracing_subscriber::{Layer, layer::Context, prelude::*};
-
-#[derive(Clone)]
-struct AuditCounter(Arc<AtomicUsize>);
-
-impl<S> Layer<S> for AuditCounter
-where
-    S: Subscriber,
-{
-    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-        if event.metadata().target() == "audit" {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
-struct FailingAuditWriter;
-
-impl Write for FailingAuditWriter {
-    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-        Err(io::Error::other("deliberate audit writer failure"))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Err(io::Error::other("deliberate audit writer failure"))
-    }
-}
 
 fn ciba_test_state_with(configure: impl FnOnce(&mut Settings)) -> TestInfrastructure {
     let mut settings =
@@ -253,7 +247,7 @@ async fn insert_ciba_user_with_email(state: &TestInfrastructure, user_id: Uuid, 
 }
 
 async fn store_ciba_session(state: &TestInfrastructure, sid: &str, user_id: Uuid) {
-    let payload = crate::http::sessions::SessionPayload {
+    let payload = nazo_oauth_server::sessions::SessionPayload {
         user_id,
         auth_time: Utc::now().timestamp(),
         amr: vec!["pwd".to_owned(), "otp".to_owned(), "mfa".to_owned()],
@@ -367,52 +361,43 @@ async fn call_ciba_token_with_modules_for_test(
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let issuance_config = TokenIssuanceConfig::from(state.settings.as_ref());
-    let ciba_config = CibaHttpConfig::from(state.settings.as_ref());
+    let issuance_config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
+    let ciba_config = ciba_config(state.settings.as_ref());
     let authorization = super::super::issue::test_support::test_authorization_service(state);
     let issuance = TokenIssuanceContext {
         config: &issuance_config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let handles = CibaTokenHandles::new(
-        Data::new(ciba_service),
-        Data::from(
-            std::sync::Arc::new(users) as std::sync::Arc<dyn nazo_persistence::CibaAccountStore>
-        ),
-        Data::new(ciba_config),
+        Arc::new(ciba_service),
+        Arc::new(users),
+        Arc::new(ciba_config),
     );
-    token_ciba(
+    let client_ip = nazo_http_actix::ClientIpConfig::new(
+        &state.settings.endpoint.trusted_proxy_cidrs,
+        state.settings.endpoint.client_ip_header_mode,
+    );
+    let facts = crate::http::token::dispatch::token_request_facts(&req, &client_ip);
+    let result = token_ciba(
         CibaTokenContext {
             token_service: &token_service,
             issuance: &issuance,
             handles: &handles,
-            request: &req,
+            request: &facts,
         },
         client,
         &form,
         client_assertion,
         auth_method,
     )
-    .await
-}
-
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
-fn service_response_oauth_error_code<B>(response: &actix_web::dev::ServiceResponse<B>) -> String {
-    response
-        .response()
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth service response should record its error code")
+    .await;
+    match result {
+        Ok(success) => nazo_http_actix::token_endpoint_success_response(success),
+        Err(error) => nazo_http_actix::oauth_endpoint_error_response(error),
+    }
 }
 
 #[actix_web::test]
@@ -428,10 +413,7 @@ async fn token_ciba_rejects_client_policy_before_state_access() {
     let response = call_ciba_token_for_test(&state, &client, "not-stored".to_owned()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("unauthorized_client")
     );
 }
@@ -462,7 +444,7 @@ async fn token_ciba_rejects_a_disabled_module_before_state_access() {
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unsupported_grant_type");
+    assert_eq!(oauth_error_code(response).await, "unsupported_grant_type");
 }
 
 #[actix_web::test]
@@ -487,7 +469,7 @@ async fn token_ciba_rejects_a_missing_auth_req_id_before_state_access() {
             .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
+    assert_eq!(oauth_error_code(response).await, "invalid_request");
 }
 
 #[actix_web::test]
@@ -499,7 +481,7 @@ async fn token_ciba_rejects_an_invalid_fapi_client_before_state_access() {
     let response = call_ciba_token_for_test(&state, &client, "not-stored".to_owned()).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
+    assert_eq!(oauth_error_code(response).await, "invalid_request");
 }
 
 #[actix_web::test]
@@ -513,21 +495,7 @@ async fn ciba_backchannel_fails_closed_before_client_state_access() {
     .expect("CIBA runtime registry should initialize");
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(crate::test_support::test_remote_client_documents_data())
-            .app_data(actix_web::web::Data::new(
-                super::super::issue::test_support::test_authorization_service(&state),
-            ))
-            .app_data(actix_web::web::Data::new(ServerCibaService::new(
-                std::sync::Arc::new(CibaStore::new(&state.valkey_connection())),
-            )))
-            .app_data(actix_web::web::Data::from(
-                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone()))
-                    as Arc<dyn nazo_persistence::CibaAccountStore>,
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -540,7 +508,7 @@ async fn ciba_backchannel_fails_closed_before_client_state_access() {
     let response = actix_web::test::call_service(&app, missing_credentials).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "invalid_client"
     );
 
@@ -554,7 +522,7 @@ async fn ciba_backchannel_fails_closed_before_client_state_access() {
     let response = actix_web::test::call_service(&app, mixed_methods).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "invalid_request"
     );
 
@@ -565,7 +533,10 @@ async fn ciba_backchannel_fails_closed_before_client_state_access() {
         .to_request();
     let response = actix_web::test::call_service(&app, lookup_failure).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(service_response_oauth_error_code(&response), "server_error");
+    assert_eq!(
+        oauth_error_code(response.into_parts().1).await,
+        "server_error"
+    );
 }
 
 #[actix_web::test]
@@ -597,19 +568,7 @@ async fn ciba_backchannel_validates_request_object_and_creates_bound_state() {
     )));
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(crate::test_support::test_remote_client_documents_data())
-            .app_data(actix_web::web::Data::new(
-                super::super::issue::test_support::test_authorization_service(&state),
-            ))
-            .app_data(ciba_service.clone())
-            .app_data(actix_web::web::Data::from(
-                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone()))
-                    as Arc<dyn nazo_persistence::CibaAccountStore>,
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -686,21 +645,7 @@ async fn ciba_backchannel_rejects_invalid_request_object_claims_before_user_look
     .expect("CIBA runtime registry should initialize");
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(crate::test_support::test_remote_client_documents_data())
-            .app_data(actix_web::web::Data::new(
-                super::super::issue::test_support::test_authorization_service(&state),
-            ))
-            .app_data(actix_web::web::Data::new(ServerCibaService::new(
-                std::sync::Arc::new(CibaStore::new(&state.valkey_connection())),
-            )))
-            .app_data(actix_web::web::Data::from(
-                Arc::new(nazo_postgres::UserRepository::new(state.diesel_db.clone()))
-                    as Arc<dyn nazo_persistence::CibaAccountStore>,
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -737,7 +682,10 @@ async fn ciba_backchannel_rejects_invalid_request_object_claims_before_user_look
             .to_request();
         let response = actix_web::test::call_service(&app, request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(service_response_oauth_error_code(&response), expected_error);
+        assert_eq!(
+            oauth_error_code(response.into_parts().1).await,
+            expected_error
+        );
     }
 
     insert_ciba_user_with_email(&state, Uuid::now_v7(), &login_hint).await;
@@ -766,7 +714,7 @@ async fn ciba_backchannel_rejects_invalid_request_object_claims_before_user_look
     let response = actix_web::test::call_service(&app, request).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "invalid_request"
     );
 }
@@ -825,15 +773,6 @@ fn ciba_private_key_jwt_client(kid: &str, fixture: &ClientSigningFixture) -> Cli
     ciba_private_key_jwt_client_with_alg(kid, fixture)
 }
 
-fn signed_ciba_request_object_with_alg(
-    kid: &str,
-    alg: jsonwebtoken::Algorithm,
-    fixture: &ClientSigningFixture,
-    extra_claims: Value,
-) -> String {
-    signed_ciba_request_object_for_client_with_alg("client-1", kid, alg, fixture, extra_claims)
-}
-
 fn signed_ciba_request_object_for_client_with_alg(
     client_id: &str,
     kid: &str,
@@ -867,14 +806,6 @@ fn signed_ciba_request_object_for_client_with_alg(
     let mut header = jsonwebtoken::Header::new(alg);
     header.kid = Some(kid.to_owned());
     fixture.encode_jwt(&header, &claims)
-}
-
-fn signed_ciba_request_object(
-    kid: &str,
-    fixture: &ClientSigningFixture,
-    extra_claims: Value,
-) -> String {
-    signed_ciba_request_object_with_alg(kid, jsonwebtoken::Algorithm::PS256, fixture, extra_claims)
 }
 
 fn signed_ciba_request_object_for_client(
@@ -943,62 +874,6 @@ fn ciba_backchannel_body(
     fields.join("&")
 }
 
-fn unsigned_ciba_request_object(client_id: &str) -> String {
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({
-            "iss": client_id,
-            "sub": client_id,
-        }))
-        .expect("payload should serialize"),
-    );
-    format!("{header}.{payload}.")
-}
-
-#[test]
-fn ciba_status_serializes_as_protocol_state() {
-    assert_eq!(
-        serde_json::to_value(CibaStatus::Pending).unwrap(),
-        json!("pending")
-    );
-}
-
-#[test]
-fn ciba_start_audit_fields_are_redacted() {
-    let now = Utc::now().timestamp();
-    let state = CibaRequestState {
-        client_id: "client-1".to_owned(),
-        user_id: Uuid::now_v7(),
-        scopes: vec!["openid".to_owned(), "profile".to_owned()],
-        audiences: vec!["resource://default".to_owned()],
-        acr: None,
-        authentication_context: None,
-        binding_message: Some("sensitive binding text".to_owned()),
-        issued_at: now,
-        status: CibaStatus::Pending,
-        interval_seconds: 5,
-        expires_at: now + 60,
-        retention_expires_at: now + 180,
-        last_poll_at: None,
-        ping_notification: None,
-    };
-
-    let fields = ciba_start_audit_fields(
-        &state,
-        "secret-auth-req-id",
-        Some("source-ip-hash".to_owned()),
-    );
-    let serialized = serde_json::to_string(&fields).unwrap();
-
-    assert!(serialized.contains(&blake3_hex("secret-auth-req-id")));
-    assert!(!serialized.contains("secret-auth-req-id"));
-    assert!(!serialized.contains("sensitive binding text"));
-    assert!(!serialized.contains("binding_message"));
-    assert!(!serialized.contains("client_assertion"));
-    assert_eq!(fields.get("client_id"), Some(&json!("client-1")));
-    assert_eq!(fields.get("source_ip_hash"), Some(&json!("source-ip-hash")));
-}
-
 #[actix_web::test]
 async fn ciba_request_parser_enforces_form_encoding_and_parameter_uniqueness() {
     let body = concat!(
@@ -1044,12 +919,7 @@ async fn ciba_request_parser_enforces_form_encoding_and_parameter_uniqueness() {
         Ok(_) => panic!("duplicate CIBA parameters must fail"),
         Err(response) => response,
     };
-    assert_eq!(
-        service_response_oauth_error_code(&actix_web::dev::ServiceResponse::new(
-            request, duplicate
-        )),
-        "invalid_request"
-    );
+    assert_eq!(oauth_error_code(duplicate).await, "invalid_request");
 
     let (request, mut payload) = actix_web::test::TestRequest::post()
         .insert_header((header::CONTENT_TYPE, "application/json"))
@@ -1081,492 +951,75 @@ async fn ciba_request_parser_enforces_form_encoding_and_parameter_uniqueness() {
     assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-#[test]
-fn ciba_request_object_helpers_cover_protocol_boundaries() {
-    let now = Utc::now().timestamp();
-    let claims =
-        |aud: Option<Value>, exp: i64, nbf: i64, iat: i64| CibaAuthenticationRequestClaims {
-            iss: Some("client-1".to_owned()),
-            aud,
-            exp: Some(exp),
-            nbf: Some(nbf),
-            iat: Some(iat),
-            jti: Some("jti-1".to_owned()),
-            scope: None,
-            login_hint: None,
-            id_token_hint: None,
-            login_hint_token: None,
-            binding_message: None,
-            acr_values: None,
-            requested_expiry: None,
-            client_notification_token: None,
-        };
-    let valid = claims(Some(json!("https://issuer.example")), now + 120, now, now);
-    assert!(ciba_request_object_audience_valid(
-        &valid,
-        "https://issuer.example"
-    ));
-    assert!(ciba_request_object_audience_valid(
-        &claims(
-            Some(json!(["other", "https://issuer.example/bc-authorize"])),
-            now + 120,
-            now,
-            now,
-        ),
-        "https://issuer.example"
-    ));
-    assert!(!ciba_request_object_audience_valid(
-        &claims(Some(json!(42)), now + 120, now, now),
-        "https://issuer.example"
-    ));
-    assert!(!ciba_request_object_audience_valid(
-        &claims(None, now + 120, now, now),
-        "https://issuer.example"
-    ));
-
-    assert!(ciba_request_object_times_valid(&valid, now));
-    assert!(!ciba_request_object_times_valid(
-        &claims(Some(json!("https://issuer.example")), now, now, now),
-        now
-    ));
-    assert!(!ciba_request_object_times_valid(
-        &claims(
-            Some(json!("https://issuer.example")),
-            now + 120,
-            now + CIBA_REQUEST_OBJECT_CLOCK_SKEW_SECONDS + 1,
-            now,
-        ),
-        now
-    ));
-    assert!(!ciba_request_object_times_valid(
-        &claims(
-            Some(json!("https://issuer.example")),
-            now + 120,
-            now - CIBA_REQUEST_OBJECT_MAX_TTL_SECONDS - 1,
-            now,
-        ),
-        now
-    ));
-    assert!(!ciba_request_object_times_valid(
-        &claims(
-            Some(json!("https://issuer.example")),
-            now + 120,
-            now,
-            now + CIBA_REQUEST_OBJECT_CLOCK_SKEW_SECONDS + 1,
-        ),
-        now
-    ));
-    assert!(!ciba_request_object_times_valid(
-        &claims(
-            Some(json!("https://issuer.example")),
-            now + 120,
-            now,
-            now - CIBA_REQUEST_OBJECT_MAX_TTL_SECONDS - 1,
-        ),
-        now
-    ));
-    assert!(!ciba_request_object_times_valid(
-        &claims(
-            Some(json!("https://issuer.example")),
-            now + CIBA_REQUEST_OBJECT_MAX_TTL_SECONDS + 120,
-            now,
-            now,
-        ),
-        now
-    ));
-    assert!(!ciba_request_object_jti_valid(None));
-    assert!(!ciba_request_object_jti_valid(Some("  ")));
-    assert!(ciba_request_object_jti_valid(Some("jti")));
-    assert!(!ciba_request_object_jti_valid(Some(&"x".repeat(129))));
-    assert_eq!(ciba_request_object_hint_count(&valid), 0);
-    let mut hinted = claims(Some(json!("https://issuer.example")), now + 120, now, now);
-    hinted.login_hint = Some("user".to_owned());
-    hinted.id_token_hint = Some("token".to_owned());
-    assert_eq!(ciba_request_object_hint_count(&hinted), 2);
-
-    let mut form = BackchannelAuthenticationForm {
-        login_hint: Some("user".to_owned()),
-        ..BackchannelAuthenticationForm::default()
+#[actix_web::test]
+async fn ciba_decision_storage_failure_maps_to_non_cacheable_server_error() {
+    let Some(state) = live_ciba_replay_state().await else {
+        return;
     };
-    form.id_token_hint = Some("token".to_owned());
-    assert_eq!(ciba_hint_count(&form), 2);
-    assert_eq!(ciba_selected_acr(Some("0 1 2")).as_deref(), Some("1"));
-    assert_eq!(ciba_selected_acr(Some("0 2")), None);
-    assert!(ciba_binding_message_is_supported("1234"));
-    assert!(!ciba_binding_message_is_supported("\n"));
-    assert!(!ciba_binding_message_is_supported(
-        &"x".repeat(CIBA_BINDING_MESSAGE_MAX_CHARS + 1)
-    ));
-    let valid_binding = BackchannelAuthenticationForm {
-        binding_message: Some("1234".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-    validate_ciba_binding_message(&valid_binding).expect("valid binding message must pass");
-    for invalid in [
-        " ".to_owned(),
-        "line\nbreak".to_owned(),
-        "x".repeat(CIBA_BINDING_MESSAGE_MAX_CHARS + 1),
-    ] {
-        let invalid_binding = BackchannelAuthenticationForm {
-            binding_message: Some(invalid),
-            ..BackchannelAuthenticationForm::default()
-        };
-        let response = validate_ciba_binding_message(&invalid_binding)
-            .expect_err("invalid outer binding message must fail closed");
-        assert_eq!(oauth_error_code(&response), "invalid_binding_message");
-    }
-
-    let mut target = None;
-    merge_request_object_string(&mut target, Some(" value ".to_owned()), "conflict")
-        .expect("first request object value should apply");
-    merge_request_object_string(&mut target, None, "conflict").expect("missing value is a no-op");
-    merge_request_object_string(&mut target, Some("value".to_owned()), "conflict")
-        .expect("equal request object value should be accepted");
-    assert!(
-        merge_request_object_string(&mut target, Some("other".to_owned()), "conflict").is_err()
-    );
-    assert!(merge_request_object_string(&mut target, Some("  ".to_owned()), "conflict").is_err());
-    assert_eq!(ciba_requested_expiry_seconds(&json!(30)), Some(30));
-    assert_eq!(ciba_requested_expiry_seconds(&json!("30")), Some(30));
-    assert_eq!(ciba_requested_expiry_seconds(&json!(0)), None);
-    assert_eq!(ciba_requested_expiry_seconds(&json!(true)), None);
-    assert_eq!(parse_requested_expiry_string(" 30 "), Some(30));
-    assert_eq!(parse_requested_expiry_string("0"), None);
-    assert_eq!(parse_requested_expiry_string("bad"), None);
-
-    assert_eq!(split_compact_jwt("a.b.c"), Some(("a", "b", "c")));
-    assert_eq!(split_compact_jwt("a.b.c.d"), None);
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"PS256"}"#);
-    assert_eq!(decode_jwt_header_value(&header).unwrap()["alg"], "PS256");
-    assert!(decode_jwt_header_value("*").is_err());
-
-    let fixture = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let signed = signed_ciba_request_object("ciba-kid", &fixture, json!({}));
-    assert_eq!(
-        unverified_signed_ciba_request_object_client_id(&signed).as_deref(),
-        Some("client-1")
-    );
-    assert_eq!(unverified_signed_ciba_request_object_client_id("bad"), None);
-    assert_eq!(
-        unverified_signed_ciba_request_object_client_id("a.b."),
-        None
-    );
-}
-
-#[test]
-fn ciba_request_object_without_request_is_a_noop() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-    let mut form = BackchannelAuthenticationForm::default();
-
-    assert!(
-        validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-            .expect("missing request object should be accepted")
-            .is_none()
-    );
-}
-
-#[test]
-fn ciba_request_object_rejects_unsupported_binding_and_parameter_conflicts() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-    let unsupported =
-        signed_ciba_request_object("ciba-kid", &key, json!({"binding_message": "\u{0001}"}));
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(unsupported),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("unsupported binding_message must be rejected");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_binding_message");
-
-    for field in [
-        "scope",
-        "login_hint",
-        "id_token_hint",
-        "login_hint_token",
-        "binding_message",
-        "acr_values",
-        "client_notification_token",
-    ] {
-        let extra = match field {
-            "scope" => json!({"scope": "openid"}),
-            "login_hint" => json!({"login_hint": "request-user"}),
-            "id_token_hint" => json!({
-                "login_hint": null,
-                "id_token_hint": "request-id-token"
-            }),
-            "login_hint_token" => json!({
-                "login_hint": null,
-                "login_hint_token": "request-login-token"
-            }),
-            "binding_message" => json!({"binding_message": "request-binding"}),
-            "acr_values" => json!({"acr_values": "1"}),
-            "client_notification_token" => {
-                json!({"client_notification_token": "request-notification"})
-            }
-            _ => unreachable!("conflict field list is exhaustive"),
-        };
-        let request_object = signed_ciba_request_object("ciba-kid", &key, extra);
-        let mut form = BackchannelAuthenticationForm {
-            request: Some(request_object),
-            ..BackchannelAuthenticationForm::default()
-        };
-        match field {
-            "scope" => form.scope = Some("outer-scope".to_owned()),
-            "login_hint" => form.login_hint = Some("outer-user".to_owned()),
-            "id_token_hint" => form.id_token_hint = Some("outer-id-token".to_owned()),
-            "login_hint_token" => form.login_hint_token = Some("outer-login-token".to_owned()),
-            "binding_message" => form.binding_message = Some("outer-binding".to_owned()),
-            "acr_values" => form.acr_values = Some("2".to_owned()),
-            "client_notification_token" => {
-                form.client_notification_token = Some("outer-notification".to_owned())
-            }
-            _ => unreachable!("conflict field list is exhaustive"),
-        }
-        let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-            .expect_err("outer and request object parameters must not conflict");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
-        assert_eq!(oauth_error_code(&response), "invalid_request", "{field}");
-    }
-}
-
-#[test]
-fn ciba_request_object_rejects_invalid_or_conflicting_requested_expiry() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-
-    let request_object = signed_ciba_request_object(
-        "ciba-kid",
-        &key,
-        json!({"requested_expiry": "not-a-duration"}),
-    );
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("invalid request object expiry must be rejected");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-
-    let request_object =
-        signed_ciba_request_object("ciba-kid", &key, json!({"requested_expiry": "30"}));
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        requested_expiry_seconds: Some(31),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("outer and request object expiry must not conflict");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-}
-
-#[test]
-fn ciba_request_object_rejects_invalid_compact_jwt_metadata() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-
-    for request_object in ["not-a-jwt".to_owned(), "a.b.".to_owned()] {
-        let mut form = BackchannelAuthenticationForm {
-            request: Some(request_object),
-            ..BackchannelAuthenticationForm::default()
-        };
-        let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-            .expect_err("malformed request object must be rejected");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(oauth_error_code(&response), "invalid_request");
-    }
-
-    let none_header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(r#"{"iss":"client-1"}"#);
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(format!("{none_header}.{payload}.signature")),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("alg=none request object must be rejected");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-
-    let mut mismatched = client.clone();
-    mismatched.backchannel_authentication_request_signing_alg = Some("ES256".to_owned());
-    let request_object = signed_ciba_request_object("ciba-kid", &key, json!({}));
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &mismatched, &mut form)
-        .expect_err("request object algorithm must match registration");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-
-    let claims = json!({
-        "iss": "client-1",
-        "aud": "https://issuer.example",
-        "iat": Utc::now().timestamp(),
-        "nbf": Utc::now().timestamp(),
-        "exp": Utc::now().timestamp() + 120,
-        "jti": format!("missing-kid-{}", Uuid::now_v7()),
-        "login_hint": "subject@example.test"
-    });
-    let request_object = key.encode_jwt(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::PS256),
-        &claims,
-    );
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("request object without kid must be rejected");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-
-    let request_object = signed_ciba_request_object("unknown-kid", &key, json!({}));
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("request object with an unknown key must be rejected");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-}
-
-#[test]
-fn ciba_unverified_request_object_hint_rejects_none_and_empty_issuers() {
-    let none_header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(r#"{"iss":"client-1","sub":"client-1"}"#);
-    assert_eq!(
-        unverified_signed_ciba_request_object_client_id(&format!(
-            "{none_header}.{payload}.signature"
-        )),
-        None
-    );
-
-    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"PS256"}"#);
-    let payload = URL_SAFE_NO_PAD.encode(r#"{"iss":"  "}"#);
-    assert_eq!(
-        unverified_signed_ciba_request_object_client_id(&format!("{header}.{payload}.signature")),
-        None
-    );
-}
-
-fn committed_decision_fixture(decision: CibaDecision) -> CibaCommittedDecision {
-    let now = Utc::now().timestamp();
-    let (status, authentication_context) = match &decision {
-        CibaDecision::Approve(authentication_context) => {
-            (CibaStatus::Approved, Some(authentication_context.clone()))
-        }
-        CibaDecision::Deny => (CibaStatus::Denied, None),
-    };
-    CibaCommittedDecision {
-        state: CibaRequestState {
-            client_id: "client-1".to_owned(),
-            user_id: Uuid::now_v7(),
-            scopes: vec!["openid".to_owned()],
-            audiences: vec!["resource://default".to_owned()],
-            acr: None,
-            authentication_context,
-            binding_message: None,
-            issued_at: now,
-            status,
-            interval_seconds: 5,
-            expires_at: now + 60,
-            retention_expires_at: now + 180,
-            last_poll_at: None,
-            ping_notification: None,
-        },
-        decision,
-    }
-}
-
-#[test]
-fn ciba_decision_audit_is_emitted_only_for_committed_outcome() {
-    let count = Arc::new(AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(AuditCounter(Arc::clone(&count)));
-
-    tracing::subscriber::with_default(subscriber, || {
-        for failure in [
-            CibaDecisionFailure::Missing,
-            CibaDecisionFailure::InvalidAuthenticationContext,
-            CibaDecisionFailure::UserMismatch,
-            CibaDecisionFailure::AlreadyHandled,
-            CibaDecisionFailure::Expired,
-            CibaDecisionFailure::Contended,
-            CibaDecisionFailure::Storage(CibaStatePortError::CorruptData),
-        ] {
-            let _ = complete_ciba_decision(
-                Err(failure),
-                "auth-req-id",
-                CibaDecisionSource::User,
-                Some("source-ip-hash".to_owned()),
-            );
-        }
-        assert_eq!(count.as_ref().load(Ordering::SeqCst), 0);
-
-        let response = complete_ciba_decision(
-            Ok(committed_decision_fixture(CibaDecision::Approve(
-                CibaAuthenticationContext {
-                    auth_time: Utc::now().timestamp(),
-                    amr: vec!["pwd".to_owned()],
-                    oidc_sid: Some("audit-session".to_owned()),
-                },
-            ))),
-            "auth-req-id",
-            CibaDecisionSource::User,
-            Some("source-ip-hash".to_owned()),
-        );
-        assert_eq!(response.status(), StatusCode::OK);
-    });
-
-    assert_eq!(count.as_ref().load(Ordering::SeqCst), 1);
-}
-
-#[test]
-fn ciba_audit_writer_failure_does_not_change_committed_response() {
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(|| FailingAuditWriter)
-        .finish();
-
-    let response = tracing::subscriber::with_default(subscriber, || {
-        complete_ciba_decision(
-            Ok(committed_decision_fixture(CibaDecision::Deny)),
-            "auth-req-id",
-            CibaDecisionSource::User,
-            None,
-        )
-    });
-
-    assert_eq!(response.status(), StatusCode::OK);
-}
-
-#[test]
-fn ciba_decision_storage_failure_maps_to_non_cacheable_server_error() {
-    let response = complete_ciba_decision(
-        Err(CibaDecisionFailure::Storage(
-            CibaStatePortError::CorruptData,
-        )),
-        "auth-req-id",
-        CibaDecisionSource::User,
-        None,
-    );
-
+    let user_id = Uuid::now_v7();
+    insert_ciba_user(&state, user_id).await;
+    let sid = format!("ciba-corrupt-session-{}", Uuid::now_v7());
+    store_ciba_session(&state, &sid, user_id).await;
+    let id = format!("ciba-corrupt-{}", Uuid::now_v7());
+    valkey_set_ex(
+        &state.valkey,
+        nazo_valkey::test_support::ciba_request_storage_key(&id),
+        "{not-json".to_owned(),
+        60,
+    )
+    .await
+    .expect("corrupt fixture stores");
+    let settings = state.settings.clone();
+    let runtime = crate::runtime_modules::test_support::runtime_module_registry_for_test(
+        state.diesel_db.clone(),
+        &settings,
+    )
+    .expect("runtime fixture");
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
+            .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
+    )
+    .await;
+    let request = actix_web::test::TestRequest::post()
+        .uri(&format!("/auth/ciba/{id}"))
+        .cookie(actix_web::cookie::Cookie::new(
+            state.settings.session.session_cookie_name.clone(),
+            sid,
+        ))
+        .cookie(actix_web::cookie::Cookie::new(
+            state.settings.session.csrf_cookie_name.clone(),
+            "csrf",
+        ))
+        .set_json(json!({"decision":"approve","csrf_token":"csrf"}))
+        .to_request();
+    let response = actix_web::test::call_service(&app, request).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("server_error")
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
     );
+    assert_eq!(
+        oauth_error_code(response.into_parts().1).await,
+        "server_error"
+    );
+}
+
+#[actix_web::test]
+async fn ciba_poll_storage_error_presenter_preserves_503_and_no_store() {
+    let response = nazo_http_actix::oauth_endpoint_error_response(
+        nazo_oauth_server::contracts::oauth_error::OAuthEndpointError::token(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            "CIBA state unavailable.",
+            false,
+        ),
+    );
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response
             .headers()
@@ -1574,64 +1027,50 @@ fn ciba_decision_storage_failure_maps_to_non_cacheable_server_error() {
             .and_then(|value| value.to_str().ok()),
         Some("no-store")
     );
-}
-
-#[test]
-fn ciba_poll_storage_failure_returns_503_and_never_protocol_progress() {
-    let response =
-        ciba_poll_failure_response(CibaPollFailure::Storage(CibaStatePortError::CorruptData));
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("server_error")
     );
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .and_then(|value| value.to_str().ok()),
-        Some("no-store")
-    );
 }
 
-#[test]
-fn ciba_poll_failures_preserve_invalid_grant_and_contention_boundaries() {
-    for (failure, expected_status, expected_error) in [
+#[actix_web::test]
+async fn ciba_poll_error_presenter_preserves_invalid_grant_and_contention_headers() {
+    for (description, expected_status, expected_error) in [
         (
-            CibaPollFailure::Missing,
+            "CIBA auth_req_id is expired or consumed.",
             StatusCode::BAD_REQUEST,
             "invalid_grant",
         ),
         (
-            CibaPollFailure::ClientMismatch,
+            "CIBA auth_req_id was not issued to this client.",
             StatusCode::BAD_REQUEST,
             "invalid_grant",
         ),
         (
-            CibaPollFailure::Contended,
+            "CIBA state is busy.",
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
         ),
     ] {
-        let response = ciba_poll_failure_response(failure);
-        assert_eq!(response.status(), expected_status);
-        assert_eq!(
-            response
-                .extensions()
-                .get::<OAuthJsonErrorFields>()
-                .map(|fields| fields.error.as_str()),
-            Some(expected_error)
+        let response = nazo_http_actix::oauth_endpoint_error_response(
+            nazo_oauth_server::contracts::oauth_error::OAuthEndpointError::token(
+                http::StatusCode::from_u16(expected_status.as_u16()).expect("valid status"),
+                expected_error,
+                description,
+                false,
+            ),
         );
+        assert_eq!(response.status(), expected_status);
         assert_eq!(
             response
                 .headers()
                 .get(header::CACHE_CONTROL)
                 .and_then(|value| value.to_str().ok()),
             Some("no-store")
+        );
+        assert_eq!(
+            Some(oauth_error_code(response).await.as_str()),
+            Some(expected_error)
         );
     }
 }
@@ -1649,10 +1088,7 @@ async fn ciba_verification_page_preserves_redirect_and_non_cacheable_headers() {
     .expect("CIBA runtime registry should initialize");
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -1716,22 +1152,9 @@ async fn ciba_verification_loads_the_bound_user_and_rejects_a_session_mismatch()
         &settings,
     )
     .expect("CIBA runtime registry should initialize");
-    let ciba_service = actix_web::web::Data::new(ServerCibaService::new(std::sync::Arc::new(
-        CibaStore::new(&state.valkey_connection()),
-    )));
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(ciba_service)
-            .app_data(actix_web::web::Data::new(
-                super::super::issue::test_support::test_authorization_service(&state),
-            ))
-            .app_data(actix_web::web::Data::new(
-                crate::http::sessions::test_support::admin_session_handles(&state),
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -1760,7 +1183,7 @@ async fn ciba_verification_loads_the_bound_user_and_rejects_a_session_mismatch()
     let response = actix_web::test::call_service(&app, request).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "access_denied"
     );
 }
@@ -1776,16 +1199,7 @@ async fn ciba_browser_decision_rejects_invalid_csrf_before_session_lookup() {
     .expect("CIBA runtime registry should initialize");
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(actix_web::web::Data::new(ServerCibaService::new(
-                std::sync::Arc::new(CibaStore::new(&state.valkey_connection())),
-            )))
-            .app_data(actix_web::web::Data::new(
-                crate::http::sessions::test_support::admin_session_handles(&state),
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -1806,7 +1220,7 @@ async fn ciba_browser_decision_rejects_invalid_csrf_before_session_lookup() {
     let response = actix_web::test::call_service(&app, request).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "invalid_request"
     );
 }
@@ -1841,14 +1255,7 @@ async fn ciba_browser_decision_commits_user_context_and_rejects_replay() {
     )));
     let app = actix_web::test::init_service(
         actix_web::App::new()
-            .app_data(ciba_service.clone())
-            .app_data(actix_web::web::Data::new(
-                crate::http::sessions::test_support::admin_session_handles(&state),
-            ))
-            .app_data(actix_web::web::Data::new(CibaHttpConfig::from(
-                settings.as_ref(),
-            )))
-            .app_data(actix_web::web::Data::from(runtime))
+            .configure(|cfg| configure_ciba_test_app(cfg, &state, &runtime))
             .configure(|cfg| crate::bootstrap::routes::configure(cfg, &settings, false)),
     )
     .await;
@@ -1892,390 +1299,9 @@ async fn ciba_browser_decision_commits_user_context_and_rejects_replay() {
     let response = actix_web::test::call_service(&app, decision_request()).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        service_response_oauth_error_code(&response),
+        oauth_error_code(response.into_parts().1).await,
         "invalid_request"
     );
-}
-
-#[test]
-fn ciba_signed_request_object_claims_apply_to_backchannel_form() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-    let request_object = signed_ciba_request_object(
-        "ciba-kid",
-        &key,
-        json!({"requested_expiry": "30", "acr_values": "1"}),
-    );
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect("valid signed CIBA request object should apply");
-
-    assert_eq!(form.scope.as_deref(), Some("openid profile email"));
-    assert_eq!(form.login_hint.as_deref(), Some("subject@example.test"));
-    assert_eq!(form.binding_message.as_deref(), Some("1234"));
-    assert_eq!(form.acr_values.as_deref(), Some("1"));
-    assert_eq!(form.requested_expiry_seconds, Some(30));
-}
-
-#[test]
-fn ciba_request_object_presence_enforces_client_policy() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.require_par_request_object = true;
-
-    let settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    let missing_request_response = validate_ciba_request_object_presence(
-        &settings,
-        &client,
-        &BackchannelAuthenticationForm::default(),
-    )
-    .expect_err("CIBA request object policy must reject unsigned form parameters");
-
-    assert_eq!(missing_request_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        missing_request_response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_request")
-    );
-
-    let form_with_request = BackchannelAuthenticationForm {
-        request: Some("request-object.jwt".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-    validate_ciba_request_object_presence(&settings, &client, &form_with_request)
-        .expect("present request object should satisfy the presence policy");
-}
-
-#[test]
-fn fapi_ciba_id1_requires_a_signed_backchannel_authentication_request() {
-    let settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-
-    let response = validate_ciba_request_object_presence(
-        &settings,
-        &client,
-        &BackchannelAuthenticationForm::default(),
-    )
-    .expect_err("FAPI-CIBA ID1 requires a signed request object");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[test]
-fn fapi_ciba_id1_accepts_both_private_key_jwt_and_mtls_client_authentication() {
-    let settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.security_policy = nazo_auth::ClientSecurityPolicy::fapi2();
-    client.require_mtls_bound_tokens = true;
-
-    validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect("FAPI-CIBA ID1 supports private_key_jwt");
-    client.token_endpoint_auth_method = "tls_client_auth".to_owned();
-    validate_ciba_security_profile_client(&settings, &client, "tls_client_auth")
-        .expect("FAPI-CIBA ID1 supports mTLS client authentication");
-
-    let response = validate_ciba_security_profile_client(&settings, &client, "client_secret_post")
-        .expect_err("FAPI-CIBA ID1 must reject shared-secret client authentication");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[test]
-fn ciba_ping_requires_a_registered_endpoint_and_high_entropy_notification_token() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.backchannel_token_delivery_mode = "ping".to_owned();
-    client.backchannel_client_notification_endpoint =
-        Some("https://client.example/ciba-notification".to_owned());
-
-    let missing =
-        validate_ciba_delivery_request(&client, &BackchannelAuthenticationForm::default())
-            .expect_err("ping requests require client_notification_token");
-    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
-
-    let weak = BackchannelAuthenticationForm {
-        client_notification_token: Some("too-short".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-    assert!(validate_ciba_delivery_request(&client, &weak).is_err());
-
-    let valid = BackchannelAuthenticationForm {
-        client_notification_token: Some("notification-token-0123456789".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-    validate_ciba_delivery_request(&client, &valid)
-        .expect("registered ping clients may supply a bearer notification token");
-}
-
-#[test]
-fn ciba_poll_rejects_ping_only_notification_credentials() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-    let form = BackchannelAuthenticationForm {
-        client_notification_token: Some("notification-token-0123456789".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    assert!(validate_ciba_delivery_request(&client, &form).is_err());
-}
-
-#[test]
-fn ciba_profile_does_not_apply_authorization_code_only_controls() {
-    let mut settings = ciba_test_state().settings.as_ref().clone();
-    settings.protocol.authorization_server_profile =
-        crate::settings::AuthorizationServerProfile::Fapi2Security;
-    settings.protocol.require_pushed_authorization_requests = true;
-    settings.protocol.ciba_security_profile = crate::settings::CibaSecurityProfile::FapiCibaId1;
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.require_mtls_bound_tokens = true;
-    let form = BackchannelAuthenticationForm {
-        request: Some("signed-request-object".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    validate_token_request_profile(&client, "private_key_jwt")
-        .expect("CIBA-compatible client authentication should pass the server profile");
-    validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect("official FAPI-CIBA compatibility policy should remain separate");
-    validate_ciba_request_object_presence(&settings, &client, &form)
-        .expect("CIBA must not require PAR, PKCE, or authorization response_type fields");
-}
-
-#[test]
-fn fapi2_ciba_profile_requires_signed_backchannel_authentication_request() {
-    let mut settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    settings.protocol.ciba_security_profile = crate::settings::CibaSecurityProfile::Fapi2Ciba;
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-
-    let response = validate_ciba_request_object_presence(
-        &settings,
-        &client,
-        &BackchannelAuthenticationForm::default(),
-    )
-    .expect_err("Fapi2Ciba must require a signed backchannel authentication request");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_request")
-    );
-}
-
-#[test]
-fn fapi2_ciba_client_policy_rejects_public_weak_auth_and_bearer_tokens() {
-    let mut settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    settings.protocol.ciba_security_profile = crate::settings::CibaSecurityProfile::Fapi2Ciba;
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-
-    let response = validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect_err("Fapi2Ciba must reject bearer access tokens");
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_request")
-    );
-
-    client.require_mtls_bound_tokens = true;
-    validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect("Fapi2Ciba must allow private_key_jwt with sender-constrained tokens");
-
-    client.require_mtls_bound_tokens = false;
-    client.require_dpop_bound_tokens = true;
-    validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect("Fapi2Ciba must allow DPoP sender-constrained tokens");
-
-    client.require_dpop_bound_tokens = false;
-    client.require_mtls_bound_tokens = true;
-    let response = validate_ciba_security_profile_client(&settings, &client, "client_secret_basic")
-        .expect_err("Fapi2Ciba must reject shared-secret client authentication");
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_client")
-    );
-
-    client.client_type = "public".to_owned();
-    let response = validate_ciba_security_profile_client(&settings, &client, "none")
-        .expect_err("Fapi2Ciba must reject public CIBA clients");
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("unauthorized_client")
-    );
-}
-
-#[test]
-fn fapi2_ciba_private_key_jwt_requires_issuer_audience_only() {
-    let mut settings =
-        Settings::from_config(&ConfigSource::default()).expect("default settings should load");
-    settings.protocol.ciba_security_profile = crate::settings::CibaSecurityProfile::Fapi2Ciba;
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.require_mtls_bound_tokens = true;
-    client.allow_client_assertion_endpoint_audience = true;
-
-    let response = validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect_err("Fapi2Ciba must reject endpoint-audience client assertions");
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_client")
-    );
-
-    settings.protocol.ciba_security_profile = crate::settings::CibaSecurityProfile::FapiCibaId1;
-    validate_ciba_security_profile_client(&settings, &client, "private_key_jwt")
-        .expect("FAPI-CIBA ID1 permits the registered token endpoint as assertion audience");
-}
-
-#[test]
-fn ciba_selected_acr_uses_supported_requested_value() {
-    assert_eq!(ciba_selected_acr(Some("1")).as_deref(), Some("1"));
-    assert_eq!(ciba_selected_acr(Some("0 1")).as_deref(), Some("1"));
-    assert_eq!(ciba_selected_acr(Some("0")).as_deref(), None);
-    assert_eq!(ciba_selected_acr(None), None);
-}
-
-#[test]
-fn ciba_token_issue_allows_refresh_and_binds_refresh_sender_constraint() {
-    let authentication_context = CibaAuthenticationContext {
-        auth_time: Utc::now().timestamp(),
-        amr: vec!["pwd".to_owned()],
-        oidc_sid: Some("sid-approved".to_owned()),
-    };
-    let ciba = CibaRequestState {
-        client_id: "client-1".to_owned(),
-        user_id: Uuid::now_v7(),
-        scopes: vec!["openid".to_owned(), "offline_access".to_owned()],
-        audiences: vec!["resource://default".to_owned()],
-        acr: Some("1".to_owned()),
-        authentication_context: None,
-        binding_message: None,
-        issued_at: Utc::now().timestamp(),
-        status: CibaStatus::Approved,
-        interval_seconds: 5,
-        expires_at: Utc::now().timestamp() + 600,
-        retention_expires_at: Utc::now().timestamp() + 720,
-        last_poll_at: None,
-        ping_notification: None,
-    };
-
-    let issue = ciba_token_issue(
-        ciba.user_id,
-        "subject-1".to_owned(),
-        ciba,
-        authentication_context,
-        Some("dpop-jkt".to_owned()),
-        None,
-    );
-
-    assert!(issue.include_refresh);
-    assert_eq!(issue.refresh_token_policy, RefreshTokenPolicy::IssueNew);
-    assert_eq!(issue.dpop_jkt.as_deref(), Some("dpop-jkt"));
-    assert_eq!(issue.refresh_token_dpop_jkt.as_deref(), Some("dpop-jkt"));
-    assert_eq!(issue.scopes, vec!["openid", "offline_access"]);
-}
-
-#[test]
-fn ciba_token_issue_transfers_approved_authentication_context() {
-    let user_id = Uuid::now_v7();
-    let authentication_context = CibaAuthenticationContext {
-        auth_time: 1_700_000_000,
-        amr: vec!["pwd".to_owned(), "otp".to_owned()],
-        oidc_sid: Some("sid-approved".to_owned()),
-    };
-    let ciba = CibaRequestState {
-        client_id: "client-1".to_owned(),
-        user_id,
-        scopes: vec!["openid".to_owned()],
-        audiences: vec!["resource://default".to_owned()],
-        acr: Some("1".to_owned()),
-        authentication_context: None,
-        binding_message: None,
-        issued_at: 1_700_000_100,
-        status: CibaStatus::Approved,
-        interval_seconds: 5,
-        expires_at: 1_700_000_600,
-        retention_expires_at: 1_700_000_720,
-        last_poll_at: None,
-        ping_notification: None,
-    };
-
-    let issue = ciba_token_issue(
-        user_id,
-        "subject-1".to_owned(),
-        ciba,
-        authentication_context,
-        None,
-        None,
-    );
-
-    assert_eq!(issue.auth_time, Some(1_700_000_000));
-    assert_eq!(issue.amr, vec!["pwd", "otp"]);
-    assert_eq!(issue.oidc_sid.as_deref(), Some("sid-approved"));
-}
-
-#[test]
-fn ciba_token_grant_state_rejects_other_client_auth_req_id_as_invalid_grant() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut ciba = CibaRequestState {
-        client_id: "client-1".to_owned(),
-        user_id: Uuid::now_v7(),
-        scopes: vec!["openid".to_owned()],
-        audiences: vec!["resource://default".to_owned()],
-        acr: None,
-        authentication_context: None,
-        binding_message: None,
-        issued_at: Utc::now().timestamp(),
-        status: CibaStatus::Pending,
-        interval_seconds: 5,
-        expires_at: Utc::now().timestamp() + 600,
-        retention_expires_at: Utc::now().timestamp() + 720,
-        last_poll_at: None,
-        ping_notification: None,
-    };
-    let mut client = ciba_private_key_jwt_client("ciba-kid", &key);
-    client.client_id = "client-2".to_owned();
-
-    let response = ciba_auth_req_id_client_error(&ciba, &client)
-        .expect("auth_req_id issued to another client must be rejected");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_grant")
-    );
-
-    ciba.client_id = client.client_id.clone();
-    assert!(ciba_auth_req_id_client_error(&ciba, &client).is_none());
 }
 
 #[actix_web::test]
@@ -2295,10 +1321,7 @@ async fn ciba_token_request_requires_mtls_binding_before_pending_state() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 }
@@ -2320,10 +1343,7 @@ async fn ciba_token_request_validates_mtls_binding_before_issuing_approved_token
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 }
@@ -2343,17 +1363,17 @@ async fn ciba_token_poll_maps_pending_slow_down_and_denied_states() {
     store_ciba_state(&state, &client, &pending_id, CibaStatus::Pending).await;
     let pending = call_ciba_token_with_mtls_for_test(&state, &client, pending_id.clone()).await;
     assert_eq!(pending.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&pending), "authorization_pending");
+    assert_eq!(oauth_error_code(pending).await, "authorization_pending");
 
     let slow_down = call_ciba_token_with_mtls_for_test(&state, &client, pending_id).await;
     assert_eq!(slow_down.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&slow_down), "slow_down");
+    assert_eq!(oauth_error_code(slow_down).await, "slow_down");
 
     let denied_id = format!("denied-status-{}", Uuid::now_v7());
     store_ciba_state(&state, &client, &denied_id, CibaStatus::Denied).await;
     let denied = call_ciba_token_with_mtls_for_test(&state, &client, denied_id).await;
     assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&denied), "access_denied");
+    assert_eq!(oauth_error_code(denied).await, "access_denied");
 }
 
 #[actix_web::test]
@@ -2395,7 +1415,7 @@ async fn ciba_token_poll_fails_closed_for_approved_state_without_authentication_
     let response = call_ciba_token_with_mtls_for_test(&state, &client, auth_req_id.clone()).await;
 
     assert_eq!(
-        (response.status(), oauth_error_code(&response)),
+        (response.status(), oauth_error_code(response).await),
         (StatusCode::SERVICE_UNAVAILABLE, "server_error".to_owned())
     );
     let store = CibaStore::new(&state.valkey_connection());
@@ -2445,7 +1465,7 @@ async fn ciba_token_poll_maps_an_expired_state_before_user_lookup() {
 
     let response = call_ciba_token_with_mtls_for_test(&state, &client, auth_req_id).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "expired_token");
+    assert_eq!(oauth_error_code(response).await, "expired_token");
 }
 
 #[actix_web::test]
@@ -2499,7 +1519,7 @@ async fn ciba_token_approved_state_issues_access_and_id_tokens_for_an_active_use
 
     let replay = call_ciba_token_with_mtls_for_test(&state, &client, auth_req_id).await;
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&replay), "invalid_grant");
+    assert_eq!(oauth_error_code(replay).await, "invalid_grant");
 }
 
 #[actix_web::test]
@@ -2527,225 +1547,9 @@ async fn ciba_replay_rejects_a_consumed_auth_req_id_even_with_a_persisted_respon
     let response = call_ciba_token_with_mtls_for_test(&state, &client, auth_req_id).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
+        Some(oauth_error_code(response).await.as_str()),
         Some("invalid_grant")
     );
 }
 
-#[test]
-fn ciba_signed_request_object_missing_audience_maps_to_invalid_request() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let client = ciba_private_key_jwt_client("ciba-kid", &key);
-    let request_object = signed_ciba_request_object("ciba-kid", &key, json!({"aud": null}));
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("missing CIBA request object audience must be invalid_request");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_request")
-    );
-    assert!(form.scope.is_none());
-}
-
-#[test]
-fn ciba_mtls_lookup_may_use_signed_request_object_issuer_as_hint() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let request_object = signed_ciba_request_object(
-        "ciba-kid",
-        &key,
-        json!({
-            "nbf": null,
-            "sub": "client-1"
-        }),
-    );
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    apply_ciba_request_object_client_id_hint(&mut form, false, false);
-
-    assert_eq!(form.client_id.as_deref(), Some("client-1"));
-}
-
-#[test]
-fn ciba_lookup_hint_never_trusts_unsigned_request_object_or_mixed_auth() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let signed = signed_ciba_request_object("ciba-kid", &key, json!({"sub": "client-1"}));
-    let mut unsigned = BackchannelAuthenticationForm {
-        request: Some(unsigned_ciba_request_object("client-1")),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let mut basic = BackchannelAuthenticationForm {
-        request: Some(signed),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    apply_ciba_request_object_client_id_hint(&mut unsigned, false, false);
-    apply_ciba_request_object_client_id_hint(&mut basic, true, false);
-
-    assert!(unsigned.client_id.is_none());
-    assert!(basic.client_id.is_none());
-}
-
-#[test]
-fn ciba_signed_request_object_missing_required_claim_maps_to_invalid_request() {
-    for claim in ["iss", "aud", "iat", "nbf", "exp", "jti"] {
-        let state = ciba_test_state();
-        let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-        let client = ciba_private_key_jwt_client("ciba-kid", &key);
-        let request_object = signed_ciba_request_object(
-            "ciba-kid",
-            &key,
-            Value::Object(serde_json::Map::from_iter([(
-                claim.to_owned(),
-                Value::Null,
-            )])),
-        );
-        let mut form = BackchannelAuthenticationForm {
-            request: Some(request_object),
-            ..BackchannelAuthenticationForm::default()
-        };
-
-        let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-            .expect_err("missing CIBA request object claim must be invalid");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response
-                .extensions()
-                .get::<OAuthJsonErrorFields>()
-                .map(|fields| fields.error.as_str()),
-            Some("invalid_request"),
-            "unexpected OAuth error for missing {claim}"
-        );
-        assert!(
-            form.scope.is_none(),
-            "missing {claim} must not merge claims"
-        );
-    }
-}
-
-#[test]
-fn ciba_rejects_rs256_request_object_signing_algorithm() {
-    let state = ciba_test_state();
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::RS256);
-    let client = ciba_private_key_jwt_client_with_alg("ciba-kid", &key);
-    let request_object = signed_ciba_request_object_with_alg(
-        "ciba-kid",
-        jsonwebtoken::Algorithm::RS256,
-        &key,
-        json!({}),
-    );
-    let mut form = BackchannelAuthenticationForm {
-        request: Some(request_object),
-        ..BackchannelAuthenticationForm::default()
-    };
-
-    let response = validate_and_apply_ciba_request_object_claims(&state, &client, &mut form)
-        .expect_err("FAPI-CIBA request objects must reject RS256");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response
-            .extensions()
-            .get::<OAuthJsonErrorFields>()
-            .map(|fields| fields.error.as_str()),
-        Some("invalid_request")
-    );
-}
-
-#[test]
-fn ciba_rejects_rs256_client_assertion_algorithm() {
-    assert!(!ciba_jwt_signing_algorithm_supported(
-        jsonwebtoken::Algorithm::RS256
-    ));
-    assert!(ciba_jwt_signing_algorithm_supported(
-        jsonwebtoken::Algorithm::PS256
-    ));
-}
-
-#[test]
-fn ciba_policy_covers_algorithm_names_and_delivery_rejections() {
-    assert_eq!(
-        ciba_algorithm_name(jsonwebtoken::Algorithm::EdDSA),
-        Some("EdDSA")
-    );
-    assert_eq!(
-        ciba_algorithm_name(jsonwebtoken::Algorithm::ES256),
-        Some("ES256")
-    );
-    assert_eq!(ciba_algorithm_name(jsonwebtoken::Algorithm::RS256), None);
-
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut ping_client = ciba_private_key_jwt_client("policy-ping-kid", &key);
-    ping_client.backchannel_token_delivery_mode = "ping".to_owned();
-    ping_client.backchannel_client_notification_endpoint = None;
-    let valid_notification = BackchannelAuthenticationForm {
-        client_notification_token: Some("notification-token-0123456789".to_owned()),
-        ..BackchannelAuthenticationForm::default()
-    };
-    let missing_endpoint = validate_ciba_delivery_request(&ping_client, &valid_notification)
-        .expect_err("ping mode must require a registered notification endpoint");
-    assert_eq!(missing_endpoint.status(), StatusCode::BAD_REQUEST);
-
-    let mut unsupported_client = ping_client;
-    unsupported_client.backchannel_token_delivery_mode = "push".to_owned();
-    let unsupported = validate_ciba_delivery_request(&unsupported_client, &valid_notification)
-        .expect_err("unsupported CIBA delivery modes must fail closed");
-    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
-
-    let mut poll_client = ciba_private_key_jwt_client("policy-poll-kid", &key);
-    poll_client.backchannel_token_delivery_mode = "poll".to_owned();
-    let poll_with_notification = validate_ciba_delivery_request(&poll_client, &valid_notification)
-        .expect_err("poll mode must reject notification credentials");
-    assert_eq!(poll_with_notification.status(), StatusCode::BAD_REQUEST);
-}
-
-#[test]
-fn ciba_token_profile_covers_fapi2_client_and_sender_constraints() {
-    let key = client_signing_fixture(jsonwebtoken::Algorithm::PS256);
-    let mut client = ciba_private_key_jwt_client("profile-kid", &key);
-
-    for (dpop, mtls) in [(false, false), (true, false), (false, true), (true, true)] {
-        client.require_dpop_bound_tokens = dpop;
-        client.require_mtls_bound_tokens = mtls;
-        validate_ciba_token_request_profile(&client, "private_key_jwt")
-            .expect("baseline CIBA profile should preserve each sender-constraint mapping");
-    }
-
-    client.security_policy = nazo_auth::ClientSecurityPolicy::fapi2();
-
-    client.client_type = "public".to_owned();
-    let public_client = validate_ciba_token_request_profile(&client, "private_key_jwt")
-        .expect_err("FAPI2 CIBA must reject public clients");
-    assert_eq!(oauth_error_code(&public_client), "unauthorized_client");
-
-    client.client_type = "confidential".to_owned();
-    client.require_dpop_bound_tokens = false;
-    client.require_mtls_bound_tokens = false;
-    let bearer = validate_ciba_token_request_profile(&client, "private_key_jwt")
-        .expect_err("FAPI2 CIBA must reject bearer tokens");
-    assert_eq!(oauth_error_code(&bearer), "invalid_request");
-
-    client.require_mtls_bound_tokens = true;
-    let bad_auth_method = validate_ciba_token_request_profile(&client, "client_secret_basic")
-        .expect_err("FAPI2 CIBA must reject shared-secret authentication");
-    assert_eq!(oauth_error_code(&bad_auth_method), "invalid_client");
-    validate_ciba_token_request_profile(&client, "private_key_jwt")
-        .expect("FAPI2 CIBA should accept constrained private_key_jwt clients");
-}
 use nazo_valkey::CibaStore;

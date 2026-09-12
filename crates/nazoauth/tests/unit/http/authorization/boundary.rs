@@ -1,10 +1,10 @@
 const REQUEST_SOURCE: &str = concat!(
     include_str!("../../../../src/http/authorization/request/mod.rs"),
     include_str!("../../../../src/http/authorization/request/flow.rs"),
-    include_str!("../../../../src/http/authorization/request/policy.rs"),
-    include_str!("../../../../src/http/authorization/request/pushed.rs"),
-    include_str!("../../../../src/http/authorization/request/reauth.rs"),
-    include_str!("../../../../src/http/authorization/request/response.rs"),
+    include_str!("../../../../../authorization-server/src/authorization/request/policy.rs"),
+    include_str!("../../../../../authorization-server/src/authorization/request/pushed.rs"),
+    include_str!("../../../../../authorization-server/src/authorization/request/reauth.rs"),
+    include_str!("../../../../../authorization-server/src/authorization/request/response.rs"),
 );
 
 #[test]
@@ -17,7 +17,7 @@ fn authorization_entrypoints_use_focused_dependencies() {
         ),
         (
             "jar",
-            include_str!("../../../../src/http/authorization/jar.rs"),
+            include_str!("../../../../../authorization-server/src/authorization/jar.rs"),
         ),
         (
             "consent",
@@ -29,7 +29,9 @@ fn authorization_entrypoints_use_focused_dependencies() {
         ),
         (
             "prompt_none",
-            include_str!("../../../../src/http/authorization/request/prompt_none.rs"),
+            include_str!(
+                "../../../../../authorization-server/src/authorization/request/prompt_none.rs"
+            ),
         ),
     ] {
         assert!(
@@ -58,7 +60,7 @@ fn authorization_entrypoints_use_focused_dependencies() {
         );
         for dependency in [
             "Data<ServerAuthorizationService>",
-            "Data<AuthorizationHttpConfig>",
+            "Data<AuthorizationConfig>",
             "Data<AdminSessionHandles>",
             "Data<ServerRuntimeModuleRegistry>",
         ] {
@@ -77,7 +79,7 @@ fn authorization_entrypoints_use_focused_dependencies() {
         ),
         (
             "jar",
-            include_str!("../../../../src/http/authorization/jar.rs"),
+            include_str!("../../../../../authorization-server/src/authorization/jar.rs"),
         ),
     ] {
         assert!(

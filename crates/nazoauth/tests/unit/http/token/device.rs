@@ -1,60 +1,17 @@
+use crate::test_support::token_response_body as response_body;
+use response_body::oauth_error_code;
+
 use super::*;
 
-#[actix_web::test]
-async fn device_client_authentication_accepts_registered_public_none_and_rejects_secret() {
-    let state = Data::new(disabled_state());
-    let service = device_authorization_service(&state);
-    let config = DeviceHttpConfig::from(state.settings.as_ref());
-    let resolver =
-        crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[]).unwrap();
-    let mut client = device_client();
-    let credentials = ClientCredentials {
-        client_id: Some(client.client_id.clone()),
-        method: "none".into(),
-        ..Default::default()
-    };
-    assert!(
-        authenticate_device_authorization_client(
-            &service,
-            &config,
-            &form_request(),
-            &mut client,
-            &credentials,
-            &resolver
-        )
-        .await
-        .is_ok()
-    );
-    let credentials = ClientCredentials {
-        client_secret: Some(Uuid::now_v7().to_string()),
-        method: "client_secret_post".into(),
-        ..credentials
-    };
-    let response = authenticate_device_authorization_client(
-        &service,
-        &config,
-        &form_request(),
-        &mut client,
-        &credentials,
-        &resolver,
-    )
-    .await
-    .expect_err("public clients cannot present a secret");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-}
 use crate::config::ConfigSource;
-use crate::domain::tenancy::DEFAULT_ORGANIZATION_ID;
-use crate::domain::tenancy::DEFAULT_REALM_ID;
-use crate::domain::tenancy::DEFAULT_TENANT_ID;
-use crate::http::rate_limit::TokenManagementRequestLimiter;
-use crate::http::token::device_issuance::token_device_code_with_service;
-use crate::http::token::device_issuance::{device_grant_key, required_device_code};
-use crate::http::token::issue::{TokenIssuanceConfig, TokenIssuanceContext};
-use crate::http::token::{ServerTokenService, TokenForm, device_config::DeviceHttpConfig};
+use nazo_oauth_server::token::device_issuance::token_device_code_with_service;
+
+use crate::http::token::{TokenForm, device_config::DeviceHttpConfig};
 use crate::settings::Settings;
 use crate::test_support::TestInfrastructure;
 use actix_web::test::TestRequest;
 use chrono::Duration;
+use chrono::Utc;
 use diesel::sql_query;
 use diesel::sql_types::{Text, Uuid as SqlUuid};
 use diesel_async::RunQueryDsl;
@@ -62,9 +19,15 @@ use fred::interfaces::ClientLike as _;
 use fred::prelude::{
     Builder as ValkeyBuilder, Config as ValkeyConfig, ConnectionConfig, PerformanceConfig,
 };
-use nazo_auth::{DeviceAuthorizationState, DevicePollTransition, evaluate_device_poll};
-use nazo_http_actix::ClientIpConfig;
-use nazo_http_actix::OAuthJsonErrorFields;
+use nazo_identity::DEFAULT_ORGANIZATION_ID;
+use nazo_identity::DEFAULT_REALM_ID;
+use nazo_identity::DEFAULT_TENANT_ID;
+use nazo_oauth_server::domain::rows::ClientRow;
+use nazo_oauth_server::rate_limit::TokenManagementRequestLimiter;
+use nazo_oauth_server::services::ServerDeviceGrantService;
+use nazo_oauth_server::services::ServerTokenService;
+use nazo_oauth_server::token::DEVICE_CODE_GRANT_TYPE;
+use nazo_oauth_server::token::issue::TokenIssuanceContext;
 use nazo_postgres::{create_pool, get_conn};
 use serde_json::json;
 use std::sync::Arc;
@@ -72,17 +35,6 @@ use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 use crate::test_support::valkey::valkey_set_ex;
-
-fn device_authorization_service(
-    state: &Data<TestInfrastructure>,
-) -> Data<ServerAuthorizationService> {
-    let connection = state.valkey_connection();
-    Data::new(ServerAuthorizationService::new(
-        nazo_postgres::AuthorizationFlowRepository::new(state.diesel_db.clone(), DEFAULT_TENANT_ID),
-        std::sync::Arc::new(nazo_valkey::AuthorizationStateAdapter::new(&connection)),
-        state.keyset.clone(),
-    ))
-}
 
 fn device_grant_service(state: &TestInfrastructure) -> Data<ServerDeviceGrantService> {
     Data::new(ServerDeviceGrantService::new(std::sync::Arc::new(
@@ -92,15 +44,37 @@ fn device_grant_service(state: &TestInfrastructure) -> Data<ServerDeviceGrantSer
 
 fn token_management_limiter(state: &TestInfrastructure) -> Data<TokenManagementRequestLimiter> {
     let rate_limit = &state.settings.identity.rate_limit;
-    let endpoint = &state.settings.endpoint;
     Data::new(TokenManagementRequestLimiter::new(
         std::sync::Arc::new(nazo_valkey::RateLimitStore::new(&state.valkey_connection())),
         rate_limit.window_seconds,
         rate_limit.token_management_max_requests,
-        ClientIpConfig::new(
-            &endpoint.trusted_proxy_cidrs,
-            endpoint.client_ip_header_mode,
+    ))
+}
+
+fn decision_handles(
+    state: &TestInfrastructure,
+    device_service: Arc<ServerDeviceGrantService>,
+    runtime: Arc<nazo_runtime_modules::SnapshotStore>,
+) -> Data<DeviceDecisionHandles> {
+    Data::new(DeviceDecisionHandles::new(
+        Arc::new(crate::http::token::issue::test_support::test_authorization_service(state)),
+        device_service,
+        Arc::new(nazo_postgres::AuthorizationFlowRepository::new(
+            state.diesel_db.clone(),
+            DEFAULT_TENANT_ID,
+        )),
+        Arc::new(
+            crate::http::token::device_config::device_config_from_settings(state.settings.as_ref()),
         ),
+        runtime,
+        Arc::new(
+            crate::adapters::remote_client_documents::RemoteClientDocumentResolver::new(&[])
+                .expect("empty resolver should build"),
+        ),
+        token_management_limiter(state).into_inner(),
+        Arc::new(crate::adapters::audit::TenantSecurityAudit::new(
+            state.settings.tenant.context.tenant_id,
+        )),
     ))
 }
 
@@ -213,14 +187,6 @@ fn device_token_form(device_code: Option<&str>) -> TokenForm {
     }
 }
 
-fn oauth_error_code(response: &HttpResponse) -> String {
-    response
-        .extensions()
-        .get::<OAuthJsonErrorFields>()
-        .map(|fields| fields.error.clone())
-        .expect("OAuth error response should record its error code")
-}
-
 async fn live_device_replay_state() -> Option<TestInfrastructure> {
     let database_url = std::env::var("DATABASE_URL").ok()?;
     let valkey_url = std::env::var("VALKEY_URL").ok()?;
@@ -278,7 +244,7 @@ async fn insert_device_user(state: &TestInfrastructure, user_id: Uuid) {
 }
 
 async fn store_device_session(state: &TestInfrastructure, session_id: &str, user_id: Uuid) {
-    let payload = crate::http::sessions::SessionPayload {
+    let payload = nazo_oauth_server::sessions::SessionPayload {
         user_id,
         auth_time: Utc::now().timestamp(),
         amr: vec!["pwd".to_owned()],
@@ -306,29 +272,35 @@ async fn call_device_token_for_test(
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let issuance_config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let issuance_config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
-    let authorization = super::super::issue::test_support::test_authorization_service(state);
+    let authorization = crate::http::token::issue::test_support::test_authorization_service(state);
     let issuance = TokenIssuanceContext {
         config: &issuance_config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let device_service = ServerDeviceGrantService::new(std::sync::Arc::new(
         nazo_valkey::DeviceStore::new(&connection),
     ));
     let request = TestRequest::post().uri("/token").to_http_request();
-    token_device_code_with_service(
-        &token_service,
-        &issuance,
-        &device_service,
-        &request,
-        client,
-        &device_token_form(Some(device_code)),
-        None,
+    crate::http::token::issue::test_support::present_token_result(
+        token_device_code_with_service(
+            &token_service,
+            &issuance,
+            &device_service,
+            &crate::http::token::issue::test_support::token_request_facts(
+                &request,
+                state.settings.as_ref(),
+            ),
+            client,
+            &device_token_form(Some(device_code)),
+            None,
+        )
+        .await,
     )
-    .await
 }
 
 #[test]
@@ -381,130 +353,6 @@ fn device_authorization_form_rejects_transport_and_parameter_boundary_violations
 }
 
 #[test]
-fn device_authorization_request_rejects_disabled_or_unregistered_client_grant() {
-    let form = DeviceAuthorizationForm {
-        client_id: Some("device-client".to_owned()),
-        scope: Some("openid".to_owned()),
-        resources: Vec::new(),
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-    };
-    let settings = device_settings();
-    let client = device_client();
-
-    assert!(matches!(
-        device_authorization_request_payload(
-            &DeviceHttpConfig::from(&settings),
-            &client,
-            &form,
-            false,
-        ),
-        Err(DeviceAuthorizationRequestError::Disabled)
-    ));
-
-    let mut client = client;
-    client.grant_types = vec!["authorization_code".to_owned()];
-    assert!(matches!(
-        device_authorization_request_payload(
-            &DeviceHttpConfig::from(&settings),
-            &client,
-            &form,
-            true,
-        ),
-        Err(DeviceAuthorizationRequestError::UnauthorizedClient)
-    ));
-}
-
-#[test]
-fn device_authorization_request_binds_scope_audience_ttl_and_poll_interval() {
-    let settings = device_settings();
-    let client = device_client();
-    let form = DeviceAuthorizationForm {
-        client_id: Some("device-client".to_owned()),
-        scope: Some("openid profile".to_owned()),
-        resources: vec!["https://api.example.com".to_owned()],
-        client_secret: None,
-        client_assertion_type: None,
-        client_assertion: None,
-    };
-
-    let payload = device_authorization_request_payload(
-        &DeviceHttpConfig::from(&settings),
-        &client,
-        &form,
-        true,
-    )
-    .expect("device authorization request should be accepted");
-
-    assert_eq!(payload.client_id, "device-client");
-    assert_eq!(payload.scopes, vec!["openid", "profile"]);
-    assert_eq!(payload.resource_indicators, vec!["https://api.example.com"]);
-    assert_eq!(payload.interval_seconds, 5);
-    assert_eq!(
-        payload.expires_at,
-        payload.issued_at + Duration::seconds(600)
-    );
-}
-
-#[test]
-fn device_code_polling_enforces_pending_slow_down_denied_and_expired_results() {
-    let now = Utc::now();
-    let payload = DeviceAuthorizationPayload {
-        client_id: "device-client".to_owned(),
-        client_name: "Device Client".to_owned(),
-        scopes: vec!["openid".to_owned()],
-        resource_indicators: vec!["resource://default".to_owned()],
-        authorization_details: json!([]),
-        interval_seconds: 5,
-        issued_at: now,
-        expires_at: now + Duration::seconds(600),
-    };
-
-    let pending = DeviceAuthorizationState::Pending {
-        payload: payload.clone(),
-        last_poll_at: None,
-        slow_down_count: 0,
-    };
-    assert!(matches!(
-        evaluate_device_poll(&pending, now),
-        DevicePollTransition::AuthorizationPending(_)
-    ));
-
-    let too_soon = DeviceAuthorizationState::Pending {
-        payload: payload.clone(),
-        last_poll_at: Some(now - Duration::seconds(1)),
-        slow_down_count: 0,
-    };
-    assert!(matches!(
-        evaluate_device_poll(&too_soon, now),
-        DevicePollTransition::SlowDown(_)
-    ));
-
-    let denied = DeviceAuthorizationState::Denied {
-        payload: payload.clone(),
-        denied_at: now,
-    };
-    assert!(matches!(
-        evaluate_device_poll(&denied, now),
-        DevicePollTransition::AccessDenied
-    ));
-
-    let expired = DeviceAuthorizationState::Pending {
-        payload: DeviceAuthorizationPayload {
-            expires_at: now - Duration::seconds(1),
-            ..payload
-        },
-        last_poll_at: None,
-        slow_down_count: 0,
-    };
-    assert!(matches!(
-        evaluate_device_poll(&expired, now),
-        DevicePollTransition::Expired
-    ));
-}
-
-#[test]
 fn device_authorization_verification_uri_targets_frontend_device_page() {
     let mut settings = device_settings();
     settings.endpoint.frontend_base_url = "https://auth.example.test/ui/".to_owned();
@@ -513,12 +361,6 @@ fn device_authorization_verification_uri_targets_frontend_device_page() {
         device_verification_uri(&DeviceHttpConfig::from(&settings)),
         "https://auth.example.test/ui/device"
     );
-}
-
-#[test]
-fn device_user_code_normalization_is_case_insensitive_and_separator_safe() {
-    assert_eq!(normalize_user_code(" ab-cd_12 "), "ABCD12");
-    assert_eq!(normalize_user_code("\t\n"), "");
 }
 
 #[actix_web::test]
@@ -550,22 +392,19 @@ async fn device_authorization_endpoint_disabled_fails_before_client_lookup() {
         )
         .expect("disabled runtime should build");
     let response = device_authorization(
-        device_authorization_service(&state),
-        device_grant_service(&state),
-        token_management_limiter(&state),
-        Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
-        Data::from(runtime),
-        Data::new(
-            crate::domain::remote_client_documents::RemoteClientDocumentResolver::new(&[])
-                .expect("empty resolver should build"),
+        decision_handles(
+            &state,
+            device_grant_service(&state).into_inner(),
+            runtime.snapshot_store(),
         ),
+        Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
         req,
         Bytes::from_static(b"client_id=device-client&scope=openid"),
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
+    assert_eq!(oauth_error_code(response).await, "invalid_request");
 }
 
 #[actix_web::test]
@@ -602,23 +441,14 @@ async fn device_denial_consumes_pending_request_after_audited_user_decision() {
     // Install the durable audit dependency before entering the required-intent
     // boundary.  The decision must not mutate Valkey until this succeeds.
     crate::test_support::token_issuance_repository(state.diesel_db.clone());
-    let state_data = Data::new(state.clone());
     let runtime = crate::runtime_modules::test_support::runtime_module_registry_for_test(
         state.diesel_db.clone(),
         state.settings.as_ref(),
     )
     .expect("device runtime registry should initialize");
-    let handles = Data::new(DeviceDecisionHandles::new(
-        device_authorization_service(&state_data),
-        Data::new(device_service),
-        Data::from(Arc::new(nazo_postgres::AuthorizationFlowRepository::new(
-            state.diesel_db.clone(),
-            DEFAULT_TENANT_ID,
-        )) as Arc<dyn nazo_auth::DeviceGrantRepositoryPort>),
-        Data::new(crate::http::sessions::test_support::profile_session_handles(&state)),
-        Data::new(DeviceHttpConfig::from(state.settings.as_ref())),
-        Data::from(runtime),
-    ));
+    let handles = decision_handles(&state, Arc::new(device_service), runtime.snapshot_store());
+    let sessions = Data::new(crate::http::sessions::test_support::profile_session_handles(&state));
+    let config = Data::new(DeviceHttpConfig::from(state.settings.as_ref()));
     let request = TestRequest::post()
         .uri("/device/decision")
         .cookie(actix_web::cookie::Cookie::new(
@@ -633,6 +463,8 @@ async fn device_denial_consumes_pending_request_after_audited_user_decision() {
 
     let response = device_decision(
         handles,
+        sessions,
+        config,
         request,
         actix_web::web::Form(DeviceDecisionForm {
             user_code: stored_user_code.clone(),
@@ -669,30 +501,36 @@ async fn device_token_rejects_client_policy_before_polling_state() {
         std::sync::Arc::new(nazo_valkey::TokenIssuanceStateAdapter::new(&connection)),
         state.keyset.clone(),
     );
-    let issuance_config = TokenIssuanceConfig::from(state.settings.as_ref());
+    let issuance_config = crate::http::token::issue::token_issuance_config(state.settings.as_ref());
     let modules = state.active_module_snapshot();
-    let authorization = super::super::issue::test_support::test_authorization_service(&state);
+    let authorization = crate::http::token::issue::test_support::test_authorization_service(&state);
     let issuance = TokenIssuanceContext {
         config: &issuance_config,
         modules: &modules,
         authorization: &authorization,
+        security_audit: crate::http::authorization::test_support::test_security_audit(),
         remote_client_documents: crate::test_support::test_remote_client_documents(),
     };
     let form = device_token_form(Some("not-stored"));
     let request = TestRequest::post().uri("/token").to_http_request();
 
-    let response = token_device_code_with_service(
-        &token_service,
-        &issuance,
-        &device_grant_service(&state),
-        &request,
-        &client,
-        &form,
-        None,
-    )
-    .await;
+    let response = crate::http::token::issue::test_support::present_token_result(
+        token_device_code_with_service(
+            &token_service,
+            &issuance,
+            &device_grant_service(&state),
+            &crate::http::token::issue::test_support::token_request_facts(
+                &request,
+                state.settings.as_ref(),
+            ),
+            &client,
+            &form,
+            None,
+        )
+        .await,
+    );
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "unauthorized_client");
+    assert_eq!(oauth_error_code(response).await, "unauthorized_client");
 }
 
 #[actix_web::test]
@@ -703,7 +541,10 @@ async fn device_code_replay_rejects_a_consumed_code_even_with_a_persisted_respon
     let mut client = device_client();
     client.client_id = format!("device-persisted-replay-{}", client.id);
     let device_code = format!("device-replay-{}", Uuid::now_v7());
-    let grant_key = device_grant_key(&device_code, None, None);
+    let grant_key = format!(
+        "device_code:{}::",
+        nazo_oauth_server::crypto::blake3_hex(&device_code)
+    );
 
     crate::http::token::issue::tests::persist_token_issuance_response_for_test(
         &state, &client, &grant_key,
@@ -712,19 +553,5 @@ async fn device_code_replay_rejects_a_consumed_code_even_with_a_persisted_respon
 
     let response = call_device_token_for_test(&state, &client, &device_code).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_grant");
-}
-
-#[test]
-fn device_code_grant_requires_device_code_before_state_lookup() {
-    let form = device_token_form(None);
-    let response = required_device_code(&form).expect_err("missing device_code must fail");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
-
-    let form = device_token_form(Some("   "));
-    let response = required_device_code(&form).expect_err("blank device_code must fail");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(oauth_error_code(&response), "invalid_request");
+    assert_eq!(oauth_error_code(response).await, "invalid_grant");
 }

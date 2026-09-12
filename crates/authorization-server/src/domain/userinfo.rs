@@ -1,0 +1,411 @@
+use std::sync::Arc;
+
+use crate::contracts::dynamic_client_registration::RemoteJwksResolverPort;
+use crate::contracts::request_facts::DpopRequestFacts;
+use crate::contracts::userinfo::AccessTokenAuthScheme;
+use crate::contracts::userinfo::{
+    PreparedUserinfo, UserinfoDpopError, UserinfoError, UserinfoFuture, UserinfoOperations,
+    UserinfoPreparationFuture, UserinfoRepresentation, UserinfoRequestFacts, UserinfoSuccess,
+};
+use nazo_auth::{Claims, DpopStateStorePort, OAuthClient, token_audience_contains};
+use nazo_key_management::{KeyManager, signing_algorithm_from_name};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::crypto::{access_token_tenant_id, blake3_hex, constant_time_eq};
+use crate::domain::client_jwe::{JwePayloadKind, client_jwe_key, encrypt_compact_jwe};
+use crate::domain::client_policy::{parse_scope, refresh_client_jwks_for_encryption};
+use crate::domain::oidc_claims::oidc_user_claims;
+use nazo_auth::DpopError;
+use nazo_auth::DpopNoncePolicy;
+
+use crate::services::ServerTokenService;
+
+#[derive(Clone)]
+pub struct UserinfoConfig {
+    issuer: Box<str>,
+    default_audience: Box<str>,
+    mtls_endpoint_base_url: Box<str>,
+    dpop_nonce_policy: DpopNoncePolicy,
+}
+
+impl UserinfoConfig {
+    pub fn new(
+        issuer: impl Into<Box<str>>,
+        default_audience: impl Into<Box<str>>,
+        mtls_endpoint_base_url: impl Into<Box<str>>,
+        dpop_nonce_policy: DpopNoncePolicy,
+    ) -> Self {
+        Self {
+            issuer: issuer.into(),
+            default_audience: default_audience.into(),
+            mtls_endpoint_base_url: mtls_endpoint_base_url.into(),
+            dpop_nonce_policy,
+        }
+    }
+
+    pub fn audience_allowed(&self, audience: &Value) -> bool {
+        let userinfo_url = format!("{}/userinfo", self.issuer.trim_end_matches('/'));
+        token_audience_contains(audience, &self.default_audience)
+            || token_audience_contains(audience, &userinfo_url)
+    }
+}
+
+/// Non-storage dependencies for the UserInfo protected-resource endpoint.
+///
+/// Token, subject, revocation and client reads remain on `ServerTokenService`;
+/// this handle only owns DPoP replay state, response signing, and focused policy.
+#[derive(Clone)]
+pub struct UserinfoHandles {
+    dpop_state: Arc<dyn DpopStateStorePort>,
+    security_audit: Arc<dyn crate::ports::audit::SecurityAudit>,
+    keys: KeyManager,
+    config: UserinfoConfig,
+    remote_client_documents: Arc<dyn RemoteJwksResolverPort>,
+}
+
+#[derive(Clone)]
+pub struct ServerUserinfoOperations {
+    token_service: Arc<ServerTokenService>,
+    handles: UserinfoHandles,
+}
+
+impl ServerUserinfoOperations {
+    pub fn new(token_service: Arc<ServerTokenService>, handles: UserinfoHandles) -> Self {
+        Self {
+            token_service,
+            handles,
+        }
+    }
+
+    async fn prepare_token(
+        &self,
+        scheme: AccessTokenAuthScheme,
+        token: String,
+    ) -> Result<PreparedUserinfo, UserinfoError> {
+        let claims = self
+            .token_service
+            .decode_access_token(self.handles.issuer(), &token)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to decode userinfo access token");
+                UserinfoError::QueryUnavailable
+            })?
+            .ok_or(UserinfoError::InvalidAccessToken)?;
+        if !self.handles.audience_allowed(&claims.aud) {
+            return Err(UserinfoError::InvalidAudience);
+        }
+        let tenant_id =
+            access_token_tenant_id(&claims).ok_or(UserinfoError::InvalidTenantBoundary)?;
+        let revoked = self
+            .token_service
+            .access_token_revoked(tenant_id, &claims.jti)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to check userinfo token revocation");
+                UserinfoError::QueryUnavailable
+            })?;
+        if revoked {
+            return Err(UserinfoError::RevokedAccessToken);
+        }
+
+        Ok(PreparedUserinfo {
+            scheme,
+            token,
+            claims,
+            tenant_id,
+        })
+    }
+
+    async fn execute(
+        &self,
+        prepared: PreparedUserinfo,
+        facts: UserinfoRequestFacts<'_>,
+    ) -> Result<UserinfoSuccess, UserinfoError> {
+        let PreparedUserinfo {
+            scheme,
+            token,
+            claims,
+            tenant_id,
+        } = prepared;
+        let dpop_nonce = self
+            .validate_sender_constraint(facts, scheme, &token, &claims)
+            .await?;
+        if !claims
+            .scope
+            .split_whitespace()
+            .any(|scope| scope == "openid")
+            || claims.subject_type != "user"
+        {
+            return Err(UserinfoError::InsufficientScope);
+        }
+
+        let scopes = parse_scope(&claims.scope);
+        let user_id = self.access_token_user_id(tenant_id, &claims).await?;
+        if nazo_identity::TenantId::new(tenant_id).is_err()
+            || nazo_identity::UserId::new(user_id).is_err()
+        {
+            return Err(UserinfoError::InactiveSubject);
+        }
+        let subject_claims = self
+            .token_service
+            .active_subject_claims(tenant_id, user_id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to load userinfo subject claims");
+                UserinfoError::QueryUnavailable
+            })?
+            .ok_or(UserinfoError::InactiveSubject)?;
+        let mut client = match self
+            .token_service
+            .client_by_protocol_id(tenant_id, &claims.client_id)
+            .await
+        {
+            Ok(Some(client)) if client.is_active => client,
+            Ok(_) => return Err(UserinfoError::ClientUnavailable),
+            Err(error) => {
+                tracing::warn!(%error, "failed to load userinfo client response policy");
+                return Err(UserinfoError::QueryUnavailable);
+            }
+        };
+        let response_claims = oidc_user_claims(
+            &subject_claims,
+            &scopes,
+            &claims.sub,
+            &claims.userinfo_claims,
+            &claims.userinfo_claim_requests,
+            None,
+        );
+        let response_encryption_configured = client.userinfo_encrypted_response_alg.is_some()
+            || client.userinfo_encrypted_response_enc.is_some();
+        refresh_client_jwks_for_encryption(
+            &mut client,
+            self.handles.remote_client_documents.as_ref(),
+            response_encryption_configured,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "userinfo encryption jwks_uri could not be refreshed");
+            UserinfoError::ResponseProtectionFailed
+        })?;
+        let representation = self
+            .protect_response(&client, response_claims)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    client_id_hash = %blake3_hex(&client.client_id),
+                    "failed to protect userinfo response"
+                );
+                UserinfoError::ResponseProtectionFailed
+            })?;
+        Ok(UserinfoSuccess {
+            representation,
+            dpop_nonce,
+        })
+    }
+
+    async fn validate_sender_constraint(
+        &self,
+        facts: UserinfoRequestFacts<'_>,
+        scheme: AccessTokenAuthScheme,
+        token: &str,
+        claims: &Claims,
+    ) -> Result<Option<String>, UserinfoError> {
+        match (scheme, claims.cnf.as_ref()) {
+            (AccessTokenAuthScheme::DPoP, Some(cnf)) if cnf.jkt.is_some() => {
+                self.handles
+                    .validate_dpop_proof(facts.dpop, token, cnf.jkt.as_deref())
+                    .await
+                    .map_err(map_dpop_error)?;
+                self.handles
+                    .issue_dpop_nonce()
+                    .await
+                    .map(Some)
+                    .map_err(map_dpop_error)
+            }
+            (AccessTokenAuthScheme::DPoP, _) => {
+                Err(UserinfoError::Dpop(UserinfoDpopError::TokenNotBound))
+            }
+            (AccessTokenAuthScheme::Bearer, Some(cnf)) if cnf.x5t_s256.is_some() => {
+                let expected = cnf.x5t_s256.as_deref().unwrap_or_default();
+                let actual = facts
+                    .mtls_thumbprint
+                    .ok_or(UserinfoError::MissingMtlsCertificate)?;
+                if !constant_time_eq(expected.as_bytes(), actual.as_bytes()) {
+                    return Err(UserinfoError::MtlsCertificateMismatch);
+                }
+                Ok(None)
+            }
+            (AccessTokenAuthScheme::Bearer, Some(_)) => {
+                Err(UserinfoError::Dpop(UserinfoDpopError::MissingProof))
+            }
+            (AccessTokenAuthScheme::Bearer, None) => Ok(None),
+        }
+    }
+
+    async fn access_token_user_id(
+        &self,
+        tenant_id: Uuid,
+        claims: &Claims,
+    ) -> Result<Uuid, UserinfoError> {
+        if let Some(user_id) = claims
+            .user_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            return Ok(user_id);
+        }
+        self.token_service
+            .load_access_token_subject(tenant_id, &claims.jti)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "failed to load access token subject mapping");
+                UserinfoError::QueryUnavailable
+            })?
+            .ok_or(UserinfoError::InvalidSubject)
+    }
+
+    async fn protect_response(
+        &self,
+        client: &OAuthClient,
+        mut claims: Value,
+    ) -> anyhow::Result<UserinfoRepresentation> {
+        let signing_alg = match client.userinfo_signed_response_alg.as_deref() {
+            Some(value) => Some(
+                signing_algorithm_from_name(value)
+                    .ok_or_else(|| anyhow::anyhow!("unsupported UserInfo signing algorithm"))?,
+            ),
+            None => None,
+        };
+        let encryption_key = client_jwe_key(
+            client.jwks.as_ref(),
+            client.userinfo_encrypted_response_alg.as_deref(),
+            client.userinfo_encrypted_response_enc.as_deref(),
+            "userinfo",
+        )?;
+        if signing_alg.is_none() && encryption_key.is_none() {
+            return Ok(UserinfoRepresentation::Claims(claims));
+        }
+
+        let body = if let Some(signing_alg) = signing_alg {
+            let object = claims
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("UserInfo claims must be a JSON object"))?;
+            object.insert("iss".to_owned(), json!(self.handles.issuer()));
+            object.insert("aud".to_owned(), json!(client.client_id));
+            let signed = self
+                .handles
+                .sign_response_jwt(
+                    nazo_auth::SigningPurpose::IdToken,
+                    &claims,
+                    "JWT",
+                    signing_alg,
+                )
+                .await?;
+            match encryption_key {
+                Some(key) => {
+                    encrypt_compact_jwe(&key, signed.as_bytes(), JwePayloadKind::NestedJwt)?
+                }
+                None => signed,
+            }
+        } else {
+            let key = encryption_key.expect("checked UserInfo encryption key is present");
+            encrypt_compact_jwe(&key, &serde_json::to_vec(&claims)?, JwePayloadKind::Claims)?
+        };
+        Ok(UserinfoRepresentation::Jwt(body))
+    }
+}
+
+impl UserinfoOperations for ServerUserinfoOperations {
+    fn prepare<'a>(
+        &'a self,
+        scheme: AccessTokenAuthScheme,
+        token: String,
+    ) -> UserinfoPreparationFuture<'a> {
+        Box::pin(async move { self.prepare_token(scheme, token).await })
+    }
+
+    fn userinfo<'a>(
+        &'a self,
+        prepared: PreparedUserinfo,
+        facts: UserinfoRequestFacts<'a>,
+    ) -> UserinfoFuture<'a> {
+        Box::pin(async move { self.execute(prepared, facts).await })
+    }
+}
+
+fn map_dpop_error(error: DpopError) -> UserinfoError {
+    let error = match error {
+        DpopError::MissingProof => UserinfoDpopError::MissingProof,
+        DpopError::MalformedProof => UserinfoDpopError::MalformedProof,
+        DpopError::InvalidProof => UserinfoDpopError::InvalidProof,
+        DpopError::ReplayDetected(_) => UserinfoDpopError::ReplayDetected,
+        DpopError::BindingMismatch => UserinfoDpopError::BindingMismatch,
+        DpopError::TokenNotBound => UserinfoDpopError::TokenNotBound,
+        DpopError::UseNonce(nonce) => UserinfoDpopError::UseNonce(nonce),
+        DpopError::NonceStoreUnavailable => UserinfoDpopError::NonceStoreUnavailable,
+    };
+    UserinfoError::Dpop(error)
+}
+
+impl UserinfoHandles {
+    pub fn new(
+        dpop_state: Arc<dyn DpopStateStorePort>,
+        security_audit: Arc<dyn crate::ports::audit::SecurityAudit>,
+        keys: KeyManager,
+        config: UserinfoConfig,
+        remote_client_documents: Arc<dyn RemoteJwksResolverPort>,
+    ) -> Self {
+        Self {
+            dpop_state,
+            security_audit,
+            keys,
+            config,
+            remote_client_documents,
+        }
+    }
+
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
+    pub fn audience_allowed(&self, audience: &Value) -> bool {
+        self.config.audience_allowed(audience)
+    }
+
+    pub async fn validate_dpop_proof(
+        &self,
+        facts: DpopRequestFacts<'_>,
+        token: &str,
+        expected_jkt: Option<&str>,
+    ) -> Result<Option<String>, DpopError> {
+        crate::security::dpop::validate_dpop_proof(
+            self.dpop_state.as_ref(),
+            self.security_audit.as_ref(),
+            self.issuer(),
+            &self.config.mtls_endpoint_base_url,
+            self.config.dpop_nonce_policy,
+            facts,
+            Some(token),
+            expected_jkt,
+        )
+        .await
+    }
+
+    pub async fn issue_dpop_nonce(&self) -> Result<String, DpopError> {
+        nazo_auth::issue_authorization_server_dpop_nonce(self.dpop_state.as_ref()).await
+    }
+
+    pub async fn sign_response_jwt(
+        &self,
+        purpose: nazo_auth::SigningPurpose,
+        claims: &Value,
+        typ: &str,
+        signing_alg: jsonwebtoken::Algorithm,
+    ) -> jsonwebtoken::errors::Result<String> {
+        let mut header = jsonwebtoken::Header::new(signing_alg);
+        header.typ = Some(typ.to_owned());
+        self.keys.encode_jwt(purpose, &header, claims).await
+    }
+}

@@ -1,0 +1,295 @@
+use nazo_auth::DpopNoncePolicy;
+
+#[derive(Clone)]
+pub struct ResourceServerConfig {
+    pub issuer: String,
+    pub mtls_endpoint_base_url: String,
+    pub default_audience: String,
+    pub protected_resource_identifier: String,
+    pub dpop_nonce_policy: DpopNoncePolicy,
+    pub fapi_http_signature_max_age_seconds: i64,
+}
+
+mod production {
+    use std::sync::{Arc, Mutex};
+
+    use crate::contracts::fapi_resource::{
+        FapiAuthorizationError, FapiFuture, FapiHttpMessageSignatures, FapiResourceAuthorizer,
+        FapiResponseSignature, FapiSignatureOperationError, FapiSignatureVerificationError,
+    };
+    use crate::ports::fapi_replay::{
+        FapiHttpSignatureReplayConsumption, FapiHttpSignatureReplayStore,
+    };
+    use jsonwebtoken::Algorithm;
+    use nazo_http_signatures::VerifiedInput;
+    use nazo_key_management::{HttpSigningLease, KeySnapshot};
+    use nazo_resource_server::{
+        AccessTokenRevocationLookup, ConfirmationPolicy,
+        DpopNoncePolicy as ResourceDpopNoncePolicy, DpopProofVerifier, DpopProofVerifierConfig,
+        ProtectedResourceAuthorizationContext, ProtectedResourceAuthorizationRequest,
+        ProtectedResourceAuthorizationResult, ProtectedResourceAuthorizationService,
+        ProtectedResourceDpopStateStore, ResourceServerVerifier, ResourceServerVerifierConfig,
+    };
+    use nazo_runtime_modules::ModuleId;
+
+    use nazo_auth::DpopNoncePolicy;
+    use nazo_runtime_modules::SnapshotStore;
+
+    use super::ResourceServerConfig;
+
+    type ServerResourceAuthorizationService = ProtectedResourceAuthorizationService<
+        Arc<dyn AccessTokenRevocationLookup>,
+        Arc<dyn ProtectedResourceDpopStateStore>,
+    >;
+
+    struct CachedResourceAuthorizationService {
+        keys: Arc<KeySnapshot>,
+        service: Arc<ServerResourceAuthorizationService>,
+    }
+
+    pub(super) fn same_key_generation(
+        cached: &Arc<KeySnapshot>,
+        current: &Arc<KeySnapshot>,
+    ) -> bool {
+        // The cache entry strongly owns `cached`, so its allocation cannot be
+        // freed or have its address reused while this comparison executes.
+        Arc::ptr_eq(cached, current)
+    }
+
+    #[derive(Clone)]
+    pub struct ServerFapiResourceAuthorizer {
+        config: ResourceServerConfig,
+        keyset: nazo_key_management::KeyManager,
+        tokens: Arc<dyn AccessTokenRevocationLookup>,
+        dpop_state: Arc<dyn ProtectedResourceDpopStateStore>,
+        service_cache: Arc<Mutex<Option<CachedResourceAuthorizationService>>>,
+    }
+
+    impl ServerFapiResourceAuthorizer {
+        pub fn from_port(
+            config: ResourceServerConfig,
+            keyset: nazo_key_management::KeyManager,
+            tokens: Arc<dyn AccessTokenRevocationLookup>,
+            dpop_state: Arc<dyn ProtectedResourceDpopStateStore>,
+        ) -> Self {
+            Self {
+                config,
+                keyset,
+                tokens,
+                dpop_state,
+                service_cache: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn service(
+            &self,
+        ) -> Result<Arc<ServerResourceAuthorizationService>, FapiAuthorizationError> {
+            let keys = self.keyset.snapshot();
+            let mut cache = self.service_cache.lock().map_err(|_| {
+                FapiAuthorizationError::Protocol(
+                    nazo_resource_server::ProtectedResourceAuthorizationError::InvalidToken(
+                        nazo_resource_server::ResourceServerVerifierError::MissingJwks,
+                    ),
+                )
+            })?;
+            if let Some(cached) = cache.as_ref()
+                && same_key_generation(&cached.keys, &keys)
+            {
+                return Ok(cached.service.clone());
+            }
+            let verifier = ResourceServerVerifier::new(ResourceServerVerifierConfig {
+                issuer: self.config.issuer.clone(),
+                audiences: vec![
+                    self.config.default_audience.clone(),
+                    self.config.protected_resource_identifier.clone(),
+                ],
+                jwks: keys.jwks(),
+                required_scopes: Vec::new(),
+                confirmation: ConfirmationPolicy::Optional,
+                allowed_algs: vec![
+                    Algorithm::EdDSA,
+                    Algorithm::RS256,
+                    Algorithm::ES256,
+                    Algorithm::PS256,
+                ],
+                clock_skew_seconds: 0,
+            })
+            .map_err(|error| {
+                FapiAuthorizationError::Protocol(
+                    nazo_resource_server::ProtectedResourceAuthorizationError::InvalidToken(error),
+                )
+            })?;
+            let service = Arc::new(
+                ProtectedResourceAuthorizationService::new(
+                    verifier,
+                    DpopProofVerifier::new(DpopProofVerifierConfig {
+                        allowed_algs: vec![Algorithm::EdDSA, Algorithm::ES256],
+                        clock_skew_seconds: 30,
+                        max_age_seconds: 300,
+                        required_nonce: None,
+                    }),
+                    self.tokens.clone(),
+                    self.dpop_state.clone(),
+                )
+                .with_dpop_nonce_policy(match self.config.dpop_nonce_policy {
+                    DpopNoncePolicy::Required => ResourceDpopNoncePolicy::Required,
+                    DpopNoncePolicy::Optional => ResourceDpopNoncePolicy::Optional,
+                }),
+            );
+            *cache = Some(CachedResourceAuthorizationService {
+                keys,
+                service: service.clone(),
+            });
+            Ok(service)
+        }
+    }
+
+    impl FapiResourceAuthorizer for ServerFapiResourceAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            request: ProtectedResourceAuthorizationRequest<'a>,
+            context: ProtectedResourceAuthorizationContext<'a>,
+        ) -> FapiFuture<'a, Result<ProtectedResourceAuthorizationResult, FapiAuthorizationError>>
+        {
+            Box::pin(async move {
+                let service = self.service()?;
+                let result = service
+                    .authorize(request, context)
+                    .await
+                    .map_err(FapiAuthorizationError::Protocol)?;
+                Ok(result)
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct ServerFapiHttpMessageSignatures {
+        clients: Arc<dyn nazo_auth::AdminClientRepositoryPort>,
+        replay: Arc<dyn FapiHttpSignatureReplayStore>,
+        keyset: nazo_key_management::KeyManager,
+        runtime_modules: Arc<SnapshotStore>,
+        max_age_seconds: i64,
+    }
+
+    impl ServerFapiHttpMessageSignatures {
+        pub fn from_port(
+            clients: Arc<dyn nazo_auth::AdminClientRepositoryPort>,
+            replay: Arc<dyn FapiHttpSignatureReplayStore>,
+            keyset: nazo_key_management::KeyManager,
+            runtime_modules: Arc<SnapshotStore>,
+            max_age_seconds: i64,
+        ) -> Self {
+            Self {
+                clients,
+                replay,
+                keyset,
+                runtime_modules,
+                max_age_seconds,
+            }
+        }
+    }
+
+    impl FapiHttpMessageSignatures for ServerFapiHttpMessageSignatures {
+        fn enabled(&self) -> bool {
+            nazo_auth::module_admissible(
+                &self.runtime_modules.load_full(),
+                ModuleId::HttpMessageSignatures,
+                nazo_auth::CapabilityAdmission::NewRequest,
+            )
+        }
+
+        fn verify_and_consume<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            client_id: &'a str,
+            input: &'a VerifiedInput,
+        ) -> FapiFuture<'a, Result<(), FapiSignatureVerificationError>> {
+            Box::pin(async move {
+                let requested_tenant_id = nazo_identity::TenantId::new(
+                    uuid::Uuid::parse_str(tenant_id)
+                        .map_err(|_| FapiSignatureVerificationError::Invalid)?,
+                )
+                .map_err(|_| FapiSignatureVerificationError::Invalid)?;
+                let client = self
+                    .clients
+                    .by_client_id(requested_tenant_id.as_uuid(), client_id)
+                    .await
+                    .map_err(|_| FapiSignatureVerificationError::LookupUnavailable)?
+                    .filter(|client| client.is_active)
+                    .ok_or(FapiSignatureVerificationError::Invalid)?;
+                let client_tenant_id = nazo_identity::TenantId::new(client.tenant_id)
+                    .map_err(|_| FapiSignatureVerificationError::Invalid)?;
+                if client_tenant_id != requested_tenant_id || client.client_id != client_id {
+                    return Err(FapiSignatureVerificationError::Invalid);
+                }
+                let jwks = client
+                    .jwks
+                    .as_ref()
+                    .ok_or(FapiSignatureVerificationError::Invalid)?;
+                nazo_http_signatures::verify_jwk_signature(
+                    jwks,
+                    input.keyid(),
+                    input.algorithm(),
+                    input.signature_base(),
+                    input.signature(),
+                )
+                .map_err(|_| FapiSignatureVerificationError::Invalid)?;
+                match self
+                    .replay
+                    .consume(
+                        client_tenant_id,
+                        input.replay_fingerprint(),
+                        self.max_age_seconds,
+                    )
+                    .await
+                {
+                    Ok(FapiHttpSignatureReplayConsumption::Accepted) => Ok(()),
+                    Ok(FapiHttpSignatureReplayConsumption::Replay) => {
+                        Err(FapiSignatureVerificationError::Replay)
+                    }
+                    Err(_) => Err(FapiSignatureVerificationError::ReplayUnavailable),
+                }
+            })
+        }
+
+        fn response_signature(
+            &self,
+        ) -> Result<Arc<dyn FapiResponseSignature>, FapiSignatureOperationError> {
+            self.keyset
+                .prepare_http_signing()
+                .map(|lease| Arc::new(ServerResponseSignature(lease)) as Arc<_>)
+                .map_err(|_| FapiSignatureOperationError::Unavailable)
+        }
+    }
+
+    struct ServerResponseSignature(HttpSigningLease);
+
+    impl FapiResponseSignature for ServerResponseSignature {
+        fn kid(&self) -> &str {
+            self.0.kid()
+        }
+
+        fn algorithm(&self) -> &str {
+            self.0.algorithm()
+        }
+
+        fn sign<'a>(
+            &'a self,
+            signature_base: &'a [u8],
+        ) -> FapiFuture<'a, Result<Vec<u8>, FapiSignatureOperationError>> {
+            Box::pin(async move {
+                self.0
+                    .sign(signature_base)
+                    .await
+                    .map(|signature| signature.as_bytes().to_vec())
+                    .map_err(|_| FapiSignatureOperationError::Unavailable)
+            })
+        }
+    }
+}
+
+pub use production::{ServerFapiHttpMessageSignatures, ServerFapiResourceAuthorizer};
+
+#[cfg(test)]
+#[path = "../../tests/unit/domain/resource_server.rs"]
+mod tests;

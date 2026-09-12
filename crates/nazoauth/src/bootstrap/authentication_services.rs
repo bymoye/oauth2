@@ -1,10 +1,10 @@
+use nazo_oauth_server::ports::audit::{SecurityAudit, audit_fields};
 use serde_json::json;
+use std::sync::Arc;
 
-use crate::adapters::audit::audit_event;
-use crate::adapters::audit::audit_fields;
 use crate::adapters::security::PasswordVerificationError;
-use crate::adapters::security::blake3_hex;
 use crate::adapters::security::verify_password_blocking_limited;
+use nazo_oauth_server::crypto::blake3_hex;
 
 #[derive(Clone, Copy)]
 pub(crate) struct LoginPasswordVerifier;
@@ -30,8 +30,16 @@ impl nazo_identity::ports::SecretVerifyPort for LoginPasswordVerifier {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct TracingAuthenticationAudit;
+#[derive(Clone)]
+pub(crate) struct TracingAuthenticationAudit {
+    audit: Arc<dyn SecurityAudit>,
+}
+
+impl TracingAuthenticationAudit {
+    pub(crate) fn new(audit: Arc<dyn SecurityAudit>) -> Self {
+        Self { audit }
+    }
+}
 
 impl nazo_identity::ports::AuthenticationAuditPort for TracingAuthenticationAudit {
     fn record(&self, event: nazo_identity::ports::AuthenticationAuditEvent) {
@@ -48,13 +56,13 @@ impl nazo_identity::ports::AuthenticationAuditPort for TracingAuthenticationAudi
                 if let Some(user_id) = user_id {
                     fields.push(("user_id", json!(user_id.as_uuid())));
                 }
-                audit_event("login_failure", audit_fields(&fields));
+                self.audit.record("login_failure", audit_fields(&fields));
             }
             nazo_identity::ports::AuthenticationAuditEvent::Success {
                 user_id,
                 source_ip,
                 amr,
-            } => audit_event(
+            } => self.audit.record(
                 "login_success",
                 audit_fields(&[
                     ("user_id", json!(user_id.as_uuid())),
@@ -65,10 +73,3 @@ impl nazo_identity::ports::AuthenticationAuditPort for TracingAuthenticationAudi
         }
     }
 }
-
-pub(crate) type LocalAuthenticationService = nazo_identity::AuthenticationService<
-    std::sync::Arc<dyn nazo_identity::ports::LoginThrottlePort>,
-    LoginPasswordVerifier,
-    std::sync::Arc<dyn nazo_identity::ports::LoginSessionPort>,
-    TracingAuthenticationAudit,
->;
