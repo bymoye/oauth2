@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
+
+from verify_static_contracts import PACKAGE_ROLES, ALLOWED_DEPENDENCY_ROLES, check_package_roles
 
 
 GRAPHS = {
@@ -84,13 +87,30 @@ def package_names(package: str) -> set[str]:
 
 def main() -> int:
     violations: list[str] = []
+    check_package_roles()
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+        check=False, capture_output=True, text=True,
+    )
+    if metadata.returncode:
+        print(metadata.stderr, file=sys.stderr)
+        return 2
+    for package in json.loads(metadata.stdout)["packages"]:
+        role = PACKAGE_ROLES.get(package["name"])
+        if role is None:
+            continue
+        for dependency in package["dependencies"]:
+            dependency_role = PACKAGE_ROLES.get(dependency["name"])
+            if dependency["kind"] != "dev" and dependency_role and dependency_role not in ALLOWED_DEPENDENCY_ROLES[role]:
+                violations.append(f"{package['name']} -> {dependency['name']}")
     for package, forbidden in GRAPHS.items():
         try:
             names = package_names(package)
         except RuntimeError as error:
             print(error, file=sys.stderr)
             return 2
-        leaked = sorted(set(forbidden) & names)
+        forbidden = set(forbidden) | {name for name, role in PACKAGE_ROLES.items() if role not in ALLOWED_DEPENDENCY_ROLES[PACKAGE_ROLES[package]]}
+        leaked = sorted(forbidden & names)
         if leaked:
             violations.append(f"{package}: {', '.join(leaked)}")
     if violations:

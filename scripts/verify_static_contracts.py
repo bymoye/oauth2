@@ -63,6 +63,69 @@ FORBIDDEN_CRATE_DEPENDENCIES = {
     "http-actix": {"diesel", "diesel-async", "fred", "nazo-postgres", "nazo-valkey"},
 }
 
+# Canonical package roles, shared with the Cargo graph guard.
+PACKAGE_ROLES = {
+    "nazo-oauth-server": "application",
+    "nazo-auth": "domain",
+    "nazo-oauth-server-object-store": "adapter",
+    "nazo-oauth-server-postgres": "adapter",
+    "nazo-oauth-server-valkey": "adapter",
+    "nazo-digital-credentials": "domain",
+    "nazo-http-actix": "adapter",
+    "nazo-http-signatures": "domain",
+    "nazo-identity": "domain",
+    "nazo-key-management": "domain",
+    "nazoauth": "host",
+    "nazo-openid4vc-http-actix": "adapter",
+    "nazo-openid4vci": "domain",
+    "nazo-openid4vp": "domain",
+    "nazo-operator-protocol": "domain",
+    "nazo-persistence": "domain",
+    "nazo-postgres": "adapter",
+    "nazo-resource-server": "domain",
+    "nazo-runtime-modules": "domain",
+    "nazo-scim-events": "domain",
+    "nazo-valkey": "adapter",
+}
+ALLOWED_DEPENDENCY_ROLES = {
+    "domain": {"domain"},
+    "application": {"domain", "application"},
+    "adapter": {"domain", "application", "adapter"},
+    "host": {"domain", "application", "adapter", "host"},
+}
+
+
+def declared_production_dependencies(manifest: dict, workspace: dict):
+    """Include optional/target-specific edges and resolve workspace aliases."""
+    sections = [manifest, *manifest.get("target", {}).values()]
+    for section in sections:
+        for kind in ("dependencies", "build-dependencies"):
+            for alias, value in section.get(kind, {}).items():
+                spec = value if isinstance(value, dict) else {}
+                if spec.get("workspace"):
+                    inherited = workspace.get("dependencies", {}).get(alias, {})
+                    spec = {**(inherited if isinstance(inherited, dict) else {}), **spec}
+                yield spec.get("package", alias), spec
+
+
+def check_package_roles() -> None:
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+    for path in sorted((ROOT / "crates").glob("*/Cargo.toml")):
+        manifest = tomllib.loads(path.read_text(encoding="utf-8"))
+        package = manifest["package"]["name"]
+        role = PACKAGE_ROLES[package]
+        for dependency, spec in declared_production_dependencies(manifest, workspace):
+            if "path" in spec:
+                candidate = path.parent / spec["path"] / "Cargo.toml"
+                if not candidate.exists():
+                    candidate = ROOT / spec["path"] / "Cargo.toml"
+                if candidate.exists():
+                    dependency = tomllib.loads(candidate.read_text(encoding="utf-8"))["package"]["name"]
+            dependency_role = PACKAGE_ROLES.get(dependency)
+            if dependency_role and dependency_role not in ALLOWED_DEPENDENCY_ROLES[role]:
+                raise SystemExit(f"{package} ({role}) must not depend on {dependency} ({dependency_role})")
+
+
 RFC9967_CASES = {
     "discovery_exact_event_uris",
     "poll_authorization_boundaries",
@@ -171,7 +234,7 @@ def check_documentation_boundaries() -> None:
 
 
 def check_authorization_server_import_boundaries() -> None:
-    for path in sorted((ROOT / "crates" / "authorization-server" / "src").rglob("*.rs")):
+    for path in sorted([*(ROOT / "crates" / "authorization-server" / "src").rglob("*.rs"), *(ROOT / "crates" / "nazoauth" / "src").rglob("*.rs")]):
         text = path.read_text(encoding="utf-8")
         relative = path.relative_to(ROOT)
         if GLOB_REEXPORT.search(text):
@@ -297,12 +360,12 @@ def check_toolchain_pins() -> None:
 
 
 def check_crate_dependency_boundaries() -> None:
+    check_package_roles()
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
     for crate, forbidden in FORBIDDEN_CRATE_DEPENDENCIES.items():
         manifest_path = ROOT / "crates" / crate / "Cargo.toml"
         manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-        declared = set()
-        for section in ("dependencies", "build-dependencies"):
-            declared.update(manifest.get(section, {}))
+        declared = {name for name, _ in declared_production_dependencies(manifest, workspace)}
         violations = sorted(declared & forbidden)
         if violations:
             raise SystemExit(
@@ -314,7 +377,9 @@ def check_transient_state_backend_boundary() -> None:
     server_root = ROOT / "crates" / "authorization-server" / "src"
     forbidden = ("nazo_valkey", "ValkeyConnection", "VALKEY_")
     violations = []
-    for path in sorted(server_root.rglob("*.rs")):
+    for path in sorted([*server_root.rglob("*.rs"), *(ROOT / "crates" / "nazoauth" / "src").rglob("*.rs")]):
+        if path.is_relative_to(ROOT / "crates" / "nazoauth" / "src" / "launchers"):
+            continue
         source = path.read_text(encoding="utf-8")
         markers = [marker for marker in forbidden if marker in source]
         if markers:
@@ -346,20 +411,16 @@ def check_aggregate_package_boundary() -> None:
 
     manifest_path = ROOT / "crates" / "nazoauth" / "Cargo.toml"
     manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
-    dependencies = set(manifest.get("dependencies", {}))
-    expected = {
-        "anyhow",
-        "nazo-oauth-server",
-        "nazo-oauth-server-postgres",
-        "nazo-oauth-server-valkey",
-        "nazo-oauth-server-object-store",
-        "tokio",
-    }
-    if dependencies != expected:
-        raise SystemExit(
-            f"nazoauth aggregate dependencies must be composition-only: "
-            f"expected {sorted(expected)}, got {sorted(dependencies)}"
-        )
+    if "bin" not in manifest or manifest["bin"][0]["name"] != "nazoauth":
+        raise SystemExit("Native Host must retain the nazoauth executable")
+    native_root = ROOT / "crates" / "nazoauth" / "src"
+    for relative in ("lib.rs", "main.rs", "launchers/mod.rs", "launchers/postgres.rs", "launchers/valkey.rs", "launchers/object_store.rs"):
+        if not (native_root / relative).is_file():
+            raise SystemExit(f"Native Host ownership is missing: {relative}")
+    application = ROOT / "crates" / "authorization-server" / "src"
+    for retired in ("bootstrap", "cli.rs", "config.rs", "operator_task", "recovery_root.rs"):
+        if (application / retired).exists():
+            raise SystemExit(f"Native Host source remains in Application: {retired}")
 
     source = (ROOT / "crates" / "nazoauth" / "src" / "main.rs").read_text(
         encoding="utf-8"
@@ -432,10 +493,10 @@ def check_rust_test_structure() -> None:
         r"(?P=indent)(?P<item>[^\r\n]+)"
     )
     allowed_nested_seams = {
-        "crates/authorization-server/src/bootstrap/startup/configuration.rs": (
+        "crates/nazoauth/src/bootstrap/startup/configuration.rs": (
             "let backchannel_logout_worker = None;",
         ),
-        "crates/authorization-server/src/bootstrap/startup/tenant_runtime.rs": (
+        "crates/nazoauth/src/bootstrap/startup/tenant_runtime.rs": (
             "pub(super) fn for_test(binding: TenantDirectoryBinding) -> Arc<Self> {",
             "pub(super) fn for_test_reusing(",
             "pub(super) fn shares_lifecycle_with(&self, other: &Self) -> bool {",
@@ -620,8 +681,8 @@ def check_removed_security_capabilities() -> None:
         raise SystemExit(f"removed security capabilities reappeared: {violations}")
 
     removed_test_harness = [
-        ROOT / "crates" / "authorization-server" / "src" / "http" / "scim.rs",
-        ROOT / "crates" / "authorization-server" / "src" / "http" / "scim",
+        ROOT / "crates" / "nazoauth" / "src" / "http" / "scim.rs",
+        ROOT / "crates" / "nazoauth" / "src" / "http" / "scim",
     ]
     present = [path.relative_to(ROOT) for path in removed_test_harness if path.exists()]
     if present:
@@ -644,7 +705,7 @@ def check_removed_security_capabilities() -> None:
 
 def check_fapi_ciba_boundaries() -> None:
     delivery = (
-        ROOT / "crates" / "authorization-server" / "src" / "domain" / "ciba_ping_delivery.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "domain" / "ciba_ping_delivery.rs"
     ).read_text(encoding="utf-8")
     forbidden_test_markers = ("#[cfg(test)]", "mod tests", "#[test]")
     if any(marker in delivery for marker in forbidden_test_markers):
@@ -662,7 +723,7 @@ def check_fapi_ciba_boundaries() -> None:
         raise SystemExit(f"CIBA ping delivery security guards are missing: {missing}")
 
     tls_policy = (
-        ROOT / "crates" / "authorization-server" / "src" / "domain" / "ciba_ping_tls.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "domain" / "ciba_ping_tls.rs"
     ).read_text(encoding="utf-8")
     if any(marker in tls_policy for marker in forbidden_test_markers):
         raise SystemExit("CIBA ping TLS policy tests must remain outside production source")
@@ -685,7 +746,7 @@ def check_fapi_ciba_boundaries() -> None:
     tls_policy_test = (
         ROOT
         / "crates"
-        / "authorization-server"
+        / "nazoauth"
         / "tests"
         / "unit"
         / "domain"
@@ -770,22 +831,22 @@ def check_openid4vc_boundaries() -> None:
         raise SystemExit(f"OpenID4VC separated test contracts are missing: {missing_tests}")
 
     server_settings = read_rust_module_tree(
-        ROOT / "crates" / "authorization-server" / "src" / "settings.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "settings.rs"
     )
     server_config = (
-        ROOT / "crates" / "authorization-server" / "src" / "config.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "config.rs"
     ).read_text(encoding="utf-8")
     server_routes = (
-        ROOT / "crates" / "authorization-server" / "src" / "bootstrap" / "routes.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "bootstrap" / "routes.rs"
     ).read_text(encoding="utf-8")
     dataset_admin = (
-        ROOT / "crates" / "authorization-server" / "src" / "http" / "admin" / "openid4vc.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "http" / "admin" / "openid4vc.rs"
     ).read_text(encoding="utf-8")
     openid4vc_protocol_adapter = (
         ROOT / "crates" / "openid4vc-http-actix" / "src" / "vci.rs"
     ).read_text(encoding="utf-8")
     openid4vc_server_domain = read_rust_module_tree(
-        ROOT / "crates" / "authorization-server" / "src" / "domain" / "openid4vc_endpoints.rs"
+        ROOT / "crates" / "nazoauth" / "src" / "domain" / "openid4vc_endpoints.rs"
     )
     for forbidden in (
         "OPENID4VCI_CREDENTIAL_DATASET_MANAGEMENT_TOKEN",
@@ -829,7 +890,7 @@ def check_openid4vc_boundaries() -> None:
     ):
         if marker not in openid4vc_server_domain:
             raise SystemExit(f"OpenID4VC internal control-plane boundary is missing: {marker}")
-    keyctl = (ROOT / "crates" / "authorization-server" / "src" / "keyctl.rs").read_text(
+    keyctl = (ROOT / "crates" / "nazoauth" / "src" / "keyctl.rs").read_text(
         encoding="utf-8"
     )
     key_store = "\n".join(
@@ -869,7 +930,7 @@ def check_openid4vc_boundaries() -> None:
 
 
 def check_admin_provision_boundary() -> None:
-    server_root = ROOT / "crates" / "authorization-server"
+    server_root = ROOT / "crates" / "nazoauth"
     persistence_root = ROOT / "crates" / "persistence-postgres"
     retired_http_module = "bootstrap" + "_" + "admin.rs"
     retired_repository_module = "initial" + "_" + "admin" + "_" + "bootstrap.rs"
